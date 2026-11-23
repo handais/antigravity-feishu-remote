@@ -74,6 +74,7 @@ const {
 const {
   formatToolStatusMarkdown,
   formatUsageSummary,
+  isTransientStartupRace,
 } = await import('./lib/task-runner.mjs');
 
 const pluginRoot = getPluginRoot();
@@ -408,6 +409,36 @@ try {
   assert.equal(
     formatUsageSummary({ input_tokens: 1500, output_tokens: 500, total_tokens: 2000 }),
     'Token 2.0k (1.5k→500)',
+  );
+  assert.equal(
+    isTransientStartupRace({
+      aborted: false,
+      status: 'ERROR',
+      exitCode: 1,
+      conversationId: '',
+      stderr: 'error: failed to start conversation: backend returned an empty conversation id',
+    }),
+    true,
+  );
+  assert.equal(
+    isTransientStartupRace({
+      aborted: false,
+      status: 'ERROR',
+      exitCode: 1,
+      conversationId: 'conv-123',
+      stderr: 'failed to start conversation',
+    }),
+    false,
+  );
+  assert.equal(
+    isTransientStartupRace({
+      aborted: true,
+      status: 'ERROR',
+      exitCode: 1,
+      conversationId: '',
+      stderr: 'failed to start conversation',
+    }),
+    false,
   );
 
   // 4g. Desktop session scanner, FTS5 search, transcript turns, handoff cards

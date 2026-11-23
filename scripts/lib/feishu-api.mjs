@@ -175,6 +175,17 @@ export function buildCard({ title, template = 'blue', markdown = '', footer = ''
   };
 }
 
+function isDirectoryEntry(parentDir, entry) {
+  if (entry.isDirectory()) return true;
+  if (!entry.isSymbolicLink()) return false;
+  try {
+    return fs.statSync(path.join(parentDir, entry.name)).isDirectory();
+  } catch {
+    // Ignore broken or inaccessible symlinks
+    return false;
+  }
+}
+
 export function discoverQuickDirs(config, currentCwd = '') {
   const candidates = [
     ...(Array.isArray(config?.agy?.favoriteDirs) ? config.agy.favoriteDirs : []),
@@ -193,7 +204,7 @@ export function discoverQuickDirs(config, currentCwd = '') {
       if (fs.existsSync(parent) && fs.statSync(parent).isDirectory()) {
         const entries = fs.readdirSync(parent, { withFileTypes: true });
         for (const entry of entries) {
-          if (entry.isDirectory() && !entry.name.startsWith('.')) {
+          if (!entry.name.startsWith('.') && isDirectoryEntry(parent, entry)) {
             candidates.push(path.join(parent, entry.name));
           }
         }
@@ -385,7 +396,7 @@ export function buildDirsCard({ chatState, config, page = 0, pageSize = 12 }) {
   try {
     allSubDirs = fs
       .readdirSync(cwd, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+      .filter((entry) => !entry.name.startsWith('.') && isDirectoryEntry(cwd, entry))
       .map((entry) => entry.name)
       .sort((a, b) => a.localeCompare(b));
   } catch (err) {
@@ -900,7 +911,7 @@ function listChildDirsSafe(parentDir) {
     if (!fs.existsSync(parentDir) || !fs.statSync(parentDir).isDirectory()) return [];
     return fs
       .readdirSync(parentDir, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && !e.name.startsWith('.') && !SKIP_SEARCH_DIRS.has(e.name))
+      .filter((e) => !e.name.startsWith('.') && !SKIP_SEARCH_DIRS.has(e.name) && isDirectoryEntry(parentDir, e))
       .map((e) => path.join(parentDir, e.name));
   } catch {
     return [];
@@ -915,12 +926,21 @@ export function searchDirsFuzzy(query, { config, currentCwd = '', limit = 8 } = 
   const favs = Array.isArray(config?.agy?.favoriteDirs) ? config.agy.favoriteDirs : [];
   const favoriteSet = new Set(favs.map((d) => path.resolve(d)));
   const candidates = new Set();
+  const seenReal = new Set();
 
   const addCandidate = (dirPath) => {
     if (!dirPath) return;
     const resolved = path.resolve(dirPath);
     try {
       if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+        let real = resolved;
+        try {
+          real = fs.realpathSync(resolved);
+        } catch {
+          // Fall back to resolved path if realpath fails
+        }
+        if (seenReal.has(real)) return;
+        seenReal.add(real);
         candidates.add(resolved);
       }
     } catch {
@@ -946,6 +966,7 @@ export function searchDirsFuzzy(query, { config, currentCwd = '', limit = 8 } = 
     path.join(home, 'code'),
     path.join(home, 'workspace'),
     path.join(home, 'dev'),
+    path.join(home, 'Library', 'CloudStorage'),
   ];
   for (const root of roots) {
     addCandidate(root);

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { loadState, saveState } from './config.mjs';
-import { buildCard, replyCard } from './feishu-api.mjs';
+import { buildCard, chunkButtons, replyCard } from './feishu-api.mjs';
 import { runAgyTurn } from './agy-runner.mjs';
 import {
   addMessageReaction,
@@ -67,6 +67,15 @@ export function formatUsageSummary(usage) {
 export function sanitizeRetryPayload(payload) {
   const { queueReactionId: _ignored, ...rest } = payload;
   return { ...rest, queueReactionId: '' };
+}
+
+export function isTransientStartupRace(result) {
+  if (!result || result.aborted || result.status === 'SUCCESS' || result.exitCode === 0) {
+    return false;
+  }
+  if (result.conversationId) return false;
+  const text = `${result.stderr || ''}\n${result.finishedReason || ''}\n${result.response || ''}`;
+  return /failed to start conversation|initialized by another opener|empty conversation id/i.test(text);
 }
 
 function getMaxConcurrent(config) {
@@ -296,6 +305,18 @@ export function createTaskRunner({
         result = await executeAttempt('');
       }
 
+      if (isTransientStartupRace(result) && !controller.signal.aborted) {
+        liveText = '';
+        lastTextStepIndex = null;
+        toolEntries.length = 0;
+        streamSession.updateStream('_检测到会话初始化瞬时冲突，1 秒后自动重试..._');
+        refreshStatus();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        if (!controller.signal.aborted) {
+          result = await executeAttempt(actualEffort);
+        }
+      }
+
       const freshState = loadState();
       const freshChat = getOrCreateChatState(freshState, runKey, config);
       if (result.conversationId) {
@@ -358,7 +379,7 @@ export function createTaskRunner({
         template,
         markdown: body,
         footer: footerParts.join(' · '),
-        buttonRows: [buttons],
+        buttonRows: chunkButtons(buttons, 3),
         chatId,
         openId,
         replyTargetMessageId: replyTarget,
@@ -378,12 +399,12 @@ export function createTaskRunner({
         template: 'red',
         markdown: String(err.message || err),
         footer: `目录 ${path.basename(chatState.cwd) || chatState.cwd}`,
-        buttonRows: [[
+        buttonRows: chunkButtons([
           { label: '🔄 重试', type: 'primary', value: { cmd: 'retry' } },
           { label: '🆕 新对话', value: { cmd: 'new' } },
           { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
           { label: '⚡ 快捷任务', value: { cmd: 'quick' } },
-        ]],
+        ], 2),
         chatId,
         openId,
         replyTargetMessageId: replyTarget,
