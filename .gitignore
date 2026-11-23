@@ -1,0 +1,9 @@
+node_modules/
+*.zip
+.DS_Store
+*.log
+*.tmp.*
+.env
+.env.*
+config.json
+state.json

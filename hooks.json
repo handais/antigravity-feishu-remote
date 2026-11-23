@@ -1,0 +1,11 @@
+{
+  "feishu-stop-notify": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./scripts/stop-notify.mjs",
+        "timeout": 10
+      }
+    ]
+  }
+}

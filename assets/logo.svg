@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="bgGrad" x1="16" y1="16" x2="112" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00D6B9"/>
+      <stop offset="55%" stop-color="#1490FF"/>
+      <stop offset="100%" stop-color="#4F46E5"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="42" y1="42" x2="90" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#E0F7FA"/>
+    </linearGradient>
+  </defs>
+  <!-- Outer rounded chat bubble with ~10% margin (13px..115px) -->
+  <path d="M31 15H97C106.941 15 115 23.0589 115 33V81C115 90.9411 106.941 99 97 99H54L34.5 112.5C32.5 113.88 29.8 112.45 29.8 110.02V99H31C21.0589 99 13 90.9411 13 81V33C13 23.0589 21.0589 15 31 15Z" fill="url(#bgGrad)" stroke="#FFFFFF" stroke-opacity="0.25" stroke-width="2"/>
+  <!-- Inner dark terminal badge for crisp contrast on both themes -->
+  <rect x="27" y="29" width="74" height="56" rx="12" fill="#0F172A" fill-opacity="0.88"/>
+  <!-- Terminal prompt chevron '>' -->
+  <path d="M40 46L54 57L40 68" stroke="#00E5C3" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Prompt underscore / cursor -->
+  <path d="M60 68H76" stroke="url(#accentGrad)" stroke-width="6" stroke-linecap="round"/>
+  <!-- Remote spark / signal dot -->
+  <circle cx="84" cy="45" r="5.5" fill="#38BDF8"/>
+  <path d="M77 37C81.8 33.8 88.2 34.4 92.2 38.4" stroke="#7DD3FC" stroke-width="3" stroke-linecap="round"/>
+</svg>

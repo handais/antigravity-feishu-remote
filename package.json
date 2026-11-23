@@ -1,0 +1,27 @@
+{
+  "name": "antigravity-feishu-remote",
+  "version": "1.0.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "Feishu WebSocket remote control bridge, MCP server, and completion hook for Antigravity",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "keywords": [
+    "antigravity",
+    "feishu",
+    "lark",
+    "mcp",
+    "remote-control",
+    "websocket",
+    "ai-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/handais/antigravity-feishu-remote.git"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.76.0",
+    "@modelcontextprotocol/sdk": "^1.32.2"
+  }
+}

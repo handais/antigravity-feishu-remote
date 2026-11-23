@@ -1,0 +1,443 @@
+import * as Lark from '@larksuiteoapi/node-sdk';
+import {
+  loadConfig,
+  loadState,
+  saveConfig,
+  saveState,
+  stripProcessProxyEnv,
+} from './lib/config.mjs';
+import {
+  buildCard,
+  createFeishuClient,
+  createStderrLogger,
+  resolveLarkDomain,
+} from './lib/feishu-api.mjs';
+import { extractFeishuDocLinks, readFeishuDoc } from './lib/feishu-docs.mjs';
+import {
+  buildMultimodalPrompt,
+  downloadMessageAttachments,
+  extractInboundMessage,
+  fetchQuotedMessageContext,
+  maintainRuntimeStorage,
+} from './lib/media.mjs';
+import {
+  computePluginCodeHash,
+  consumePendingRestartNotice,
+  createBackupSnapshot,
+} from './lib/self-ops.mjs';
+import {
+  enforceTempFullExpiry,
+  formatHelpMarkdown,
+  replySimpleCard,
+  sendCardToTarget,
+  stripMentions,
+  toastCardResponse,
+} from './lib/bridge-helpers.mjs';
+import { createTaskRunner } from './lib/task-runner.mjs';
+import { handleSlashCommand } from './lib/slash-commands.mjs';
+import { handleBotMenuEvent, handleCardAction } from './lib/card-actions.mjs';
+
+const startedAt = Date.now();
+const bootCodeHash = computePluginCodeHash();
+const initialConfig = loadConfig();
+stripProcessProxyEnv(initialConfig.feishu.proxy);
+
+if (!initialConfig.feishu.appId || !initialConfig.feishu.appSecret) {
+  console.error('[feishu-remote] Missing appId or appSecret. Run `cli.mjs setup` first.');
+  process.exit(1);
+}
+
+const client = createFeishuClient(initialConfig, { quiet: false });
+const wsClient = new Lark.WSClient({
+  appId: initialConfig.feishu.appId,
+  appSecret: initialConfig.feishu.appSecret,
+  domain: resolveLarkDomain(initialConfig.feishu.domain),
+  logger: createStderrLogger('lark-ws'),
+  loggerLevel: Lark.LoggerLevel.warn,
+});
+
+const seenMessageIds = new Set();
+const activeRuns = new Map(); // runKey -> { controller, promptPreview, startedAt }
+const chatQueues = new Map(); // runKey -> Array<{ id, queuedAt, payload, queueMessageId }>
+const lastTaskByChat = new Map(); // runKey -> payload
+
+function markMessageSeen(messageId) {
+  if (!messageId) return false;
+  if (seenMessageIds.has(messageId)) return true;
+  if (seenMessageIds.size >= 2000) {
+    const oldest = seenMessageIds.values().next().value;
+    if (oldest !== undefined) seenMessageIds.delete(oldest);
+  }
+  seenMessageIds.add(messageId);
+  return false;
+}
+
+function stopWsForRestart() {
+  for (const running of activeRuns.values()) {
+    try {
+      running.controller.abort();
+    } catch {
+      // Ignore
+    }
+  }
+  chatQueues.clear();
+  try {
+    wsClient.close({ force: true });
+  } catch {
+    // Ignore
+  }
+}
+
+const runner = createTaskRunner({
+  client,
+  activeRuns,
+  chatQueues,
+  lastTaskByChat,
+});
+
+const ctx = {
+  client,
+  startedAt,
+  bootCodeHash,
+  activeRuns,
+  chatQueues,
+  lastTaskByChat,
+  runner,
+  stopWsForRestart,
+};
+
+async function handleIncomingMessage(rawEvent) {
+  const payload = rawEvent?.message ? rawEvent : rawEvent?.event || rawEvent;
+  const sender = payload?.sender;
+  const message = payload?.message;
+  if (!sender || !message) return;
+
+  if (sender.sender_type !== 'user') return;
+  if (markMessageSeen(message.message_id)) return;
+
+  const createMs = Number(message.create_time || 0);
+  if (createMs > 0 && Date.now() - createMs > 5 * 60 * 1000) {
+    return;
+  }
+
+  const config = loadConfig();
+  const openId = sender.sender_id?.open_id || '';
+  const chatId = message.chat_id || '';
+  const chatType = message.chat_type || 'p2p';
+  const messageId = message.message_id || '';
+
+  if (!openId || !chatId || !messageId) return;
+
+  if (chatType === 'group') {
+    const policy = config.security.groupPolicy || 'mention';
+    if (policy === 'off') return;
+    if (policy === 'mention' && (!Array.isArray(message.mentions) || message.mentions.length === 0)) {
+      return;
+    }
+  }
+
+  const { supported, text: rawText, msgType, attachments } = extractInboundMessage(message);
+  const text = stripMentions(rawText);
+
+  const allowed = config.security.allowedOpenIds || [];
+  let justBound = false;
+
+  if (allowed.length === 0 && config.security.autoBindFirstUser && chatType === 'p2p') {
+    config.security.allowedOpenIds = [openId];
+    config.security.autoBindFirstUser = false;
+    if (!config.notifications.defaultReceiveId) {
+      config.notifications.defaultReceiveId = openId;
+      config.notifications.defaultReceiveIdType = 'open_id';
+    }
+    saveConfig(config);
+    justBound = true;
+    console.error(`[feishu-remote] Auto-bound first p2p user open_id=${openId}`);
+
+    await replySimpleCard(client, messageId, {
+      title: '🎉 绑定成功，已授权为主人账号',
+      template: 'green',
+      markdown: [
+        `已将你的飞书 \`open_id\`（\`${openId}\`）设为唯一授权白名单。`,
+        '',
+        formatHelpMarkdown(),
+      ].join('\n'),
+      buttonRows: [[{ label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel' } }]],
+    });
+
+    const greetingWords = new Set(['你好', 'hi', 'hello', 'hey', '/bind', '/start', '开始']);
+    if (attachments.length === 0 && (!supported || !text || greetingWords.has(text.toLowerCase()))) {
+      const stateAfterBind = loadState();
+      if (stateAfterBind.lastP2pChatByOpenId[openId] !== chatId) {
+        stateAfterBind.lastP2pChatByOpenId[openId] = chatId;
+        saveState(stateAfterBind);
+      }
+      return;
+    }
+  } else if (allowed.length > 0 && !allowed.includes(openId)) {
+    if (chatType === 'p2p') {
+      await replySimpleCard(client, messageId, {
+        title: '🔒 未授权访问',
+        template: 'grey',
+        markdown: `当前机器人仅限白名单用户使用。\n你的 \`open_id\` 为：\`${openId}\`\n\n如需授权，请在主机运行：\n\`cli.mjs setup --allow-open-id ${openId}\``,
+      });
+    }
+    return;
+  }
+
+  if (chatType === 'p2p') {
+    const p2pState = loadState();
+    if (p2pState.lastP2pChatByOpenId[openId] !== chatId) {
+      p2pState.lastP2pChatByOpenId[openId] = chatId;
+      saveState(p2pState);
+    }
+  }
+
+  if (!supported) {
+    if (!justBound) {
+      await replySimpleCard(client, messageId, {
+        title: 'ℹ️ 暂不支持该消息类型',
+        template: 'grey',
+        markdown: `当前支持文本、富文本、图片/截图、文件和语音消息，暂不支持 \`${msgType || 'unknown'}\` 类型。`,
+      });
+    }
+    return;
+  }
+
+  if (!text && attachments.length === 0) return;
+
+  if (text.startsWith('/') && attachments.length === 0) {
+    const handled = await handleSlashCommand(ctx, { text, chatId, openId, messageId, config });
+    if (handled) return;
+  }
+
+  let quoted = null;
+  if (message.parent_id) {
+    try {
+      quoted = await fetchQuotedMessageContext(client, {
+        parentId: message.parent_id,
+        chatKey: chatId || openId,
+      });
+    } catch {
+      quoted = null;
+    }
+  }
+
+  const docLinks = extractFeishuDocLinks([text, quoted?.text].filter(Boolean).join('\n')).slice(0, 2);
+  const docs = [];
+  for (const link of docLinks) {
+    try {
+      const doc = await readFeishuDoc(client, link.url, {
+        maxChars: 16000,
+        domain: config.feishu.domain,
+      });
+      docs.push(doc);
+    } catch (err) {
+      docs.push({
+        url: link.url,
+        error: err?.message || String(err),
+      });
+    }
+  }
+
+  let downloaded = [];
+  let failed = [];
+  if (attachments.length > 0) {
+    const dl = await downloadMessageAttachments(client, {
+      messageId,
+      chatKey: chatId || openId,
+      attachments,
+    });
+    downloaded = dl.downloaded;
+    failed = dl.failed;
+    if (downloaded.length === 0 && !text && !quoted && docs.length === 0) {
+      const errReason = failed[0]?.error || '未知错误';
+      await replySimpleCard(client, messageId, {
+        title: '❌ 附件下载失败',
+        template: 'red',
+        markdown: [
+          `未能下载你发送的附件：\`${errReason}\``,
+          '',
+          '如提示无权限，请在飞书开放平台「权限管理」开通 **`im:resource`**（获取与上传图片或文件资源）并发布新版本。',
+        ].join('\n'),
+      });
+      return;
+    }
+  }
+
+  const hasContext = Boolean(
+    downloaded.length > 0 ||
+    failed.length > 0 ||
+    (quoted && (quoted.text || quoted.downloaded?.length > 0)) ||
+    docs.length > 0,
+  );
+  const finalPrompt = hasContext
+    ? buildMultimodalPrompt({ text, downloaded, failed, quoted, docs })
+    : text;
+
+  const allFiles = [...downloaded, ...(quoted?.downloaded || [])];
+  const kindLabels = [...new Set(allFiles.map((d) => (
+    d.kind === 'image' ? '图片' : d.kind === 'audio' ? '语音' : d.kind === 'media' ? '视频' : '文件'
+  )))];
+  const noteParts = [];
+  if (quoted && (quoted.text || quoted.downloaded?.length > 0)) {
+    noteParts.push('↩️ 已带入引用消息');
+  }
+  const okDocsCount = docs.filter((d) => !d.error).length;
+  if (docs.length > 0) {
+    noteParts.push(okDocsCount > 0 ? `📄 已读取 ${okDocsCount} 篇云文档` : '⚠️ 云文档读取受限');
+  }
+  if (downloaded.length > 0) {
+    noteParts.push(`📎 已接收 ${downloaded.length} 个附件（${kindLabels.join('、')}）`);
+  } else if (failed.length > 0) {
+    noteParts.push('⚠️ 附件下载失败');
+  }
+
+  const tag = kindLabels.length > 0 ? `[${kindLabels.join('/')}]` : docs.length > 0 ? '[云文档]' : quoted ? '[引用]' : '';
+  const displayPreview = text
+    ? (tag ? `${tag} ${text}` : text)
+    : allFiles[0]?.fileName
+      ? `${tag} ${allFiles[0].fileName}`
+      : docs[0]?.title
+        ? `[云文档] ${docs[0].title}`
+        : '多模态上下文分析';
+
+  await runner.enqueueOrExecutePrompt({
+    text: finalPrompt,
+    displayPreview,
+    attachmentNote: noteParts.join(' · '),
+    chatId,
+    openId,
+    messageId,
+    config,
+  });
+}
+
+const dispatcher = new Lark.EventDispatcher({}).register({
+  'im.message.receive_v1': async (data) => {
+    void handleIncomingMessage(data).catch((err) => {
+      console.error('[feishu-remote] Unhandled message worker error:', err);
+    });
+  },
+  'card.action.trigger': async (data) => {
+    try {
+      return await handleCardAction(ctx, data);
+    } catch (err) {
+      console.error('[feishu-remote] Unhandled card action error:', err);
+      return toastCardResponse('error', '操作处理失败');
+    }
+  },
+  'application.bot.menu_v6': async (data) => {
+    void handleBotMenuEvent(ctx, data).catch((err) => {
+      console.error('[feishu-remote] Unhandled bot menu error:', err);
+    });
+  },
+  'im.message.reaction.created_v1': async () => {},
+  'im.message.reaction.deleted_v1': async () => {},
+});
+
+function shutdown(signalName) {
+  console.error(`[feishu-remote] Received ${signalName}, shutting down...`);
+  stopWsForRestart();
+  process.exit(0);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+setInterval(() => {
+  try {
+    const currentState = loadState();
+    const currentConfig = loadConfig();
+    let dirty = false;
+    for (const [key, chatInfo] of Object.entries(currentState.chats || {})) {
+      if (activeRuns.has(key)) continue;
+      const exp = enforceTempFullExpiry(currentState, chatInfo);
+      if (!exp.expired) continue;
+      dirty = true;
+      const targetChatId = key.startsWith('oc_')
+        ? key
+        : (currentState.lastP2pChatByOpenId?.[key] || '');
+      const targetOpenId = key.startsWith('ou_')
+        ? key
+        : (currentConfig.notifications.defaultReceiveId || currentConfig.security.allowedOpenIds?.[0] || '');
+      void sendCardToTarget(client, {
+        chatId: targetChatId,
+        openId: targetOpenId,
+        card: buildCard({
+          title: '🛡️ 临时全权限已到期',
+          template: 'grey',
+          markdown: `临时全权限已到期，系统已自动切回 \`${chatInfo.mode}\` 安全模式。`,
+          buttonRows: [[{ label: '⚙️ 打开控制面板', value: { cmd: 'panel' } }]],
+        }),
+      }).catch(() => {});
+    }
+    if (dirty) {
+      saveState(currentState);
+    }
+  } catch (err) {
+    console.error('[feishu-remote] Temp-full watcher error:', err?.message || err);
+  }
+}, 30_000).unref();
+
+try {
+  const maint = maintainRuntimeStorage();
+  if (maint.outLog.pruned || maint.errLog.pruned) {
+    console.error(
+      `[feishu-remote] Pruned oversized daemon logs (out: ${maint.outLog.pruned}, err: ${maint.errLog.pruned})`,
+    );
+  }
+} catch (err) {
+  console.error('[feishu-remote] Startup storage maintenance error:', err?.message || err);
+}
+
+setInterval(() => {
+  try {
+    maintainRuntimeStorage();
+  } catch {
+    // Ignore periodic maintenance errors
+  }
+}, 24 * 60 * 60 * 1000).unref();
+
+try {
+  const startupSnap = createBackupSnapshot({ reason: 'startup' });
+  if (startupSnap.created) {
+    console.error(`[feishu-remote] Saved startup snapshot ${startupSnap.snapshot.id}`);
+  }
+} catch (err) {
+  console.error('[feishu-remote] Startup snapshot error:', err?.message || err);
+}
+
+console.error(`[feishu-remote] Starting Feishu WebSocket bridge (domain=${initialConfig.feishu.domain}, hash=${bootCodeHash.slice(0, 8)})...`);
+wsClient.start({ eventDispatcher: dispatcher }).catch((err) => {
+  console.error('[feishu-remote] WSClient fatal error:', err);
+  process.exit(1);
+});
+
+setTimeout(() => {
+  const notice = consumePendingRestartNotice();
+  if (!notice || !notice.requestedAt || Date.now() - Number(notice.requestedAt) >= 5 * 60 * 1000) {
+    return;
+  }
+  const isRollback = notice.action === 'rollback';
+  const lines = [
+    `- **当前运行版本**：\`${bootCodeHash.slice(0, 8)}\``,
+    notice.previousHash ? `- **切换前版本**：\`${String(notice.previousHash).slice(0, 8)}\`` : '',
+    isRollback && notice.snapshotId ? `- **恢复快照**：\`${notice.snapshotId}\`` : '',
+    `- **进程 PID**：\`${process.pid}\``,
+  ].filter(Boolean);
+  void sendCardToTarget(client, {
+    chatId: notice.chatId || '',
+    openId: notice.openId || '',
+    card: buildCard({
+      title: isRollback ? '✅ 已回滚并重启上线' : '✅ 飞书桥接已安全重启上线',
+      template: 'green',
+      markdown: lines.join('\n'),
+      buttonRows: [[
+        { label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel' } },
+        { label: '⏪ 快照回滚', value: { cmd: 'ops' } },
+      ]],
+    }),
+  }).catch((err) => {
+    console.error('[feishu-remote] Failed to send post-restart confirmation card:', err?.message || err);
+  });
+}, 1500);

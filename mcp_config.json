@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "feishu-remote-tools": {
+      "command": "node",
+      "args": ["${PLUGIN_ROOT}/scripts/mcp-server.mjs"]
+    }
+  }
+}

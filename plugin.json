@@ -1,0 +1,12 @@
+{
+  "name": "feishu-remote",
+  "displayName": "飞书远程控制 (Feishu Remote)",
+  "description": "通过飞书长连接在手机上远程操控本机 Antigravity（支持流式卡片、多轮续聊、目录/模型/模式切换、账号白名单），并附带飞书 MCP 主动推送与任务完成提醒 Hook。",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "帮我配置并启动飞书远程控制机器人",
+    "查看飞书远程控制后台服务状态和最近日志",
+    "帮我把 feishu-remote 插件打包成可分享给朋友的 zip"
+  ]
+}
