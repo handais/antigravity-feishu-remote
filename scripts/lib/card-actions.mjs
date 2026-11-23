@@ -695,17 +695,19 @@ export async function handleCardAction(ctx, rawEvent) {
     config.agy.favoriteDirs = existing;
     saveConfig(config);
     saveState(state);
+    const page = Number(value?.page || 0);
     if (cmd === 'pin_in_dirs') {
-      return toastCardResponse('success', actionLabel, buildDirsCard({ chatState, config }));
+      return toastCardResponse('success', actionLabel, buildDirsCard({ chatState, config, page }));
     }
     return toastCardResponse('success', actionLabel, inplace ? renderPanel() : null);
   }
 
   if (cmd === 'dirs') {
     saveState(state);
-    const card = buildDirsCard({ chatState, config });
+    const page = Number(value?.page || 0);
+    const card = buildDirsCard({ chatState, config, page });
     if (inplace) {
-      return toastCardResponse('info', '目录浏览', card);
+      return toastCardResponse('info', value?.page !== undefined ? '已切换目录页' : '目录浏览', card);
     }
     void sendToTarget(card).catch((err) => {
       console.error('[feishu-remote] send dirs card error:', err.message);

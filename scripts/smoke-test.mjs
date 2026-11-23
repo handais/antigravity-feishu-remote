@@ -24,6 +24,7 @@ const {
   buildControlPanelCard,
   buildDesktopSessionPreviewCard,
   buildDesktopSessionsCard,
+  buildDirsCard,
   buildEffortCard,
   buildGitStatusCard,
   buildQueuedCard,
@@ -646,6 +647,25 @@ try {
   const topicPanelJson = JSON.stringify(topicPanelCard);
   assert.ok(topicPanelJson.includes('om_new_1_abc'));
   assert.ok(topicPanelJson.includes('全局并行 2/4'));
+
+  // 4j. Directory browser pagination
+  const manyDirRoot = path.join(tempConfigDir, 'many-dirs');
+  for (let i = 1; i <= 15; i += 1) {
+    fs.mkdirSync(path.join(manyDirRoot, `dir-${String(i).padStart(2, '0')}`), { recursive: true });
+  }
+  const dirPage0Json = JSON.stringify(
+    buildDirsCard({ chatState: { cwd: manyDirRoot }, config: topicConfig, page: 0 }),
+  );
+  assert.ok(dirPage0Json.includes('第 1/2 页'));
+  assert.ok(dirPage0Json.includes('▶️ 下一页 (2/2)'));
+  assert.ok(!dirPage0Json.includes('◀️ 上一页'));
+
+  const dirPage1Json = JSON.stringify(
+    buildDirsCard({ chatState: { cwd: manyDirRoot }, config: topicConfig, page: 1 }),
+  );
+  assert.ok(dirPage1Json.includes('第 2/2 页'));
+  assert.ok(dirPage1Json.includes('◀️ 上一页 (1/2)'));
+  assert.ok(dirPage1Json.includes('dir-15'));
 
   // 5. stop-notify.mjs subprocess checks
   const stopChildRes = await runSubprocess('scripts/stop-notify.mjs', {

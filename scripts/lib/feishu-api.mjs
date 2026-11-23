@@ -357,7 +357,7 @@ export function buildControlPanelCard({
   });
 }
 
-export function buildDirsCard({ chatState, config }) {
+export function buildDirsCard({ chatState, config, page = 0, pageSize = 12 }) {
   const cwd = path.resolve(chatState?.cwd || config?.agy?.defaultCwd || os.homedir());
   const home = path.resolve(os.homedir());
   const parentDir = path.dirname(cwd);
@@ -391,7 +391,11 @@ export function buildDirsCard({ chatState, config }) {
   } catch (err) {
     readErr = err?.message || '无法读取目录';
   }
-  const subDirs = allSubDirs.slice(0, 9);
+  const perPage = Math.max(3, Math.min(18, Number(pageSize) || 12));
+  const totalPages = Math.max(1, Math.ceil(allSubDirs.length / perPage));
+  const safePage = Math.max(0, Math.min(totalPages - 1, Math.floor(Number(page) || 0)));
+  const startIdx = safePage * perPage;
+  const subDirs = allSubDirs.slice(startIdx, startIdx + perPage);
 
   const lines = [
     `- **当前目录**：\`${cwd}\``,
@@ -399,7 +403,7 @@ export function buildDirsCard({ chatState, config }) {
     readErr
       ? `- **子目录读取失败**：\`${readErr}\``
       : allSubDirs.length > 0
-        ? `- **可见子目录**：共 ${allSubDirs.length} 个${allSubDirs.length > 9 ? '（显示前 9 个）' : ''}`
+        ? `- **可见子目录**：共 ${allSubDirs.length} 个${totalPages > 1 ? `（第 ${safePage + 1}/${totalPages} 页，显示 ${startIdx + 1}–${startIdx + subDirs.length}）` : ''}`
         : '- **可见子目录**：当前目录下暂无可见子文件夹',
   ];
 
@@ -416,7 +420,7 @@ export function buildDirsCard({ chatState, config }) {
   });
   navRow.push({
     label: isPinned ? '📌 取消收藏' : '📌 收藏此目录',
-    value: { cmd: 'pin_in_dirs', inplace: true },
+    value: { cmd: 'pin_in_dirs', page: safePage, inplace: true },
   });
 
   const favRows = favorites.length > 0
@@ -443,12 +447,29 @@ export function buildDirsCard({ chatState, config }) {
       )
     : [];
 
+  const pagerRow = [];
+  if (totalPages > 1) {
+    if (safePage > 0) {
+      pagerRow.push({
+        label: `◀️ 上一页 (${safePage}/${totalPages})`,
+        value: { cmd: 'dirs', page: safePage - 1, inplace: true },
+      });
+    }
+    if (safePage < totalPages - 1) {
+      pagerRow.push({
+        label: `▶️ 下一页 (${safePage + 2}/${totalPages})`,
+        type: 'primary',
+        value: { cmd: 'dirs', page: safePage + 1, inplace: true },
+      });
+    }
+  }
+
   return buildCard({
     title: '📁 目录浏览与切换',
     template: 'blue',
     markdown: lines.join('\n'),
-    buttonRows: [navRow, ...favRows, ...subDirRows],
-    footer: '点子目录进入，点「📌 收藏此目录」可固定到控制面板',
+    buttonRows: [navRow, ...favRows, ...subDirRows, ...(pagerRow.length > 0 ? [pagerRow] : [])],
+    footer: '点子目录进入，支持翻页；也可发送 /cd <关键词> 模糊直达',
   });
 }
 
