@@ -464,3 +464,35 @@ export function buildDesktopHandoffContext(detail, { maxTurns = 6 } = {}) {
   headerLines.push('', '请基于以上上下文直接响应用户接下来的请求：');
   return headerLines.join('\n');
 }
+
+/**
+ * Check read-only SQLite indexes to determine whether a conversation is a nested subagent (nesting_depth > 0).
+ */
+export function isSubagentConversation(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (!id) return false;
+  for (const store of getAppStores()) {
+    const dbPath = path.join(store.dir, 'conversation_summaries.db');
+    if (!fs.existsSync(dbPath)) continue;
+    let db;
+    try {
+      db = new DatabaseSync(dbPath, { readOnly: true });
+      db.exec('PRAGMA busy_timeout = 500;');
+      const row = db
+        .prepare('SELECT COALESCE(nesting_depth, 0) AS depth FROM conversation_summaries WHERE conversation_id = ? LIMIT 1')
+        .get(id);
+      if (row && Number(row.depth) > 0) {
+        return true;
+      }
+    } catch {
+      // Ignore single-store lookup failures
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        // Ignore close failures
+      }
+    }
+  }
+  return false;
+}

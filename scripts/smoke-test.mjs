@@ -37,6 +37,7 @@ const {
   buildDesktopHandoffContext,
   extractTranscriptTurns,
   getDesktopSessionDetail,
+  isSubagentConversation,
   listDesktopSessions,
 } = await import('./lib/desktop-sessions.mjs');
 const {
@@ -532,6 +533,8 @@ try {
     const previewCard = buildDesktopSessionPreviewCard(detail);
     assert.equal(previewCard.schema, '2.0');
     assert.ok(extractTranscriptTurns(path.join(cliAppDir, 'brain', 'cli-1')).length === 0);
+    assert.equal(isSubagentConversation('sub-ignored'), true);
+    assert.equal(isSubagentConversation('desk-1'), false);
   } finally {
     if (prevGeminiEnv === undefined) {
       delete process.env.FEISHU_REMOTE_GEMINI_DIR;
@@ -688,6 +691,38 @@ try {
   });
   assert.equal(stopUnconfiguredRes.code, 0);
   assert.equal(stopUnconfiguredRes.stdout.trim(), '{}');
+
+  const stopNotIdleRes = await runSubprocess('scripts/stop-notify.mjs', {
+    env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir },
+    stdinData: JSON.stringify({ fullyIdle: false, terminationReason: 'NO_TOOL_CALL' }),
+  });
+  assert.equal(stopNotIdleRes.code, 0);
+  assert.equal(stopNotIdleRes.stdout.trim(), '{}');
+  assert.equal(stopNotIdleRes.stderr.trim(), '');
+
+  const stopTerminalStepRes = await runSubprocess('scripts/stop-notify.mjs', {
+    env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir },
+    stdinData: JSON.stringify({ fullyIdle: true, terminationReason: 'TERMINAL_STEP_TYPE' }),
+  });
+  assert.equal(stopTerminalStepRes.code, 0);
+  assert.equal(stopTerminalStepRes.stdout.trim(), '{}');
+  assert.equal(stopTerminalStepRes.stderr.trim(), '');
+
+  const stopCanceledRes = await runSubprocess('scripts/stop-notify.mjs', {
+    env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir },
+    stdinData: JSON.stringify({ fullyIdle: true, terminationReason: 'USER_CANCELED' }),
+  });
+  assert.equal(stopCanceledRes.code, 0);
+  assert.equal(stopCanceledRes.stdout.trim(), '{}');
+  assert.equal(stopCanceledRes.stderr.trim(), '');
+
+  const stopSubagentRes = await runSubprocess('scripts/stop-notify.mjs', {
+    env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir, FEISHU_REMOTE_GEMINI_DIR: fakeGeminiDir },
+    stdinData: JSON.stringify({ conversationId: 'sub-ignored', fullyIdle: true, terminationReason: 'NO_TOOL_CALL' }),
+  });
+  assert.equal(stopSubagentRes.code, 0);
+  assert.equal(stopSubagentRes.stdout.trim(), '{}');
+  assert.equal(stopSubagentRes.stderr.trim(), '');
 
   // 6. mcp-server.mjs stdio JSON-RPC handshake
   await testMcpStdio();

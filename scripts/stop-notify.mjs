@@ -1,11 +1,11 @@
+import fs from 'node:fs';
 import path from 'node:path';
-import { loadConfig, stripProcessProxyEnv } from './lib/config.mjs';
-import {
-  buildCard,
-  createFeishuClient,
-  sanitizeForFeishuMarkdown,
-  sendCard,
-} from './lib/feishu-api.mjs';
+import { getConfigDir, loadConfig, stripProcessProxyEnv } from './lib/config.mjs';
+import { isSubagentConversation } from './lib/desktop-sessions.mjs';
+
+const SKIP_REASONS = new Set(['TERMINAL_STEP_TYPE', 'USER_CANCELED', 'TERMINAL_CUSTOM_HOOK']);
+const DEDUP_WINDOW_MS = 15_000;
+const DEDUP_RETENTION_MS = 5 * 60_000;
 
 function readStdinWithTimeout(timeoutMs = 2000) {
   return new Promise((resolve) => {
@@ -33,6 +33,42 @@ function readStdinWithTimeout(timeoutMs = 2000) {
   });
 }
 
+function shouldSkipByDedup(conversationId) {
+  if (!conversationId) return false;
+  try {
+    const dedupPath = path.join(getConfigDir(), 'stop-notify-dedup.json');
+    let map = {};
+    if (fs.existsSync(dedupPath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(dedupPath, 'utf8'));
+        if (parsed && typeof parsed === 'object') {
+          map = parsed;
+        }
+      } catch {
+        map = {};
+      }
+    }
+    const now = Date.now();
+    for (const [k, ts] of Object.entries(map)) {
+      if (!Number.isFinite(Number(ts)) || now - Number(ts) > DEDUP_RETENTION_MS) {
+        delete map[k];
+      }
+    }
+    const prevAt = Number(map[conversationId] || 0);
+    if (prevAt > 0 && now - prevAt < DEDUP_WINDOW_MS) {
+      return true;
+    }
+    map[conversationId] = now;
+    fs.mkdirSync(path.dirname(dedupPath), { recursive: true, mode: 0o700 });
+    const tmpPath = `${dedupPath}.tmp.${process.pid}.${now}`;
+    fs.writeFileSync(tmpPath, `${JSON.stringify(map)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmpPath, dedupPath);
+  } catch {
+    // Best-effort dedup; ignore FS errors
+  }
+  return false;
+}
+
 async function run() {
   if (process.env.FEISHU_REMOTE_BRIDGE_CHILD === '1') {
     return;
@@ -49,6 +85,22 @@ async function run() {
   }
 
   if (payload.continuationActive === true || payload.continuation_active === true) {
+    return;
+  }
+  if (payload.fullyIdle === false || payload.fully_idle === false) {
+    return;
+  }
+
+  const reason = String(payload.terminationReason || payload.termination_reason || 'COMPLETED')
+    .trim()
+    .toUpperCase();
+  const isError = reason === 'ERROR' || Boolean(payload.error);
+  if (!isError && SKIP_REASONS.has(reason)) {
+    return;
+  }
+
+  const conversationId = String(payload.conversationId || payload.conversation_id || '').trim();
+  if (conversationId && isSubagentConversation(conversationId)) {
     return;
   }
 
@@ -68,16 +120,24 @@ async function run() {
     return;
   }
 
+  if (shouldSkipByDedup(conversationId)) {
+    return;
+  }
+
+  const {
+    buildCard,
+    createFeishuClient,
+    sanitizeForFeishuMarkdown,
+    sendCard,
+  } = await import('./lib/feishu-api.mjs');
+
   stripProcessProxyEnv(config.feishu.proxy);
   const client = createFeishuClient(config, { quiet: true });
 
-  const conversationId = String(payload.conversationId || '').trim();
   const workspaceDir = String(payload.cwd || payload.workspacePaths?.[0] || '').trim();
   const workspaceName = workspaceDir ? path.basename(workspaceDir) || workspaceDir : '未指定目录';
   const modelName = String(payload.modelName || '').trim();
   const promptPreview = String(payload.lastUserInput || '').replace(/\s+/g, ' ').trim().slice(0, 120);
-  const reason = payload.terminationReason || 'COMPLETED';
-  const isError = reason === 'ERROR' || Boolean(payload.error);
 
   const lines = [
     `- **工作区**：\`${workspaceName}\``,
