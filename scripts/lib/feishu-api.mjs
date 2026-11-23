@@ -237,7 +237,16 @@ export function chunkButtons(buttons, perRow = 3) {
   return rows;
 }
 
-export function buildControlPanelCard({ chatState, config, isRunning = false, uptimeText = '', queueLength = 0 }) {
+export function buildControlPanelCard({
+  chatState,
+  config,
+  isRunning = false,
+  uptimeText = '',
+  queueLength = 0,
+  threadRootId = '',
+  activeParallelCount = 0,
+  maxConcurrentRuns = 4,
+}) {
   const cwd = chatState?.cwd || config?.agy?.defaultCwd || os.homedir();
   const mode = chatState?.mode || config?.agy?.defaultMode || 'accept-edits';
   const model = chatState?.model || config?.agy?.defaultModel || '';
@@ -258,9 +267,11 @@ export function buildControlPanelCard({ chatState, config, isRunning = false, up
     ? `\`full\`（⏱️ 临时全权，约 ${remainingMin} 分钟后自动切回 \`${revertMode}\`）`
     : `\`${mode}\``;
   const queueSuffix = queueLength > 0 ? `（排队 ${queueLength} 条）` : '';
+  const parallelSuffix = activeParallelCount > 1 ? ` · 全局并行 ${activeParallelCount}/${maxConcurrentRuns}` : '';
   const pendingHandoff = chatState.pendingHandoff;
 
   const lines = [
+    threadRootId ? `- **所属话题**：\`${threadRootId.slice(0, 12)}\`（独立并行会话）` : '',
     `- **工作目录**：\`${cwd}\``,
     `- **执行模式**：${modeDisplay}`,
     `- **当前模型**：\`${model || 'default (随 CLI 配置)'}\``,
@@ -269,7 +280,7 @@ export function buildControlPanelCard({ chatState, config, isRunning = false, up
     pendingHandoff
       ? `- **待注入上下文**：已挂接电脑端「${(pendingHandoff.title || '').slice(0, 24)}」（下条消息自动注入）`
       : '',
-    `- **运行状态**：${isRunning ? `⏳ 正在执行任务${queueSuffix}` : `🟢 空闲${queueSuffix}`}`,
+    `- **运行状态**：${isRunning ? `⏳ 正在执行任务${queueSuffix}${parallelSuffix}` : `🟢 空闲${queueSuffix}${parallelSuffix}`}`,
   ].filter(Boolean);
   if (uptimeText) {
     lines.push(`- **守护进程在线**：\`${uptimeText}\``);
@@ -627,11 +638,12 @@ export async function sendText(client, { receiveId, receiveIdType = 'open_id', t
   return res?.data?.message_id || '';
 }
 
-export async function replyCard(client, { messageId, card }) {
+export async function replyCard(client, { messageId, card, replyInThread = false }) {
   const res = await client.im.v1.message.reply({
     data: {
       msg_type: 'interactive',
       content: JSON.stringify(card),
+      ...(replyInThread ? { reply_in_thread: true } : {}),
     },
     path: {
       message_id: messageId,
@@ -655,7 +667,19 @@ export async function patchCard(client, { messageId, card }) {
 
 export async function deliverFinalCard(
   client,
-  { replyMessageId = '', chatId = '', receiveId = '', receiveIdType = 'chat_id', title, template, markdown, footer = '', buttonRows = [] },
+  {
+    replyMessageId = '',
+    replyTargetMessageId = '',
+    replyInThread = false,
+    chatId = '',
+    receiveId = '',
+    receiveIdType = 'chat_id',
+    title,
+    template,
+    markdown,
+    footer = '',
+    buttonRows = [],
+  },
 ) {
   const clean = sanitizeForFeishuMarkdown(markdown);
   const chunks = splitMarkdownChunks(clean, 7000);
@@ -683,7 +707,9 @@ export async function deliverFinalCard(
         // Fallback to sending a new card if patching fails (e.g., expired or deleted)
       }
     }
-    if (targetId) {
+    if (replyInThread && replyTargetMessageId) {
+      await replyCard(client, { messageId: replyTargetMessageId, card, replyInThread: true });
+    } else if (targetId) {
       await sendCard(client, { receiveId: targetId, receiveIdType: targetType, card });
     }
   }
@@ -716,7 +742,10 @@ function assertLocalFile(filePath, maxBytes, label) {
   return stat;
 }
 
-export async function uploadAndSendImage(client, { receiveId, receiveIdType = 'open_id', filePath }) {
+export async function uploadAndSendImage(
+  client,
+  { receiveId, receiveIdType = 'open_id', filePath, replyToMessageId = '', replyInThread = false },
+) {
   const stat = assertLocalFile(filePath, 10 * 1024 * 1024, '图片');
   let uploadRes;
   try {
@@ -737,16 +766,27 @@ export async function uploadAndSendImage(client, { receiveId, receiveIdType = 'o
 
   let sendRes;
   try {
-    sendRes = await client.im.v1.message.create({
-      data: {
-        receive_id: receiveId,
-        msg_type: 'image',
-        content: JSON.stringify({ image_key: imageKey }),
-      },
-      params: {
-        receive_id_type: receiveIdType,
-      },
-    });
+    if (replyInThread && replyToMessageId) {
+      sendRes = await client.im.v1.message.reply({
+        path: { message_id: replyToMessageId },
+        data: {
+          msg_type: 'image',
+          content: JSON.stringify({ image_key: imageKey }),
+          reply_in_thread: true,
+        },
+      });
+    } else {
+      sendRes = await client.im.v1.message.create({
+        data: {
+          receive_id: receiveId,
+          msg_type: 'image',
+          content: JSON.stringify({ image_key: imageKey }),
+        },
+        params: {
+          receive_id_type: receiveIdType,
+        },
+      });
+    }
   } catch (err) {
     throw unwrapLarkError(err, 'sendImage');
   }
@@ -760,7 +800,10 @@ export async function uploadAndSendImage(client, { receiveId, receiveIdType = 'o
   };
 }
 
-export async function uploadAndSendFile(client, { receiveId, receiveIdType = 'open_id', filePath }) {
+export async function uploadAndSendFile(
+  client,
+  { receiveId, receiveIdType = 'open_id', filePath, replyToMessageId = '', replyInThread = false },
+) {
   const stat = assertLocalFile(filePath, 30 * 1024 * 1024, '文件');
   const fileType = resolveFeishuFileType(filePath);
   const fileName = path.basename(filePath);
@@ -784,16 +827,27 @@ export async function uploadAndSendFile(client, { receiveId, receiveIdType = 'op
 
   let sendRes;
   try {
-    sendRes = await client.im.v1.message.create({
-      data: {
-        receive_id: receiveId,
-        msg_type: 'file',
-        content: JSON.stringify({ file_key: fileKey }),
-      },
-      params: {
-        receive_id_type: receiveIdType,
-      },
-    });
+    if (replyInThread && replyToMessageId) {
+      sendRes = await client.im.v1.message.reply({
+        path: { message_id: replyToMessageId },
+        data: {
+          msg_type: 'file',
+          content: JSON.stringify({ file_key: fileKey }),
+          reply_in_thread: true,
+        },
+      });
+    } else {
+      sendRes = await client.im.v1.message.create({
+        data: {
+          receive_id: receiveId,
+          msg_type: 'file',
+          content: JSON.stringify({ file_key: fileKey }),
+        },
+        params: {
+          receive_id_type: receiveIdType,
+        },
+      });
+    }
   } catch (err) {
     throw unwrapLarkError(err, 'sendFile');
   }
@@ -808,11 +862,14 @@ export async function uploadAndSendFile(client, { receiveId, receiveIdType = 'op
   };
 }
 
-export async function sendLocalMedia(client, { receiveId, receiveIdType = 'open_id', filePath, forceFile = false }) {
+export async function sendLocalMedia(
+  client,
+  { receiveId, receiveIdType = 'open_id', filePath, forceFile = false, replyToMessageId = '', replyInThread = false },
+) {
   if (!forceFile && isImageFilePath(filePath)) {
-    return uploadAndSendImage(client, { receiveId, receiveIdType, filePath });
+    return uploadAndSendImage(client, { receiveId, receiveIdType, filePath, replyToMessageId, replyInThread });
   }
-  return uploadAndSendFile(client, { receiveId, receiveIdType, filePath });
+  return uploadAndSendFile(client, { receiveId, receiveIdType, filePath, replyToMessageId, replyInThread });
 }
 
 const SKIP_SEARCH_DIRS = new Set(['node_modules', 'Library', 'Applications']);

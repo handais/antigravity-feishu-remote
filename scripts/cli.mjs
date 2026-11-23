@@ -181,6 +181,14 @@ function cmdSetup(flags) {
     config.agy.timeoutSeconds = Math.floor(t);
   }
 
+  if (typeof flags['max-concurrent'] === 'string') {
+    const mc = Number(flags['max-concurrent']);
+    if (!Number.isFinite(mc) || mc < 1 || mc > 10) {
+      throw new Error('--max-concurrent must be between 1 and 10');
+    }
+    config.agy.maxConcurrentRuns = Math.floor(mc);
+  }
+
   if (flags['allow-open-id'] !== undefined) {
     const rawList = Array.isArray(flags['allow-open-id'])
       ? flags['allow-open-id']

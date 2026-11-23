@@ -49,6 +49,7 @@ Run commands with `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs`:
   - `--model <model-id>`
   - `--effort <low|medium|high|xhigh|max|default>` (default `default`)
   - `--timeout <seconds>` (default `3600`; `0` for unlimited)
+  - `--max-concurrent <1..10>` (default `4`; max simultaneous active `agy` runs across chats/topic threads)
   - `--proxy <http://127.0.0.1:7897>` (proxy for spawned `agy` subprocesses; auto-detected if omitted)
   - `--feishu-proxy <url>` (usually leave empty so Feishu connects directly)
   - `--allow-open-id <ou_xxx>` (repeatable; if omitted, first private-chat sender is auto-bound)

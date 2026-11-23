@@ -28,6 +28,8 @@ import {
 import {
   enforceTempFullExpiry,
   formatHelpMarkdown,
+  makeSessionKey,
+  parseSessionKey,
   replySimpleCard,
   sendCardToTarget,
   stripMentions,
@@ -60,6 +62,58 @@ const seenMessageIds = new Set();
 const activeRuns = new Map(); // runKey -> { controller, promptPreview, startedAt }
 const chatQueues = new Map(); // runKey -> Array<{ id, queuedAt, payload, queueMessageId }>
 const lastTaskByChat = new Map(); // runKey -> payload
+const cardThreadMap = new Map(); // cardMessageId -> { sessionKey, threadRootId, chatId }
+const chatModeCache = new Map(); // chatId -> 'topic' | 'group' | ...
+
+function recordCardThread(cardMessageId, meta) {
+  if (!cardMessageId || !meta?.threadRootId) return;
+  if (cardThreadMap.size >= 1500) {
+    const oldest = cardThreadMap.keys().next().value;
+    if (oldest !== undefined) cardThreadMap.delete(oldest);
+  }
+  cardThreadMap.set(cardMessageId, {
+    sessionKey: meta.sessionKey || makeSessionKey(meta.chatId, meta.threadRootId),
+    threadRootId: meta.threadRootId,
+    chatId: meta.chatId || '',
+  });
+}
+
+async function resolveTopicContext(message, chatId, chatType) {
+  if (chatType === 'p2p' || !chatId) {
+    return { isTopicThread: false, threadRootId: '', sessionKey: chatId };
+  }
+  if (message.thread_id) {
+    const threadRootId = message.root_id || message.message_id;
+    return {
+      isTopicThread: Boolean(threadRootId),
+      threadRootId,
+      sessionKey: makeSessionKey(chatId, threadRootId),
+    };
+  }
+  let chatMode = chatModeCache.get(chatId);
+  if (!chatMode && chatId.startsWith('oc_')) {
+    try {
+      const res = await client.im.v1.chat.get({ path: { chat_id: chatId } });
+      chatMode = res?.data?.chat_mode || 'group';
+    } catch {
+      chatMode = 'group';
+    }
+    if (chatModeCache.size >= 500) {
+      const oldest = chatModeCache.keys().next().value;
+      if (oldest !== undefined) chatModeCache.delete(oldest);
+    }
+    chatModeCache.set(chatId, chatMode);
+  }
+  if (chatMode === 'topic') {
+    const threadRootId = message.root_id || message.message_id;
+    return {
+      isTopicThread: Boolean(threadRootId),
+      threadRootId,
+      sessionKey: makeSessionKey(chatId, threadRootId),
+    };
+  }
+  return { isTopicThread: false, threadRootId: '', sessionKey: chatId };
+}
 
 function markMessageSeen(messageId) {
   if (!messageId) return false;
@@ -93,6 +147,7 @@ const runner = createTaskRunner({
   activeRuns,
   chatQueues,
   lastTaskByChat,
+  recordCardThread,
 });
 
 const ctx = {
@@ -102,6 +157,8 @@ const ctx = {
   activeRuns,
   chatQueues,
   lastTaskByChat,
+  cardThreadMap,
+  recordCardThread,
   runner,
   stopWsForRestart,
 };
@@ -192,13 +249,21 @@ async function handleIncomingMessage(rawEvent) {
     }
   }
 
+  const { isTopicThread, threadRootId, sessionKey } = await resolveTopicContext(message, chatId, chatType);
+  const runKey = sessionKey || chatId || openId;
+  const replyTargetId = isTopicThread ? (threadRootId || messageId) : messageId;
+
   if (!supported) {
     if (!justBound) {
-      await replySimpleCard(client, messageId, {
+      const sentErrId = await replySimpleCard(client, replyTargetId, {
         title: 'ℹ️ 暂不支持该消息类型',
         template: 'grey',
         markdown: `当前支持文本、富文本、图片/截图、文件和语音消息，暂不支持 \`${msgType || 'unknown'}\` 类型。`,
+        replyInThread: isTopicThread,
       });
+      if (isTopicThread && sentErrId) {
+        recordCardThread(sentErrId, { sessionKey: runKey, threadRootId, chatId });
+      }
     }
     return;
   }
@@ -206,19 +271,34 @@ async function handleIncomingMessage(rawEvent) {
   if (!text && attachments.length === 0) return;
 
   if (text.startsWith('/') && attachments.length === 0) {
-    const handled = await handleSlashCommand(ctx, { text, chatId, openId, messageId, config });
+    const handled = await handleSlashCommand(ctx, {
+      text,
+      chatId,
+      openId,
+      messageId,
+      sessionKey: runKey,
+      threadRootId,
+      replyInThread: isTopicThread,
+      config,
+    });
     if (handled) return;
   }
 
   let quoted = null;
   if (message.parent_id) {
-    try {
-      quoted = await fetchQuotedMessageContext(client, {
-        parentId: message.parent_id,
-        chatKey: chatId || openId,
-      });
-    } catch {
-      quoted = null;
+    const isPlainTopicFollowup =
+      isTopicThread &&
+      message.parent_id === threadRootId &&
+      Boolean(loadState().chats?.[runKey]?.conversationId);
+    if (!isPlainTopicFollowup) {
+      try {
+        quoted = await fetchQuotedMessageContext(client, {
+          parentId: message.parent_id,
+          chatKey: chatId || openId,
+        });
+      } catch {
+        quoted = null;
+      }
     }
   }
 
@@ -251,7 +331,7 @@ async function handleIncomingMessage(rawEvent) {
     failed = dl.failed;
     if (downloaded.length === 0 && !text && !quoted && docs.length === 0) {
       const errReason = failed[0]?.error || '未知错误';
-      await replySimpleCard(client, messageId, {
+      const sentDlErrId = await replySimpleCard(client, replyTargetId, {
         title: '❌ 附件下载失败',
         template: 'red',
         markdown: [
@@ -259,7 +339,11 @@ async function handleIncomingMessage(rawEvent) {
           '',
           '如提示无权限，请在飞书开放平台「权限管理」开通 **`im:resource`**（获取与上传图片或文件资源）并发布新版本。',
         ].join('\n'),
+        replyInThread: isTopicThread,
       });
+      if (isTopicThread && sentDlErrId) {
+        recordCardThread(sentDlErrId, { sessionKey: runKey, threadRootId, chatId });
+      }
       return;
     }
   }
@@ -308,11 +392,14 @@ async function handleIncomingMessage(rawEvent) {
     chatId,
     openId,
     messageId,
+    sessionKey: runKey,
+    threadRootId,
+    replyInThread: isTopicThread,
     config,
   });
 }
 
-const dispatcher = new Lark.EventDispatcher({}).register({
+const dispatcher = new Lark.EventDispatcher({ loggerLevel: Lark.LoggerLevel.warn }).register({
   'im.message.receive_v1': async (data) => {
     void handleIncomingMessage(data).catch((err) => {
       console.error('[feishu-remote] Unhandled message worker error:', err);
@@ -354,15 +441,18 @@ setInterval(() => {
       const exp = enforceTempFullExpiry(currentState, chatInfo);
       if (!exp.expired) continue;
       dirty = true;
-      const targetChatId = key.startsWith('oc_')
-        ? key
-        : (currentState.lastP2pChatByOpenId?.[key] || '');
-      const targetOpenId = key.startsWith('ou_')
-        ? key
+      const { chatId: parsedChatId, threadRootId } = parseSessionKey(key);
+      const targetChatId = parsedChatId.startsWith('oc_')
+        ? parsedChatId
+        : (currentState.lastP2pChatByOpenId?.[parsedChatId] || '');
+      const targetOpenId = parsedChatId.startsWith('ou_')
+        ? parsedChatId
         : (currentConfig.notifications.defaultReceiveId || currentConfig.security.allowedOpenIds?.[0] || '');
       void sendCardToTarget(client, {
         chatId: targetChatId,
         openId: targetOpenId,
+        replyToMessageId: threadRootId,
+        replyInThread: Boolean(threadRootId),
         card: buildCard({
           title: '🛡️ 临时全权限已到期',
           template: 'grey',

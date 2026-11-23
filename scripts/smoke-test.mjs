@@ -56,6 +56,7 @@ const {
   extractInboundMessage,
   extractInteractiveCardText,
   pruneLogFileIfOversized,
+  pruneStaleThreadStates,
 } = await import('./lib/media.mjs');
 const {
   createBackupSnapshot,
@@ -63,6 +64,9 @@ const {
   runPreflightCheck,
 } = await import('./lib/self-ops.mjs');
 const {
+  getOrCreateChatState,
+  makeSessionKey,
+  parseSessionKey,
   parseTimeoutArg,
 } = await import('./lib/bridge-helpers.mjs');
 const {
@@ -564,6 +568,84 @@ try {
   assert.equal(fs.existsSync(oldFile), false);
   assert.equal(fs.existsSync(midFile), false);
   assert.equal(fs.existsSync(newFile), true);
+
+  // 4i. Topic group session keys, inheritance, stale thread pruning, and panel badges
+  assert.equal(makeSessionKey('oc_topic_1', ''), 'oc_topic_1');
+  assert.equal(makeSessionKey('oc_topic_1', 'om_root_1'), 'oc_topic_1#om_root_1');
+  assert.deepEqual(parseSessionKey('oc_topic_1'), { chatId: 'oc_topic_1', threadRootId: '' });
+  assert.deepEqual(parseSessionKey('oc_topic_1#om_root_1'), {
+    chatId: 'oc_topic_1',
+    threadRootId: 'om_root_1',
+  });
+
+  const topicConfig = {
+    agy: {
+      defaultCwd: os.homedir(),
+      defaultMode: 'accept-edits',
+      defaultModel: '',
+      defaultEffort: '',
+      maxConcurrentRuns: 4,
+    },
+  };
+  const nowMs = Date.now();
+  const topicState = {
+    chats: {
+      oc_topic_1: {
+        conversationId: '',
+        cwd: pluginRoot,
+        mode: 'auto',
+        model: 'gemini-3.1-pro',
+        effort: 'high',
+        recentConversations: [],
+        pendingHandoff: null,
+        fullExpiresAt: 0,
+        fullRevertMode: 'accept-edits',
+        lastActiveAt: nowMs - 40 * 86400_000,
+      },
+      'oc_topic_1#om_stale': {
+        conversationId: 'old-conv',
+        cwd: os.homedir(),
+        mode: 'accept-edits',
+        lastActiveAt: nowMs - 35 * 86400_000,
+      },
+      'oc_topic_1#om_fresh': {
+        conversationId: 'fresh-conv',
+        cwd: os.homedir(),
+        mode: 'accept-edits',
+        lastActiveAt: nowMs - 1000,
+      },
+    },
+    lastP2pChatByOpenId: {},
+  };
+
+  const inheritedThread = getOrCreateChatState(topicState, 'oc_topic_1#om_new_1', topicConfig);
+  assert.equal(inheritedThread.cwd, pluginRoot);
+  assert.equal(inheritedThread.mode, 'auto');
+  assert.equal(inheritedThread.model, 'gemini-3.1-pro');
+  assert.equal(inheritedThread.effort, 'high');
+  assert.ok(inheritedThread.lastActiveAt > 0);
+  assert.equal(topicState.chats['oc_topic_1#om_fresh'].cwd, os.homedir());
+
+  saveState(topicState);
+  const prunedCount = pruneStaleThreadStates(30);
+  assert.equal(prunedCount, 1);
+  const afterPrune = loadState();
+  assert.equal(Boolean(afterPrune.chats.oc_topic_1), true);
+  assert.equal(Boolean(afterPrune.chats['oc_topic_1#om_stale']), false);
+  assert.equal(Boolean(afterPrune.chats['oc_topic_1#om_fresh']), true);
+
+  const topicPanelCard = buildControlPanelCard({
+    chatState: inheritedThread,
+    config: topicConfig,
+    isRunning: true,
+    threadRootId: 'om_new_1_abc',
+    activeParallelCount: 2,
+    maxConcurrentRuns: 4,
+  });
+  assert.equal(topicPanelCard.schema, '2.0');
+  const topicPanelJson = JSON.stringify(topicPanelCard);
+  assert.ok(topicPanelJson.includes('om_new_1_abc'));
+  assert.ok(topicPanelJson.includes('全局并行 2/4'));
 
   // 5. stop-notify.mjs subprocess checks
   const stopChildRes = await runSubprocess('scripts/stop-notify.mjs', {

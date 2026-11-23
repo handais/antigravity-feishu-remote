@@ -76,6 +76,7 @@ export const DEFAULT_CONFIG = {
     quickPrompts: [],
     proxy: '',
     timeoutSeconds: 3600,
+    maxConcurrentRuns: 4,
   },
   notifications: {
     defaultReceiveId: '',

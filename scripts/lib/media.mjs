@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { getConfigDir, getLogPaths } from './config.mjs';
+import { getConfigDir, getLogPaths, loadState, saveState } from './config.mjs';
 
 export const IMAGE_EXTENSIONS = new Set([
   '.png',
@@ -182,6 +182,33 @@ export function pruneLogFileIfOversized(
 }
 
 /**
+ * Prune stale per-thread chat state entries older than maxAgeDays (only `#` thread sub-sessions).
+ */
+export function pruneStaleThreadStates(maxAgeDays = 30) {
+  let removed = 0;
+  try {
+    const state = loadState();
+    const cutoff = Date.now() - Math.max(1, Number(maxAgeDays) || 30) * 86400_000;
+    let dirty = false;
+    for (const [key, info] of Object.entries(state.chats || {})) {
+      if (!key.includes('#')) continue;
+      const lastActive = Number(info?.lastActiveAt || 0);
+      if (lastActive > 0 && lastActive < cutoff) {
+        delete state.chats[key];
+        removed += 1;
+        dirty = true;
+      }
+    }
+    if (dirty) {
+      saveState(state);
+    }
+  } catch {
+    // Ignore stale thread state cleanup failures
+  }
+  return removed;
+}
+
+/**
  * Run periodic maintenance on daemon logs and downloaded inbox attachments.
  */
 export function maintainRuntimeStorage({
@@ -189,6 +216,7 @@ export function maintainRuntimeStorage({
   keepLogBytes = 512 * 1024,
   inboxMaxAgeDays = 7,
   inboxMaxBytes = 200 * 1024 * 1024,
+  threadMaxAgeDays = 30,
 } = {}) {
   const { outLog, errLog } = getLogPaths();
   let outRes = { pruned: false, beforeBytes: 0, afterBytes: 0 };
@@ -204,7 +232,8 @@ export function maintainRuntimeStorage({
     // Ignore errLog prune failure
   }
   cleanupOldInboxFiles(inboxMaxAgeDays, { maxTotalBytes: inboxMaxBytes });
-  return { outLog: outRes, errLog: errRes };
+  const prunedThreads = pruneStaleThreadStates(threadMaxAgeDays);
+  return { outLog: outRes, errLog: errRes, prunedThreads };
 }
 
 export function detectExtensionFromBuffer(buf, fallbackExt = '.bin') {

@@ -12,7 +12,7 @@ import {
   buildQueueListCard,
   buildQuickPromptsCard,
   buildScopesCard,
-  replyCard,
+  replyCard as sendReplyCard,
   searchDirsFuzzy,
   sendLocalMedia,
 } from './feishu-api.mjs';
@@ -41,12 +41,24 @@ import {
   replySimpleCard,
 } from './bridge-helpers.mjs';
 
-export async function handleSlashCommand(ctx, { text, chatId, openId = '', messageId, config }) {
-  const { client, startedAt, bootCodeHash, activeRuns, runner, stopWsForRestart } = ctx;
+export async function handleSlashCommand(
+  ctx,
+  {
+    text,
+    chatId,
+    openId = '',
+    messageId,
+    sessionKey = '',
+    threadRootId = '',
+    replyInThread = false,
+    config,
+  },
+) {
+  const { client, startedAt, bootCodeHash, activeRuns, runner, stopWsForRestart, recordCardThread = () => {} } = ctx;
   const [rawCmd, ...rest] = text.trim().split(/\s+/);
   const cmd = rawCmd.toLowerCase();
   const arg = rest.join(' ').trim();
-  const runKey = chatId || openId;
+  const runKey = sessionKey || chatId || openId;
   const state = loadState();
   const chatState = getOrCreateChatState(state, runKey, config);
   const expiryInfo = enforceTempFullExpiry(state, chatState);
@@ -56,7 +68,25 @@ export async function handleSlashCommand(ctx, { text, chatId, openId = '', messa
   const isRunning = Boolean(runKey && activeRuns.has(runKey));
   const queueLength = runner.getQueueForChat(runKey).length;
   const anyBusy = () => activeRuns.size > 0 || runner.totalQueuedCount() > 0;
-  const replySimple = (opts) => replySimpleCard(client, messageId, opts);
+  const replyTargetId = replyInThread ? (threadRootId || messageId) : messageId;
+  const replyCard = async (targetClient, { messageId: targetMsgId, card }) => {
+    const sentId = await sendReplyCard(targetClient || client, {
+      messageId: replyInThread ? (threadRootId || targetMsgId) : targetMsgId,
+      card,
+      replyInThread,
+    });
+    if (threadRootId && sentId) {
+      recordCardThread(sentId, { sessionKey: runKey, threadRootId, chatId });
+    }
+    return sentId;
+  };
+  const replySimple = async (opts) => {
+    const sentId = await replySimpleCard(client, replyTargetId, { ...opts, replyInThread });
+    if (threadRootId && sentId) {
+      recordCardThread(sentId, { sessionKey: runKey, threadRootId, chatId });
+    }
+    return sentId;
+  };
 
   if (cmd === '/panel' || cmd === '/menu') {
     await replyCard(client, {
@@ -67,6 +97,9 @@ export async function handleSlashCommand(ctx, { text, chatId, openId = '', messa
         isRunning,
         uptimeText: formatUptime(Date.now() - startedAt),
         queueLength,
+        threadRootId,
+        activeParallelCount: activeRuns.size,
+        maxConcurrentRuns: config.agy.maxConcurrentRuns || 4,
       }),
     });
     return true;
@@ -273,6 +306,7 @@ export async function handleSlashCommand(ctx, { text, chatId, openId = '', messa
       ? `\`full\`（临时授权，约 ${remainMin}m 后切回 \`${chatState.fullRevertMode || 'accept-edits'}\`）`
       : `\`${chatState.mode}\``;
     const lines = [
+      threadRootId ? `- **所属话题**：\`${threadRootId.slice(0, 12)}\`（独立并行会话）` : '',
       `- **工作目录**：\`${chatState.cwd}\``,
       `- **执行模式**：${modeText}`,
       `- **单轮超时**：\`${formatTimeoutLabel(config.agy.timeoutSeconds)}\``,
@@ -283,6 +317,7 @@ export async function handleSlashCommand(ctx, { text, chatId, openId = '', messa
         ? `- **待注入电脑端上下文**：\`${chatState.pendingHandoff.id?.slice(0, 8) || '-'}\` · ${chatState.pendingHandoff.title || '(无标题)'}`
         : '',
       `- **运行中任务**：${running ? `是（已运行 ${Math.round((Date.now() - running.startedAt) / 1000)}s）` : '空闲'}`,
+      activeRuns.size > 0 ? `- **全局并行运行**：\`${activeRuns.size}/${config.agy.maxConcurrentRuns || 4}\`` : '',
       `- **排队中任务**：\`${queueLength}\` 条`,
       `- **守护进程在线**：\`${formatUptime(Date.now() - startedAt)}\``,
     ].filter(Boolean);
@@ -397,6 +432,9 @@ export async function handleSlashCommand(ctx, { text, chatId, openId = '', messa
     }
     if (directIsDir) {
       chatState.cwd = targetDir;
+      if (threadRootId && chatId) {
+        getOrCreateChatState(state, chatId, config).cwd = targetDir;
+      }
       saveState(state);
       await replySimple({
         title: '📂 已切换工作目录',
@@ -413,6 +451,9 @@ export async function handleSlashCommand(ctx, { text, chatId, openId = '', messa
     const matches = searchDirsFuzzy(arg, { config, currentCwd: chatState.cwd });
     if (matches.length === 1) {
       chatState.cwd = matches[0];
+      if (threadRootId && chatId) {
+        getOrCreateChatState(state, chatId, config).cwd = matches[0];
+      }
       saveState(state);
       await replySimple({
         title: '📂 已模糊匹配并切换工作目录',
@@ -472,6 +513,8 @@ export async function handleSlashCommand(ctx, { text, chatId, openId = '', messa
         receiveIdType: chatId ? 'chat_id' : 'open_id',
         filePath: targetFile,
         forceFile,
+        replyToMessageId: replyTargetId,
+        replyInThread,
       });
       await replySimple({
         title: sent.kind === 'image' ? '🖼️ 图片已发送' : '📎 文件已发送',

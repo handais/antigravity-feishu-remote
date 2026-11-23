@@ -152,6 +152,8 @@ export async function createStreamingCardSession(
   client,
   {
     messageId = '',
+    replyTargetMessageId = '',
+    replyInThread = false,
     chatId = '',
     openId = '',
     title = '⏳ Antigravity 正在处理...',
@@ -167,6 +169,7 @@ export async function createStreamingCardSession(
   let mode = 'patch';
   let cardId = '';
   let replyMessageId = '';
+  const effectiveReplyTarget = replyTargetMessageId || messageId;
 
   const canUseCardKit = Boolean(
     client?.cardkit?.v1?.card?.create &&
@@ -204,12 +207,13 @@ export async function createStreamingCardSession(
         data: { card_id: createdCardId },
       });
       let sendRes;
-      if (messageId) {
+      if (effectiveReplyTarget) {
         sendRes = await client.im.v1.message.reply({
-          path: { message_id: messageId },
+          path: { message_id: effectiveReplyTarget },
           data: {
             msg_type: 'interactive',
             content: contentPayload,
+            ...(replyInThread ? { reply_in_thread: true } : {}),
           },
         });
       } else if (chatId || openId) {
@@ -244,8 +248,12 @@ export async function createStreamingCardSession(
       buttonRows: stopButton ? [[{ label: '🛑 立即中止', type: 'danger', value: { cmd: 'stop' } }]] : [],
     });
     try {
-      if (messageId) {
-        replyMessageId = await replyCard(client, { messageId, card: initialCard });
+      if (effectiveReplyTarget) {
+        replyMessageId = await replyCard(client, {
+          messageId: effectiveReplyTarget,
+          card: initialCard,
+          replyInThread,
+        });
       } else if (chatId || openId) {
         replyMessageId = await sendCard(client, {
           receiveId: chatId || openId,
@@ -528,6 +536,8 @@ export async function createStreamingCardSession(
       buttonRows = [],
       chatId: targetChatId = chatId,
       openId: targetOpenId = openId,
+      replyTargetMessageId: finalReplyTarget = effectiveReplyTarget,
+      replyInThread: finalReplyInThread = replyInThread,
     }) {
       closed = true;
       const wasStreamingActive = streamingActive;
@@ -614,7 +624,7 @@ export async function createStreamingCardSession(
 
         if (updatedOk) {
           for (let i = 1; i < chunks.length; i += 1) {
-            if (!targetId) break;
+            if (!targetId && !(finalReplyInThread && finalReplyTarget)) break;
             const isLast = i === chunks.length - 1;
             const extraCard = buildCard({
               title: `${finalTitle} (${i + 1}/${chunks.length})`,
@@ -623,7 +633,15 @@ export async function createStreamingCardSession(
               footer: isLast ? finalFooter : '',
               buttonRows: isLast ? buttonRows : [],
             });
-            await sendCard(client, { receiveId: targetId, receiveIdType: targetType, card: extraCard });
+            if (finalReplyInThread && finalReplyTarget) {
+              await replyCard(client, {
+                messageId: finalReplyTarget,
+                card: extraCard,
+                replyInThread: true,
+              });
+            } else {
+              await sendCard(client, { receiveId: targetId, receiveIdType: targetType, card: extraCard });
+            }
           }
           return;
         }
@@ -631,6 +649,8 @@ export async function createStreamingCardSession(
 
       await deliverFinalCard(client, {
         replyMessageId,
+        replyTargetMessageId: finalReplyTarget,
+        replyInThread: finalReplyInThread,
         chatId: targetChatId,
         receiveId: targetOpenId,
         receiveIdType: 'open_id',

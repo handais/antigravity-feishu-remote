@@ -10,6 +10,7 @@ import {
 import {
   enforceTempFullExpiry,
   getOrCreateChatState,
+  makeSessionKey,
   recordRecentConversation,
   sendCardToTarget,
 } from './bridge-helpers.mjs';
@@ -68,7 +69,19 @@ export function sanitizeRetryPayload(payload) {
   return { ...rest, queueReactionId: '' };
 }
 
-export function createTaskRunner({ client, activeRuns, chatQueues, lastTaskByChat }) {
+function getMaxConcurrent(config) {
+  const n = Number(config?.agy?.maxConcurrentRuns || 4);
+  if (!Number.isFinite(n) || n < 1) return 4;
+  return Math.max(1, Math.min(10, Math.floor(n)));
+}
+
+export function createTaskRunner({
+  client,
+  activeRuns,
+  chatQueues,
+  lastTaskByChat,
+  recordCardThread = () => {},
+}) {
   const getQueueForChat = (runKey) => {
     if (!runKey) return [];
     return chatQueues.get(runKey) || [];
@@ -89,10 +102,14 @@ export function createTaskRunner({ client, activeRuns, chatQueues, lastTaskByCha
     chatId = '',
     openId = '',
     messageId = '',
+    sessionKey = '',
+    threadRootId = '',
+    replyInThread = false,
     queueReactionId = '',
     config,
   }) => {
-    const runKey = chatId || openId;
+    const runKey = sessionKey || makeSessionKey(chatId, threadRootId) || chatId || openId;
+    const replyTarget = threadRootId || messageId;
     const summaryText = displayPreview || text;
 
     const state = loadState();
@@ -117,6 +134,9 @@ export function createTaskRunner({ client, activeRuns, chatQueues, lastTaskByCha
         chatId,
         openId,
         messageId,
+        sessionKey: runKey,
+        threadRootId,
+        replyInThread,
         config,
       }),
     );
@@ -152,6 +172,8 @@ export function createTaskRunner({ client, activeRuns, chatQueues, lastTaskByCha
 
     const streamSession = await createStreamingCardSession(client, {
       messageId,
+      replyTargetMessageId: replyTarget,
+      replyInThread,
       chatId,
       openId,
       title: '⏳ Antigravity 正在处理...',
@@ -161,6 +183,13 @@ export function createTaskRunner({ client, activeRuns, chatQueues, lastTaskByCha
       footer: '点下方按钮或发送 /stop 可中止',
       stopButton: true,
     });
+    if (threadRootId && streamSession.replyMessageId) {
+      recordCardThread(streamSession.replyMessageId, {
+        sessionKey: runKey,
+        threadRootId,
+        chatId,
+      });
+    }
 
     let actualEffort = effectiveEffort;
     let effortFallbackUsed = false;
@@ -332,6 +361,8 @@ export function createTaskRunner({ client, activeRuns, chatQueues, lastTaskByCha
         buttonRows: [buttons],
         chatId,
         openId,
+        replyTargetMessageId: replyTarget,
+        replyInThread,
       });
 
       if (messageId && !result.aborted && !isFailed) {
@@ -355,6 +386,8 @@ export function createTaskRunner({ client, activeRuns, chatQueues, lastTaskByCha
         ]],
         chatId,
         openId,
+        replyTargetMessageId: replyTarget,
+        replyInThread,
       });
     } finally {
       activeRuns.delete(runKey);
@@ -367,16 +400,41 @@ export function createTaskRunner({ client, activeRuns, chatQueues, lastTaskByCha
         setTimeout(() => {
           void executePrompt(nextItem.payload);
         }, 150);
+      } else {
+        const maxConcurrent = getMaxConcurrent(config);
+        if (activeRuns.size < maxConcurrent) {
+          for (const [otherKey, otherQueue] of chatQueues.entries()) {
+            if (activeRuns.has(otherKey) || !Array.isArray(otherQueue) || otherQueue.length === 0) {
+              continue;
+            }
+            const nextOther = otherQueue.shift();
+            if (otherQueue.length === 0) {
+              chatQueues.delete(otherKey);
+            }
+            setTimeout(() => {
+              void executePrompt(nextOther.payload);
+            }, 150);
+            break;
+          }
+        }
       }
     }
   };
 
   const enqueueOrExecutePrompt = async (payload) => {
-    const runKey = payload.chatId || payload.openId;
+    const runKey =
+      payload.sessionKey ||
+      makeSessionKey(payload.chatId, payload.threadRootId) ||
+      payload.chatId ||
+      payload.openId;
     if (!runKey) return;
 
-    if (!activeRuns.has(runKey)) {
-      void executePrompt(payload);
+    const maxConcurrent = getMaxConcurrent(payload.config);
+    const replyTarget = payload.threadRootId || payload.messageId;
+    const replyInThread = Boolean(payload.replyInThread);
+
+    if (!activeRuns.has(runKey) && activeRuns.size < maxConcurrent) {
+      void executePrompt({ ...payload, sessionKey: runKey });
       return;
     }
 
@@ -392,10 +450,14 @@ export function createTaskRunner({ client, activeRuns, chatQueues, lastTaskByCha
         ]],
       });
       try {
-        if (payload.messageId) {
-          await replyCard(client, { messageId: payload.messageId, card: fullCard });
+        let fullMsgId = '';
+        if (replyTarget) {
+          fullMsgId = await replyCard(client, { messageId: replyTarget, card: fullCard, replyInThread });
         } else {
-          await sendCardToTarget(client, { chatId: payload.chatId, openId: payload.openId, card: fullCard });
+          fullMsgId = await sendCardToTarget(client, { chatId: payload.chatId, openId: payload.openId, card: fullCard });
+        }
+        if (payload.threadRootId && fullMsgId) {
+          recordCardThread(fullMsgId, { sessionKey: runKey, threadRootId: payload.threadRootId, chatId: payload.chatId });
         }
       } catch (err) {
         console.error('[feishu-remote] Failed to send queue-full card:', err?.message || err);
@@ -409,22 +471,31 @@ export function createTaskRunner({ client, activeRuns, chatQueues, lastTaskByCha
     const item = {
       id: queueId,
       queuedAt: Date.now(),
-      payload: { ...payload, queueReactionId },
+      payload: { ...payload, sessionKey: runKey, queueReactionId },
       queueMessageId: '',
     };
     queue.push(item);
     chatQueues.set(runKey, queue);
 
+    const runningPreview = activeRuns.get(runKey)?.promptPreview ||
+      (!activeRuns.has(runKey) ? `全局并行上限已满 (${activeRuns.size}/${maxConcurrent})` : '');
     const card = buildQueuedCard({
       position: queue.length,
       queueId,
       promptPreview: payload.displayPreview || payload.text,
-      runningPreview: activeRuns.get(runKey)?.promptPreview || '',
+      runningPreview,
     });
     try {
-      item.queueMessageId = payload.messageId
-        ? await replyCard(client, { messageId: payload.messageId, card })
+      item.queueMessageId = replyTarget
+        ? await replyCard(client, { messageId: replyTarget, card, replyInThread })
         : await sendCardToTarget(client, { chatId: payload.chatId, openId: payload.openId, card });
+      if (payload.threadRootId && item.queueMessageId) {
+        recordCardThread(item.queueMessageId, {
+          sessionKey: runKey,
+          threadRootId: payload.threadRootId,
+          chatId: payload.chatId,
+        });
+      }
     } catch (err) {
       console.error('[feishu-remote] Failed to send queued card:', err?.message || err);
     }

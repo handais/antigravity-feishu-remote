@@ -26,18 +26,43 @@ export function stripMentions(text) {
     .trim();
 }
 
+export function makeSessionKey(chatId, threadRootId = '') {
+  const cid = String(chatId || '').trim();
+  const tid = String(threadRootId || '').trim();
+  if (cid && tid) return `${cid}#${tid}`;
+  return cid;
+}
+
+export function parseSessionKey(sessionKey) {
+  const raw = String(sessionKey || '').trim();
+  const idx = raw.indexOf('#');
+  if (idx < 0) {
+    return { chatId: raw, threadRootId: '' };
+  }
+  return {
+    chatId: raw.slice(0, idx),
+    threadRootId: raw.slice(idx + 1),
+  };
+}
+
 export function getOrCreateChatState(state, chatId, config) {
   if (!state.chats[chatId]) {
+    const { chatId: parentChatId, threadRootId } = parseSessionKey(chatId);
+    const parentState = threadRootId && parentChatId ? state.chats[parentChatId] : null;
+    const baseMode = parentState?.mode && parentState.mode !== 'full'
+      ? parentState.mode
+      : (config.agy.defaultMode || 'accept-edits');
     state.chats[chatId] = {
       conversationId: '',
-      cwd: config.agy.defaultCwd || os.homedir(),
-      mode: config.agy.defaultMode || 'accept-edits',
-      model: config.agy.defaultModel || '',
-      effort: config.agy.defaultEffort || '',
+      cwd: parentState?.cwd || config.agy.defaultCwd || os.homedir(),
+      mode: baseMode,
+      model: parentState?.model !== undefined ? parentState.model : (config.agy.defaultModel || ''),
+      effort: parentState?.effort !== undefined ? parentState.effort : (config.agy.defaultEffort || ''),
       recentConversations: [],
       pendingHandoff: null,
       fullExpiresAt: 0,
-      fullRevertMode: config.agy.defaultMode || 'accept-edits',
+      fullRevertMode: baseMode,
+      lastActiveAt: Date.now(),
     };
   } else {
     if (state.chats[chatId].fullExpiresAt === undefined) {
@@ -52,6 +77,7 @@ export function getOrCreateChatState(state, chatId, config) {
     if (state.chats[chatId].pendingHandoff === undefined) {
       state.chats[chatId].pendingHandoff = null;
     }
+    state.chats[chatId].lastActiveAt = Date.now();
   }
   return state.chats[chatId];
 }
@@ -359,7 +385,13 @@ export function toastCardResponse(type, content, card = null) {
   return resp;
 }
 
-export function sendCardToTarget(client, { chatId, openId, card }) {
+export function sendCardToTarget(
+  client,
+  { chatId, openId, card, replyToMessageId = '', replyInThread = false },
+) {
+  if (replyInThread && replyToMessageId) {
+    return replyCard(client, { messageId: replyToMessageId, card, replyInThread: true });
+  }
   const receiveId = chatId || openId;
   const receiveIdType = chatId ? 'chat_id' : 'open_id';
   if (!receiveId) return Promise.resolve('');
@@ -369,9 +401,9 @@ export function sendCardToTarget(client, { chatId, openId, card }) {
 export async function replySimpleCard(
   client,
   messageId,
-  { title, template = 'blue', markdown, footer = '', buttonRows = [] },
+  { title, template = 'blue', markdown, footer = '', buttonRows = [], replyInThread = false },
 ) {
-  await replyCard(client, {
+  return replyCard(client, {
     messageId,
     card: buildCard({
       title,
@@ -380,5 +412,6 @@ export async function replySimpleCard(
       footer,
       buttonRows,
     }),
+    replyInThread,
   });
 }

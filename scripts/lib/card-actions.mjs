@@ -40,6 +40,7 @@ import {
   formatHelpMarkdown,
   formatUptime,
   getOrCreateChatState,
+  makeSessionKey,
   normalizeTempMinutes,
   recordRecentConversation,
   sendCardToTarget,
@@ -47,7 +48,18 @@ import {
 } from './bridge-helpers.mjs';
 
 export async function handleCardAction(ctx, rawEvent) {
-  const { client, startedAt, bootCodeHash, activeRuns, chatQueues, lastTaskByChat, runner, stopWsForRestart } = ctx;
+  const {
+    client,
+    startedAt,
+    bootCodeHash,
+    activeRuns,
+    chatQueues,
+    lastTaskByChat,
+    cardThreadMap,
+    recordCardThread = () => {},
+    runner,
+    stopWsForRestart,
+  } = ctx;
   const payload = rawEvent?.action ? rawEvent : rawEvent?.event || rawEvent;
   const openId = payload?.operator?.open_id || '';
   const chatId = payload?.context?.open_chat_id || payload?.open_chat_id || '';
@@ -67,12 +79,32 @@ export async function handleCardAction(ctx, rawEvent) {
     return toastCardResponse('error', '未授权账号，无法操作');
   }
 
+  let threadMeta = openMessageId && cardThreadMap ? cardThreadMap.get(openMessageId) : null;
+  if (!threadMeta && openMessageId && chatId && chatId.startsWith('oc_')) {
+    try {
+      const msgRes = await client.im.v1.message.get({ path: { message_id: openMessageId } });
+      const msgItem = msgRes?.data?.items?.[0];
+      if (msgItem?.thread_id) {
+        const resolvedRootId = msgItem.root_id || msgItem.message_id;
+        threadMeta = {
+          sessionKey: makeSessionKey(chatId, resolvedRootId),
+          threadRootId: resolvedRootId,
+          chatId,
+        };
+        recordCardThread(openMessageId, threadMeta);
+      }
+    } catch {
+      // Ignore fallback message lookup errors
+    }
+  }
+
   const state = loadState();
-  const targetChatId = chatId || state.lastP2pChatByOpenId[openId] || '';
-  if (chatId && openId && state.lastP2pChatByOpenId[openId] !== chatId && chatId.startsWith('oc_')) {
+  const threadRootId = threadMeta?.threadRootId || '';
+  const targetChatId = threadMeta?.chatId || chatId || state.lastP2pChatByOpenId[openId] || '';
+  if (!threadRootId && chatId && openId && !state.lastP2pChatByOpenId[openId]) {
     state.lastP2pChatByOpenId[openId] = chatId;
   }
-  const runKey = targetChatId || openId;
+  const runKey = threadMeta?.sessionKey || makeSessionKey(targetChatId, threadRootId) || targetChatId || openId;
   const chatState = getOrCreateChatState(state, runKey, config);
   enforceTempFullExpiry(state, chatState);
 
@@ -81,7 +113,19 @@ export async function handleCardAction(ctx, rawEvent) {
   const inplace = Boolean(value?.inplace);
   const isRunning = Boolean(runKey && activeRuns.has(runKey));
   const anyBusy = () => activeRuns.size > 0 || runner.totalQueuedCount() > 0;
-  const sendToTarget = (card) => sendCardToTarget(client, { chatId: targetChatId, openId, card });
+  const sendToTarget = async (card) => {
+    const sentId = await sendCardToTarget(client, {
+      chatId: targetChatId,
+      openId,
+      card,
+      replyToMessageId: threadRootId,
+      replyInThread: Boolean(threadRootId),
+    });
+    if (threadRootId && sentId) {
+      recordCardThread(sentId, { sessionKey: runKey, threadRootId, chatId: targetChatId });
+    }
+    return sentId;
+  };
 
   const renderPanel = () => buildControlPanelCard({
     chatState,
@@ -89,6 +133,9 @@ export async function handleCardAction(ctx, rawEvent) {
     isRunning: Boolean(runKey && activeRuns.has(runKey)),
     uptimeText: formatUptime(Date.now() - startedAt),
     queueLength: runner.getQueueForChat(runKey).length,
+    threadRootId,
+    activeParallelCount: activeRuns.size,
+    maxConcurrentRuns: config.agy.maxConcurrentRuns || 4,
   });
 
   if (cmd === 'panel' || cmd === 'status') {
@@ -239,6 +286,9 @@ export async function handleCardAction(ctx, rawEvent) {
         chatId: targetChatId,
         openId,
         messageId: '',
+        sessionKey: runKey,
+        threadRootId,
+        replyInThread: Boolean(threadRootId),
         config,
       }).catch((err) => {
         console.error('[feishu-remote] desktop_takeover summarize error:', err);
@@ -595,6 +645,9 @@ export async function handleCardAction(ctx, rawEvent) {
     void runner.enqueueOrExecutePrompt({
       ...prev,
       messageId: '',
+      sessionKey: prev.sessionKey || runKey,
+      threadRootId: prev.threadRootId || threadRootId,
+      replyInThread: prev.replyInThread ?? Boolean(threadRootId),
       queueReactionId: '',
       config,
     }).catch((err) => {
@@ -611,6 +664,9 @@ export async function handleCardAction(ctx, rawEvent) {
         return toastCardResponse('error', '目标路径不是文件夹');
       }
       chatState.cwd = targetDir;
+      if (threadRootId && targetChatId) {
+        getOrCreateChatState(state, targetChatId, config).cwd = targetDir;
+      }
       saveState(state);
       return toastCardResponse(
         'success',
@@ -665,6 +721,9 @@ export async function handleCardAction(ctx, rawEvent) {
         return toastCardResponse('error', '目标路径不是文件夹');
       }
       chatState.cwd = targetDir;
+      if (threadRootId && targetChatId) {
+        getOrCreateChatState(state, targetChatId, config).cwd = targetDir;
+      }
       saveState(state);
       return toastCardResponse(
         'success',
@@ -706,6 +765,9 @@ export async function handleCardAction(ctx, rawEvent) {
       chatId: targetChatId,
       openId,
       messageId: '',
+      sessionKey: runKey,
+      threadRootId,
+      replyInThread: Boolean(threadRootId),
       config,
     }).catch((err) => {
       console.error('[feishu-remote] quick_run error:', err);
