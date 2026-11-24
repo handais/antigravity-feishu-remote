@@ -16,7 +16,7 @@
 ```text
 请帮我按这个仓库的 README 自动部署飞书远程控制插件：
 https://github.com/handais/antigravity-feishu-remote
-安装到 ~/.gemini/config/plugins/feishu-remote，遇到需要我在飞书开放平台操作或提供 App ID / App Secret 时再提示我。
+安装到 ~/.gemini/config/plugins/feishu-remote。如果当前环境支持浏览器操作，也请直接打开飞书开放平台（https://open.feishu.cn/app）帮我完成应用创建、权限导入、长连接事件/回调配置与版本发布，只在需要我扫码登录、二次确认或最后在飞书发“你好”配对时提醒我。
 ```
 
 ### 2. 给 AI 助手（Antigravity / Coding Agent）的部署 SOP
@@ -48,13 +48,20 @@ https://github.com/handais/antigravity-feishu-remote
    ```
    - 期望：`cli.mjs check` 输出 `"ok": true` 且 `"errors": []`；`smoke-test.mjs` 输出 `ALL SMOKE TESTS PASSED`。
 
-#### Step 3 — 引导用户准备飞书应用与凭证
-1. 告知用户按下方 **[二、飞书开放平台 3 分钟配置清单](#二飞书开放平台-3-分钟配置清单)** 操作（若你当前具备浏览器操作权限且用户同意，可在用户完成登录扫码后协助在网页中点选并发布）：
-   - 创建企业自建应用 → 开启 **机器人（Bot）**能力；
-   - 在 **权限管理 → 批量导入/导出权限** 粘贴下方 JSON 开通权限（如需单人话题群免 `@` 直接发消息，额外开通 `im:message.group_msg`）；
-   - 在 **事件与回调** 中将订阅方式设为 **「使用长连接接收事件 / 回调」**，订阅事件 `im.message.receive_v1`、`application.bot.menu_v6`，订阅回调 `card.action.trigger`；
-   - 创建版本并发布（建议同步配置机器人自定义菜单）。
-2. 向用户索取且**仅索取**两项信息：**`App ID`** 与 **`App Secret`**。
+#### Step 3 — 飞书开放平台配置（支持 Antigravity IDE 浏览器半自动代办）
+
+- **路径 A（推荐，当前 Agent 具备浏览器操作工具 / Antigravity IDE `/browser`）**：
+  1. 打开 `https://open.feishu.cn/app`；如果未登录，先**暂停并提示用户扫码登录飞书开放平台**，待用户确认登录后再继续后续点击。
+  2. 新建一个企业自建应用（或进入用户指定的已有应用），开启 **应用能力 → 机器人（Bot）**。
+  3. 进入 **权限管理 → 批量导入/导出权限**，粘贴下方 **[二、飞书开放平台 3 分钟配置清单](#二飞书开放平台-3-分钟配置清单)** 中的 JSON 一键开通权限（若用户计划建个人话题群免 `@` 使用，顺带确认开通 `im:message.group_msg`）。
+  4. 进入 **凭证与基础信息** 获取 `App ID` 与 `App Secret`（若点击查看需要验证码/人工复制，请让用户粘贴或仅在本机运行 `cli.mjs setup`，**绝不在对话回复里明文回显 `App Secret`**）。
+  5. **先跑 Step 4 启动本地守护进程再保存长连接**：因为飞书后台开启「使用长连接接收事件/回调」时可能会校验当前应用是否已有在线长连接，建议先完成 Step 4 的 `cli.mjs setup` 与 `cli.mjs start`，确保长连接已连上。
+  6. 回到网页 **事件与回调**：将「事件配置」和「回调配置」的订阅方式均设为 **使用长连接接收**，添加事件 `im.message.receive_v1`、`application.bot.menu_v6` 与回调 `card.action.trigger`。
+  7. （可选）进入 **机器人自定义菜单** 配置 `menu_panel` / `menu_quick` / `menu_dirs` / `menu_new` / `menu_stop`（响应动作选「推送事件」）。
+  8. 进入 **版本管理与发布** → 创建版本（可用范围保持仅自己或指定成员）并提交发布（遇到需人工确认/审核提示时由用户确认）。
+
+- **路径 B（纯命令行环境、无浏览器工具）**：
+  - 引导用户按下方 **[二、飞书开放平台 3 分钟配置清单](#二飞书开放平台-3-分钟配置清单)** 操作并发布，向用户索取且**仅索取**两项信息：**`App ID`** 与 **`App Secret`**，再执行 Step 4。
 
 #### Step 4 — 写入配置、启动守护进程与验收
 拿到 `App ID` 和 `App Secret` 后执行：
@@ -176,6 +183,7 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
      - `im:message:readonly`（读取引用回复的历史消息与卡片内容）
      - `docx:document:readonly` / `docx:document:write_only` / `docx:document.block:convert` / `wiki:node:read`（飞书云文档与 Wiki 读取/写入）
      - `im:message.group_at_msg:readonly`（可选，如需在群里 `@机器人` 使用）
+     - `im:message.group_msg`（可选，仅在配合 `--group-policy all` 实现单人话题群免 `@` 直接打字触发时需要）
 4. **事件与回调**：
    - **事件配置**：订阅方式选择 **「使用长连接接收事件」**，添加事件 **`im.message.receive_v1`**（接收消息 v2.0）和 **`application.bot.menu_v6`**（机器人自定义菜单事件，用于响应底部菜单点击）。
    - **回调配置**：订阅方式选择 **「使用长连接接收回调」**，添加回调 **`card.action.trigger`**（用于响应控制面板、目录浏览、快捷任务、队列、权限、Git、重试等卡片按钮点击）。
