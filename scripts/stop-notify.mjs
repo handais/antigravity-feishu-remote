@@ -25,7 +25,7 @@ function getSystemIdleSeconds() {
         timeout: 1500,
         stdio: ['ignore', 'pipe', 'ignore'],
       });
-      const match = out.match(/HIDIdleTime\s*=\s*(\d+)/);
+      const match = out.match(/"?HIDIdleTime"?\s*=\s*(\d+)/);
       if (match) {
         return Math.floor(Number(match[1]) / 1e9);
       }

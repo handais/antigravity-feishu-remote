@@ -787,6 +787,11 @@ try {
   assert.equal(stopMutedRes.stdout.trim(), '{}');
   assert.equal(stopMutedRes.stderr.trim(), '');
 
+  const ioregSample = '    | | |   "HIDIdleTime" = 6728880875\n';
+  const ioregMatch = ioregSample.match(/"?HIDIdleTime"?\s*=\s*(\d+)/);
+  assert.ok(ioregMatch);
+  assert.equal(Math.floor(Number(ioregMatch[1]) / 1e9), 6);
+
   // 6. mcp-server.mjs stdio JSON-RPC handshake
   await testMcpStdio();
 
