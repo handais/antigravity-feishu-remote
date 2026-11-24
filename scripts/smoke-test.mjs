@@ -44,6 +44,7 @@ const {
 } = await import('./lib/desktop-sessions.mjs');
 const {
   buildAgyArgs,
+  buildChildEnv,
   parseAgyStreamLine,
 } = await import('./lib/agy-runner.mjs');
 const {
@@ -791,6 +792,10 @@ try {
   const ioregMatch = ioregSample.match(/"?HIDIdleTime"?\s*=\s*(\d+)/);
   assert.ok(ioregMatch);
   assert.equal(Math.floor(Number(ioregMatch[1]) / 1e9), 6);
+
+  const childEnv = buildChildEnv(DEFAULT_CONFIG, process.execPath);
+  assert.equal(childEnv.FEISHU_REMOTE_BRIDGE_CHILD, '1');
+  assert.ok(childEnv.PATH.split(path.delimiter).length >= 1);
 
   // 6. mcp-server.mjs stdio JSON-RPC handshake
   await testMcpStdio();

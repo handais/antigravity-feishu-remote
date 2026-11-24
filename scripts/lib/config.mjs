@@ -226,26 +226,60 @@ export function saveState(state) {
 }
 
 export function detectAgyBin() {
+  const isWin = process.platform === 'win32';
+  const lookupCmd = isWin ? 'where' : 'which';
   try {
-    const found = execFileSync('which', ['agy'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    if (found && fs.existsSync(found)) {
-      return found;
+    const out = execFileSync(lookupCmd, ['agy'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    }).trim();
+    if (out) {
+      const lines = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      const preferred = isWin
+        ? (lines.find((l) => /\.(exe|cmd|bat)$/i.test(l) && fs.existsSync(l)) || lines.find((l) => fs.existsSync(l)))
+        : lines.find((l) => fs.existsSync(l));
+      if (preferred) {
+        return preferred;
+      }
     }
   } catch {
     // Fallback to common install paths
   }
-  const candidates = [
-    path.join(os.homedir(), '.local', 'bin', 'agy'),
-    '/opt/homebrew/bin/agy',
-    '/usr/local/bin/agy',
-    '/usr/bin/agy',
-  ];
+  const candidates = isWin
+    ? [
+        path.join(os.homedir(), '.local', 'bin', 'agy.exe'),
+        path.join(os.homedir(), '.gemini', 'bin', 'agy.exe'),
+        process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'antigravity', 'agy.exe') : '',
+        process.env.APPDATA ? path.join(process.env.APPDATA, 'npm', 'agy.cmd') : '',
+      ].filter(Boolean)
+    : [
+        path.join(os.homedir(), '.local', 'bin', 'agy'),
+        '/opt/homebrew/bin/agy',
+        '/usr/local/bin/agy',
+        '/usr/bin/agy',
+      ];
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {
       return candidate;
     }
   }
   return '';
+}
+
+function normalizeWindowsProxyValue(rawServer) {
+  const raw = String(rawServer || '').trim();
+  if (!raw) return '';
+  let picked = raw;
+  if (raw.includes('=')) {
+    const entries = raw.split(';').map((s) => s.trim()).filter(Boolean);
+    const httpsEntry = entries.find((e) => /^https=/i.test(e));
+    const httpEntry = entries.find((e) => /^http=/i.test(e));
+    const chosen = httpsEntry || httpEntry || entries[0] || '';
+    picked = chosen.includes('=') ? chosen.slice(chosen.indexOf('=') + 1).trim() : chosen;
+  }
+  if (!picked) return '';
+  return /^https?:\/\//i.test(picked) ? picked : `http://${picked}`;
 }
 
 export function detectLocalProxy() {
@@ -275,6 +309,21 @@ export function detectLocalProxy() {
       }
     } catch {
       // Ignore scutil errors
+    }
+  } else if (process.platform === 'win32') {
+    try {
+      const out = execFileSync(
+        'reg',
+        ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      );
+      const enabled = /ProxyEnable\s+REG_DWORD\s+0x1\b/i.test(out);
+      const serverMatch = out.match(/ProxyServer\s+REG_SZ\s+([^\r\n]+)/i);
+      if (enabled && serverMatch) {
+        return normalizeWindowsProxyValue(serverMatch[1]);
+      }
+    } catch {
+      // Ignore registry proxy lookup errors
     }
   }
   return '';

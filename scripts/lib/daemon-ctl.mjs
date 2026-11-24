@@ -71,6 +71,14 @@ ${envXml}
 }
 
 function buildPathEnv() {
+  if (process.platform === 'win32') {
+    const parts = [
+      path.dirname(process.execPath),
+      path.join(os.homedir(), '.local', 'bin'),
+      ...(process.env.PATH || '').split(path.delimiter),
+    ].filter(Boolean);
+    return [...new Set(parts)].join(path.delimiter);
+  }
   const parts = [
     path.dirname(process.execPath),
     path.join(os.homedir(), '.local', 'bin'),
@@ -171,10 +179,17 @@ WantedBy=default.target
   const errFd = fs.openSync(errLog, 'a');
   const child = spawn(process.execPath, [daemonScript], {
     detached: true,
+    windowsHide: true,
     stdio: ['ignore', outFd, errFd],
     env: { ...process.env, PATH: pathEnv },
   });
   child.unref();
+  try {
+    fs.closeSync(outFd);
+    fs.closeSync(errFd);
+  } catch {
+    // Ignore close errors
+  }
   fs.writeFileSync(pidFile, `${child.pid}\n`, 'utf8');
   return { manager: 'pid', pid: child.pid, outLog, errLog };
 }

@@ -416,6 +416,7 @@ export function scheduleDaemonSelfRestart({ delayMs = 700, onBeforeExit } = {}) 
     const cliPath = path.join(getPluginRoot(), 'scripts', 'cli.mjs');
     const child = spawn(process.execPath, [cliPath, 'restart'], {
       detached: true,
+      windowsHide: true,
       stdio: 'ignore',
     });
     child.unref();

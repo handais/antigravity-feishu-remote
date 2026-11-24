@@ -117,29 +117,56 @@ export function parseAgyStreamLine(line) {
 }
 
 export function buildChildEnv(config, agyBin) {
+  const isWin = process.platform === 'win32';
+  const delim = path.delimiter;
   const pathParts = [
     path.dirname(process.execPath),
     agyBin ? path.dirname(agyBin) : '',
-    '/opt/homebrew/bin',
-    '/usr/local/bin',
-    '/usr/bin',
-    '/bin',
-    '/usr/sbin',
-    '/sbin',
-    process.env.PATH || '',
+    ...(isWin
+      ? []
+      : [
+          '/opt/homebrew/bin',
+          '/usr/local/bin',
+          '/usr/bin',
+          '/bin',
+          '/usr/sbin',
+          '/sbin',
+        ]),
+    ...(process.env.PATH || '').split(delim),
   ].filter(Boolean);
-  const dedupedPath = [...new Set(pathParts.join(':').split(':').filter(Boolean))].join(':');
+  const dedupedPath = [...new Set(pathParts)].join(delim);
 
   const env = {
-    HOME: process.env.HOME || '',
-    USER: process.env.USER || '',
-    LOGNAME: process.env.LOGNAME || '',
-    SHELL: process.env.SHELL || '/bin/zsh',
+    HOME: process.env.HOME || process.env.USERPROFILE || '',
+    USER: process.env.USER || process.env.USERNAME || '',
+    LOGNAME: process.env.LOGNAME || process.env.USERNAME || '',
+    ...(isWin ? {} : { SHELL: process.env.SHELL || '/bin/zsh' }),
     TERM: 'xterm-256color',
     LANG: process.env.LANG || 'en_US.UTF-8',
     PATH: dedupedPath,
     FEISHU_REMOTE_BRIDGE_CHILD: '1',
   };
+
+  if (isWin) {
+    for (const winKey of [
+      'USERPROFILE',
+      'HOMEDRIVE',
+      'HOMEPATH',
+      'APPDATA',
+      'LOCALAPPDATA',
+      'SystemRoot',
+      'COMSPEC',
+      'PATHEXT',
+      'TEMP',
+      'TMP',
+      'ProgramFiles',
+      'ProgramFiles(x86)',
+    ]) {
+      if (process.env[winKey]) {
+        env[winKey] = process.env[winKey];
+      }
+    }
+  }
 
   if (process.env.ANTIGRAVITY_API_KEY) {
     env.ANTIGRAVITY_API_KEY = process.env.ANTIGRAVITY_API_KEY;
@@ -155,6 +182,16 @@ export function buildChildEnv(config, agyBin) {
     env.NO_PROXY = '127.0.0.1,localhost,::1';
   }
   return env;
+}
+
+function getWindowsSpawnOpts(binPath) {
+  if (process.platform !== 'win32') {
+    return {};
+  }
+  return {
+    windowsHide: true,
+    ...( /\.(cmd|bat)$/i.test(String(binPath || '')) ? { shell: true } : {}),
+  };
 }
 
 export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-edits', model = '', effort = '', config, onEvent, signal }) {
@@ -179,6 +216,7 @@ export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-ed
       cwd: cwd || config?.agy?.defaultCwd || process.cwd(),
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      ...getWindowsSpawnOpts(agyBin),
     });
 
     let stderr = '';
@@ -284,6 +322,7 @@ export function listAgyModels(config) {
     const child = spawn(agyBin, ['models'], {
       env: buildChildEnv(config, agyBin),
       stdio: ['ignore', 'pipe', 'pipe'],
+      ...getWindowsSpawnOpts(agyBin),
     });
     let stdout = '';
     let stderr = '';

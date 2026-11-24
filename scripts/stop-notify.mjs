@@ -39,6 +39,21 @@ function getSystemIdleSeconds() {
       if (Number.isFinite(ms) && ms >= 0) {
         return Math.floor(ms / 1000);
       }
+    } else if (process.platform === 'win32') {
+      const psScript = [
+        "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class IdleTime { [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } [DllImport(\"user32.dll\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); public static uint GetIdleMs() { LASTINPUTINFO lii = new LASTINPUTINFO(); lii.cbSize = (uint)Marshal.SizeOf(lii); return GetLastInputInfo(ref lii) ? unchecked((uint)Environment.TickCount - lii.dwTime) : 0; } }';",
+        'Write-Output ([Math]::Floor([IdleTime]::GetIdleMs() / 1000))',
+      ].join(' ');
+      const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psScript], {
+        encoding: 'utf8',
+        timeout: 2500,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const sec = Number(String(out || '').trim());
+      if (Number.isFinite(sec) && sec >= 0) {
+        return Math.floor(sec);
+      }
     }
   } catch {
     // Fail-open when idle probe is unavailable

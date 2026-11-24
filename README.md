@@ -25,7 +25,7 @@ https://github.com/handais/antigravity-feishu-remote
 > 请严格按以下步骤依次执行并校验输出；每步失败立即停止并报告原因，不要跳过检查。
 
 #### Step 1 — 前置环境检查
-1. 检查系统平台（支持 **macOS `launchd`**、**Linux `systemd --user`**；Windows 请提示用户使用 **WSL2**，或仅可前台运行 `node scripts/bridge-daemon.mjs`）。
+1. 检查系统平台（支持 **macOS `launchd`**、**Linux `systemd --user`**、**原生 Windows（`pid` 后台模式 + `where agy` + 系统代理 + `GetLastInputInfo` 离开感应）** 及 **WSL2**）。
 2. 检查 Node 版本与 `agy` CLI：
    ```bash
    node -v && which agy
@@ -204,7 +204,7 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
 
 ## 三、本机安装与启动
 
-> **环境要求**：`Node.js 22.5+`（`/desktop` 只读索引扫描依赖内置 `node:sqlite`）及已登录的 `agy` CLI。守护进程托管支持 **macOS (`launchd`)** 与 **Linux (`systemd --user`)**；Windows 建议在 WSL2 中安装运行，或通过前台方式运行 `node scripts/bridge-daemon.mjs`。
+> **环境要求**：`Node.js 22.5+`（`/desktop` 只读索引扫描依赖内置 `node:sqlite`）及已登录的 `agy` CLI。守护进程托管支持 **macOS (`launchd`)**、**Linux (`systemd --user`)** 与 **原生 Windows**（PowerShell/CMD 下自动走分离后台 `pid` 模式，支持 `where agy`、系统代理读取与 `GetLastInputInfo` 离开感应；Windows 如需开机自启可配合计划任务或使用 WSL2）。
 
 ### 1. 克隆并安装依赖
 ```bash
