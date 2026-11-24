@@ -14,6 +14,7 @@ import {
   maskSecret,
   saveConfig,
   stripProcessProxyEnv,
+  VALID_NOTIFY_MODES,
 } from './lib/config.mjs';
 import {
   buildCard,
@@ -222,7 +223,28 @@ function cmdSetup(flags) {
     config.notifications.defaultReceiveIdType = flags['receive-id-type'].trim();
   }
   if (flags['stop-hook'] !== undefined) {
-    config.notifications.stopHookEnabled = parseBool(flags['stop-hook'], config.notifications.stopHookEnabled);
+    const enabled = parseBool(flags['stop-hook'], config.notifications.stopHookEnabled);
+    config.notifications.stopHookEnabled = enabled;
+    if (!enabled) {
+      config.notifications.stopNotifyMode = 'off';
+    } else if (config.notifications.stopNotifyMode === 'off') {
+      config.notifications.stopNotifyMode = 'on';
+    }
+  }
+  if (typeof flags['notify-mode'] === 'string') {
+    const m = flags['notify-mode'].trim().toLowerCase();
+    if (!VALID_NOTIFY_MODES.includes(m)) {
+      throw new Error(`--notify-mode must be one of: ${VALID_NOTIFY_MODES.join(', ')}`);
+    }
+    config.notifications.stopNotifyMode = m;
+    config.notifications.stopHookEnabled = m !== 'off';
+  }
+  if (typeof flags['away-seconds'] === 'string') {
+    const sec = Number(flags['away-seconds']);
+    if (!Number.isFinite(sec) || sec < 10 || sec > 3600) {
+      throw new Error('--away-seconds must be between 10 and 3600');
+    }
+    config.notifications.awayIdleSeconds = Math.floor(sec);
   }
 
   const saved = saveConfig(config);

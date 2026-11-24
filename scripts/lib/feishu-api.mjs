@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { getEffectiveQuickPrompts } from './config.mjs';
+import { getEffectiveQuickPrompts, resolveStopNotifyMode } from './config.mjs';
 import { isImageFilePath, resolveFeishuFileType } from './media.mjs';
 
 export function createStderrLogger(prefix = 'lark') {
@@ -280,6 +280,13 @@ export function buildControlPanelCard({
   const queueSuffix = queueLength > 0 ? `（排队 ${queueLength} 条）` : '';
   const parallelSuffix = activeParallelCount > 1 ? ` · 全局并行 ${activeParallelCount}/${maxConcurrentRuns}` : '';
   const pendingHandoff = chatState.pendingHandoff;
+  const notifyMode = resolveStopNotifyMode(config);
+  const awayMin = Math.max(1, Math.round(Number(config?.notifications?.awayIdleSeconds || 120) / 60));
+  const notifyLabel = notifyMode === 'on'
+    ? '🔔 始终提醒'
+    : notifyMode === 'away'
+      ? `🧠 仅离开电脑时（空闲 ≥ ${awayMin}m）`
+      : '🔕 已关闭';
 
   const lines = [
     threadRootId ? `- **所属话题**：\`${threadRootId.slice(0, 12)}\`（独立并行会话）` : '',
@@ -287,6 +294,7 @@ export function buildControlPanelCard({
     `- **执行模式**：${modeDisplay}`,
     `- **当前模型**：\`${model || 'default (随 CLI 配置)'}\``,
     `- **推理强度**：\`${effort || 'default (随 CLI 配置)'}\``,
+    `- **电脑端提醒**：${notifyLabel}`,
     `- **当前会话**：\`${convId ? convId.slice(0, 8) : '(未开始，下条消息新建)'}\``,
     pendingHandoff
       ? `- **待注入上下文**：已挂接电脑端「${(pendingHandoff.title || '').slice(0, 24)}」（下条消息自动注入）`
@@ -319,6 +327,10 @@ export function buildControlPanelCard({
     {
       label: isPinned ? '📌 取消收藏' : '📌 收藏目录',
       value: { cmd: 'pin', inplace: true },
+    },
+    {
+      label: notifyMode === 'on' ? '🔔 提醒:开' : notifyMode === 'away' ? '🧠 提醒:离开' : '🔕 提醒:关',
+      value: { cmd: 'notify_menu', inplace: true },
     },
     { label: '♻️ 安全重启', value: { cmd: 'safe_restart', inplace: true } },
     { label: '⏪ 快照回滚', value: { cmd: 'ops', inplace: true } },
@@ -1429,5 +1441,72 @@ export function buildDesktopSessionPreviewCard(detail, { filter = 'all', query =
       ],
     ],
     footer: '只读扫描本地索引，绝不修改桌面 App 数据库',
+  });
+}
+
+/**
+ * Render the 3-mode desktop stop-notification switcher card (on / away / off).
+ */
+export function buildNotifyCard({ config } = {}) {
+  const mode = resolveStopNotifyMode(config);
+  const idleSeconds = Math.max(10, Number(config?.notifications?.awayIdleSeconds || 120));
+  const idleMin = Math.max(1, Math.round(idleSeconds / 60));
+
+  const modeDesc = mode === 'on'
+    ? '🔔 **始终提醒（`on`）** — 桌面端每次任务完成都会推飞书卡片'
+    : mode === 'away'
+      ? `🧠 **仅离开电脑时提醒（\`away\`）** — 键鼠空闲超过 **${idleMin} 分钟**（\`${idleSeconds}s\`）才推飞书，在电脑前操作时自动静音`
+      : '🔕 **已关闭（`off`）** — 不再推送桌面端完成通知（飞书远程发起的任务正常流式回复）';
+
+  const modeRow = [
+    {
+      label: '🔔 始终提醒',
+      type: mode === 'on' ? 'primary' : 'default',
+      value: { cmd: 'notify_mode', arg: 'on', inplace: true },
+    },
+    {
+      label: '🧠 仅离开电脑时',
+      type: mode === 'away' ? 'primary' : 'default',
+      value: { cmd: 'notify_mode', arg: 'away', inplace: true },
+    },
+    {
+      label: '🔕 关闭提醒',
+      type: mode === 'off' ? 'primary' : 'default',
+      value: { cmd: 'notify_mode', arg: 'off', inplace: true },
+    },
+  ];
+
+  const idleRow = [
+    {
+      label: '⏱️ 离开 1 分钟',
+      type: mode === 'away' && idleSeconds === 60 ? 'primary' : 'default',
+      value: { cmd: 'notify_idle', arg: '60', inplace: true },
+    },
+    {
+      label: '⏱️ 离开 2 分钟',
+      type: mode === 'away' && idleSeconds === 120 ? 'primary' : 'default',
+      value: { cmd: 'notify_idle', arg: '120', inplace: true },
+    },
+    {
+      label: '⏱️ 离开 5 分钟',
+      type: mode === 'away' && idleSeconds === 300 ? 'primary' : 'default',
+      value: { cmd: 'notify_idle', arg: '300', inplace: true },
+    },
+  ];
+
+  return buildCard({
+    title: '🔔 桌面端完成提醒设置',
+    template: mode === 'off' ? 'grey' : mode === 'away' ? 'wathet' : 'blue',
+    markdown: [
+      `- **当前模式**：${modeDesc}`,
+      '',
+      '**说明**：`away` 模式通过系统键鼠空闲时长（macOS `HIDIdleTime`）判断你是否在电脑前；切换后立即生效，无需重启守护进程。',
+    ].join('\n'),
+    buttonRows: [
+      modeRow,
+      idleRow,
+      [{ label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } }],
+    ],
+    footer: '也可在聊天发送 /notify <on|away|off> 或 /mute',
   });
 }

@@ -240,6 +240,7 @@ export function formatHelpMarkdown() {
     '- `/timeout [分钟|0]`：查看或设置单轮任务超时时间（如 `/timeout 60`，`/timeout 0` 表示不限时）',
     `- \`/effort [强度|default]\`：切换推理强度（\`${VALID_EFFORTS.join('` / `')}\` / \`default\`）`,
     '- `/model [模型名|default]` / `/models`：查看或切换模型',
+    '- `/notify [on|away|off]`（别名 `/mute`）：切换电脑端完成提醒（始终 / 仅离开电脑 / 关闭）',
     '- `/stop`（或 `/cancel`）：中止当前正在执行的任务',
   ].join('\n');
 }

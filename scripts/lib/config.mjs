@@ -54,6 +54,20 @@ export const DEFAULT_QUICK_PROMPTS = [
   },
 ];
 
+export const VALID_NOTIFY_MODES = ['on', 'away', 'off'];
+
+export function resolveStopNotifyMode(config) {
+  const notifications = config?.notifications || {};
+  if (notifications.stopHookEnabled === false) {
+    return 'off';
+  }
+  const mode = String(notifications.stopNotifyMode || '').trim().toLowerCase();
+  if (VALID_NOTIFY_MODES.includes(mode)) {
+    return mode;
+  }
+  return 'on';
+}
+
 export const DEFAULT_CONFIG = {
   feishu: {
     appId: '',
@@ -82,6 +96,8 @@ export const DEFAULT_CONFIG = {
     defaultReceiveId: '',
     defaultReceiveIdType: 'open_id',
     stopHookEnabled: true,
+    stopNotifyMode: 'on',
+    awayIdleSeconds: 120,
   },
 };
 

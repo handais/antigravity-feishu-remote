@@ -509,25 +509,56 @@ setTimeout(() => {
     return;
   }
   const isRollback = notice.action === 'rollback';
+  const threadRootId = String(notice.threadRootId || '').trim();
+  const replyInThread = Boolean(threadRootId) && notice.replyInThread !== false;
   const lines = [
     `- **当前运行版本**：\`${bootCodeHash.slice(0, 8)}\``,
     notice.previousHash ? `- **切换前版本**：\`${String(notice.previousHash).slice(0, 8)}\`` : '',
     isRollback && notice.snapshotId ? `- **恢复快照**：\`${notice.snapshotId}\`` : '',
     `- **进程 PID**：\`${process.pid}\``,
   ].filter(Boolean);
-  void sendCardToTarget(client, {
-    chatId: notice.chatId || '',
-    openId: notice.openId || '',
-    card: buildCard({
-      title: isRollback ? '✅ 已回滚并重启上线' : '✅ 飞书桥接已安全重启上线',
-      template: 'green',
-      markdown: lines.join('\n'),
-      buttonRows: [[
-        { label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel' } },
-        { label: '⏪ 快照回滚', value: { cmd: 'ops' } },
-      ]],
-    }),
-  }).catch((err) => {
-    console.error('[feishu-remote] Failed to send post-restart confirmation card:', err?.message || err);
+  const card = buildCard({
+    title: isRollback ? '✅ 已回滚并重启上线' : '✅ 飞书桥接已安全重启上线',
+    template: 'green',
+    markdown: lines.join('\n'),
+    buttonRows: [[
+      { label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel' } },
+      { label: '⏪ 快照回滚', value: { cmd: 'ops' } },
+    ]],
   });
+  let sentInThread = replyInThread;
+  const sendPromise = replyInThread
+    ? sendCardToTarget(client, {
+        chatId: notice.chatId || '',
+        openId: notice.openId || '',
+        replyToMessageId: threadRootId,
+        replyInThread: true,
+        card,
+      }).catch((err) => {
+        console.error('[feishu-remote] Post-restart thread reply failed, falling back to chat:', err?.message || err);
+        sentInThread = false;
+        return sendCardToTarget(client, {
+          chatId: notice.chatId || '',
+          openId: notice.openId || '',
+          card,
+        });
+      })
+    : sendCardToTarget(client, {
+        chatId: notice.chatId || '',
+        openId: notice.openId || '',
+        card,
+      });
+  void sendPromise
+    .then((sentId) => {
+      if (sentInThread && threadRootId && sentId) {
+        recordCardThread(sentId, {
+          sessionKey: notice.sessionKey || makeSessionKey(notice.chatId || '', threadRootId),
+          threadRootId,
+          chatId: notice.chatId || '',
+        });
+      }
+    })
+    .catch((err) => {
+      console.error('[feishu-remote] Failed to send post-restart confirmation card:', err?.message || err);
+    });
 }, 1500);

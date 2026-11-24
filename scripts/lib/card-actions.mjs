@@ -2,7 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { listAgyModels, VALID_EFFORTS, VALID_MODES } from './agy-runner.mjs';
 import { removeMessageReaction } from './cardkit-stream.mjs';
-import { getEffectiveQuickPrompts, loadConfig, loadState, saveConfig, saveState } from './config.mjs';
+import {
+  getEffectiveQuickPrompts,
+  loadConfig,
+  loadState,
+  saveConfig,
+  saveState,
+  VALID_NOTIFY_MODES,
+} from './config.mjs';
 import {
   buildCard,
   buildControlPanelCard,
@@ -11,6 +18,7 @@ import {
   buildDirsCard,
   buildEffortCard,
   buildGitStatusCard,
+  buildNotifyCard,
   buildQuickPromptsCard,
   buildQueueListCard,
   buildScopesCard,
@@ -357,6 +365,51 @@ export async function handleCardAction(ctx, rawEvent) {
     );
   }
 
+  if (cmd === 'notify_menu') {
+    saveState(state);
+    const card = buildNotifyCard({ config });
+    if (inplace) {
+      return toastCardResponse('info', '桌面端完成提醒设置', card);
+    }
+    void sendToTarget(card).catch((err) => {
+      console.error('[feishu-remote] send notify card error:', err.message);
+    });
+    return toastCardResponse('info', '已打开桌面端提醒设置');
+  }
+
+  if (cmd === 'notify_mode') {
+    const modeArg = arg.trim().toLowerCase();
+    if (!VALID_NOTIFY_MODES.includes(modeArg)) {
+      return toastCardResponse('error', `无效提醒模式：${arg}`);
+    }
+    config.notifications.stopNotifyMode = modeArg;
+    config.notifications.stopHookEnabled = modeArg !== 'off';
+    saveConfig(config);
+    saveState(state);
+    const label = modeArg === 'on'
+      ? '🔔 已设为始终提醒'
+      : modeArg === 'away'
+        ? '🧠 已设为仅离开电脑时提醒'
+        : '🔕 已关闭桌面端完成提醒';
+    return toastCardResponse('success', label, inplace ? buildNotifyCard({ config }) : null);
+  }
+
+  if (cmd === 'notify_idle') {
+    const rawSec = Number(arg);
+    const clampedSec = Number.isFinite(rawSec) ? Math.max(30, Math.min(1800, Math.round(rawSec))) : 120;
+    config.notifications.awayIdleSeconds = clampedSec;
+    config.notifications.stopNotifyMode = 'away';
+    config.notifications.stopHookEnabled = true;
+    saveConfig(config);
+    saveState(state);
+    const minLabel = Math.max(1, Math.round(clampedSec / 60));
+    return toastCardResponse(
+      'success',
+      `🧠 已设为离开电脑 ≥ ${minLabel} 分钟才提醒`,
+      inplace ? buildNotifyCard({ config }) : null,
+    );
+  }
+
   if (cmd === 'safe_restart') {
     if (anyBusy()) {
       return toastCardResponse('warning', '当前有任务运行或排队中，请先中止或清空队列后再重启');
@@ -373,6 +426,9 @@ export async function handleCardAction(ctx, rawEvent) {
     writePendingRestartNotice({
       chatId: targetChatId,
       openId,
+      sessionKey: runKey,
+      threadRootId,
+      replyInThread: Boolean(threadRootId),
       action: 'restart',
       snapshotId: '',
       previousHash: bootCodeHash,
@@ -424,6 +480,9 @@ export async function handleCardAction(ctx, rawEvent) {
     writePendingRestartNotice({
       chatId: targetChatId,
       openId,
+      sessionKey: runKey,
+      threadRootId,
+      replyInThread: Boolean(threadRootId),
       action: 'rollback',
       snapshotId: res.snapshot.id,
       previousHash: bootCodeHash,
@@ -1006,6 +1065,11 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
 
   if (key === 'effort') {
     await sendToTarget(buildEffortCard(chatState.effort || config.agy.defaultEffort || ''));
+    return;
+  }
+
+  if (key === 'notify') {
+    await sendToTarget(buildNotifyCard({ config }));
     return;
   }
 

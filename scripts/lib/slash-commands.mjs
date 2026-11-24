@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { listAgyModels, VALID_EFFORTS, VALID_MODES } from './agy-runner.mjs';
-import { getEffectiveQuickPrompts, loadState, saveConfig, saveState } from './config.mjs';
+import { getEffectiveQuickPrompts, loadState, resolveStopNotifyMode, saveConfig, saveState } from './config.mjs';
 import {
   buildControlPanelCard,
   buildDesktopSessionsCard,
@@ -9,6 +9,7 @@ import {
   buildDirsCard,
   buildEffortCard,
   buildGitStatusCard,
+  buildNotifyCard,
   buildQueueListCard,
   buildQuickPromptsCard,
   buildScopesCard,
@@ -164,6 +165,9 @@ export async function handleSlashCommand(
     writePendingRestartNotice({
       chatId,
       openId,
+      sessionKey: runKey,
+      threadRootId: replyInThread ? (threadRootId || messageId) : '',
+      replyInThread: Boolean(replyInThread),
       action: 'restart',
       snapshotId: '',
       previousHash: bootCodeHash,
@@ -305,6 +309,13 @@ export async function handleSlashCommand(
     const modeText = isTempFull
       ? `\`full\`（临时授权，约 ${remainMin}m 后切回 \`${chatState.fullRevertMode || 'accept-edits'}\`）`
       : `\`${chatState.mode}\``;
+    const notifyMode = resolveStopNotifyMode(config);
+    const awayMin = Math.max(1, Math.round(Number(config?.notifications?.awayIdleSeconds || 120) / 60));
+    const notifyText = notifyMode === 'on'
+      ? '🔔 始终提醒'
+      : notifyMode === 'away'
+        ? `🧠 仅离开电脑时（空闲 ≥ ${awayMin}m）`
+        : '🔕 已关闭';
     const lines = [
       threadRootId ? `- **所属话题**：\`${threadRootId.slice(0, 12)}\`（独立并行会话）` : '',
       `- **工作目录**：\`${chatState.cwd}\``,
@@ -312,6 +323,7 @@ export async function handleSlashCommand(
       `- **单轮超时**：\`${formatTimeoutLabel(config.agy.timeoutSeconds)}\``,
       `- **当前模型**：\`${chatState.model || 'default (随 CLI 配置)'}\``,
       `- **推理强度**：\`${chatState.effort || config.agy.defaultEffort || 'default (随 CLI 配置)'}\``,
+      `- **电脑端提醒**：${notifyText}`,
       `- **当前会话**：\`${chatState.conversationId || '(未开始，下条消息新建)'}\``,
       chatState.pendingHandoff
         ? `- **待注入电脑端上下文**：\`${chatState.pendingHandoff.id?.slice(0, 8) || '-'}\` · ${chatState.pendingHandoff.title || '(无标题)'}`
@@ -709,6 +721,70 @@ export async function handleSlashCommand(
       template: 'green',
       markdown: `当前推理强度已设置为：\`${normalized}\``,
       buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+    });
+    return true;
+  }
+
+  if (cmd === '/notify' || cmd === '/mute' || cmd === '/unmute') {
+    if (cmd === '/mute') {
+      config.notifications.stopNotifyMode = 'off';
+      config.notifications.stopHookEnabled = false;
+      saveConfig(config);
+      await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
+      return true;
+    }
+    if (cmd === '/unmute') {
+      config.notifications.stopNotifyMode = 'on';
+      config.notifications.stopHookEnabled = true;
+      saveConfig(config);
+      await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
+      return true;
+    }
+    if (!arg) {
+      await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
+      return true;
+    }
+    const parts = arg.trim().toLowerCase().split(/\s+/);
+    const modeArg = parts[0];
+    if (modeArg === 'on' || modeArg === 'always' || modeArg === '开') {
+      config.notifications.stopNotifyMode = 'on';
+      config.notifications.stopHookEnabled = true;
+      saveConfig(config);
+      await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
+      return true;
+    }
+    if (modeArg === 'off' || modeArg === 'mute' || modeArg === '关') {
+      config.notifications.stopNotifyMode = 'off';
+      config.notifications.stopHookEnabled = false;
+      saveConfig(config);
+      await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
+      return true;
+    }
+    if (modeArg === 'away' || modeArg === 'auto' || modeArg === '离开') {
+      if (parts[1]) {
+        const minRaw = parts[1].replace(/m(?:in)?$/i, '');
+        const minNum = Number(minRaw);
+        if (!Number.isFinite(minNum) || minNum <= 0 || minNum > 60) {
+          await replySimple({
+            title: '⚠️ 用法提示',
+            template: 'orange',
+            markdown: '离开超时分钟数请填 `1~60`，例如 `/notify away 2` 或 `/notify away 5`。',
+          });
+          return true;
+        }
+        config.notifications.awayIdleSeconds = Math.max(30, Math.round(minNum * 60));
+      }
+      config.notifications.stopNotifyMode = 'away';
+      config.notifications.stopHookEnabled = true;
+      saveConfig(config);
+      await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
+      return true;
+    }
+    await replySimple({
+      title: '⚠️ 无效提醒模式',
+      template: 'orange',
+      markdown: '支持：`/notify on`（始终）、`/notify away [分钟]`（离开电脑时）、`/notify off`（关闭）。',
+      buttonRows: [[{ label: '🔔 打开提醒设置', value: { cmd: 'notify_menu' } }]],
     });
     return true;
   }

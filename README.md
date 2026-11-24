@@ -42,6 +42,7 @@
    - `/mode [accept-edits|plan|auto|full|default|full 30m]`：查看或切换执行权限模式（支持 `/mode full 30m` 临时全权限并在到期后自动切回安全模式）
    - `/timeout [分钟|0]`：查看或设置单轮任务超时时间（默认 60 分钟；`/timeout 0` 不限时，CardKit 超过 10 分钟流式窗口会自动无缝切为全卡刷新）
    - `/effort [low|medium|high|xhigh|max|default]`：查看或切换推理强度（控制面板也可直接点 `🎛️ 强度`）
+   - `/notify [on|away [分钟]|off]`（别名 `/mute` / `/unmute`）：切换桌面端完成提醒（始终 / 仅离开电脑时通过键鼠空闲检测提醒 / 关闭）
    - `/model [模型名|default]` / `/models`：查看可用模型或切换模型（支持点击按钮切换）
    - `/stop`（或 `/cancel`）：立即中止当前正在执行的任务
    - **多模态收发**：手机直接发送图片/截图、文件（PDF/代码/文档）、语音或图文混排，自动下载至 `~/.config/antigravity-feishu/inbox/`（7 天自动清理）并由 Antigravity 原生读取分析。

@@ -1,11 +1,50 @@
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getConfigDir, loadConfig, stripProcessProxyEnv } from './lib/config.mjs';
+import {
+  getConfigDir,
+  loadConfig,
+  resolveStopNotifyMode,
+  stripProcessProxyEnv,
+} from './lib/config.mjs';
 import { isSubagentConversation } from './lib/desktop-sessions.mjs';
 
 const SKIP_REASONS = new Set(['TERMINAL_STEP_TYPE', 'USER_CANCELED', 'TERMINAL_CUSTOM_HOOK']);
 const DEDUP_WINDOW_MS = 15_000;
 const DEDUP_RETENTION_MS = 5 * 60_000;
+
+function getSystemIdleSeconds() {
+  if (process.env.FEISHU_REMOTE_TEST_IDLE_SECONDS !== undefined) {
+    const mockVal = Number(process.env.FEISHU_REMOTE_TEST_IDLE_SECONDS);
+    return Number.isFinite(mockVal) && mockVal >= 0 ? Math.floor(mockVal) : null;
+  }
+  try {
+    if (process.platform === 'darwin') {
+      const out = execFileSync('ioreg', ['-c', 'IOHIDSystem'], {
+        encoding: 'utf8',
+        timeout: 1500,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const match = out.match(/HIDIdleTime\s*=\s*(\d+)/);
+      if (match) {
+        return Math.floor(Number(match[1]) / 1e9);
+      }
+    } else if (process.platform === 'linux') {
+      const out = execFileSync('xprintidle', [], {
+        encoding: 'utf8',
+        timeout: 1000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const ms = Number(String(out || '').trim());
+      if (Number.isFinite(ms) && ms >= 0) {
+        return Math.floor(ms / 1000);
+      }
+    }
+  } catch {
+    // Fail-open when idle probe is unavailable
+  }
+  return null;
+}
 
 function readStdinWithTimeout(timeoutMs = 2000) {
   return new Promise((resolve) => {
@@ -105,8 +144,16 @@ async function run() {
   }
 
   const config = loadConfig();
-  if (!config.notifications.stopHookEnabled) {
+  const notifyMode = resolveStopNotifyMode(config);
+  if (notifyMode === 'off') {
     return;
+  }
+  if (notifyMode === 'away') {
+    const awayThreshold = Math.max(10, Number(config.notifications.awayIdleSeconds || 120));
+    const idleSec = getSystemIdleSeconds();
+    if (idleSec !== null && idleSec < awayThreshold) {
+      return;
+    }
   }
   if (!config.feishu.appId || !config.feishu.appSecret) {
     return;
@@ -126,6 +173,7 @@ async function run() {
 
   const {
     buildCard,
+    chunkButtons,
     createFeishuClient,
     sanitizeForFeishuMarkdown,
     sendCard,
@@ -174,11 +222,20 @@ async function run() {
   }
   actionRow.push({ label: '⚙️ 控制面板', value: { cmd: 'panel' } });
 
+  const muteRow = notifyMode === 'on'
+    ? [
+        { label: '🧠 改为仅离开提醒', value: { cmd: 'notify_mode', arg: 'away' } },
+        { label: '🔕 关闭桌面提醒', value: { cmd: 'notify_mode', arg: 'off' } },
+      ]
+    : [
+        { label: '🔕 关闭桌面提醒', value: { cmd: 'notify_mode', arg: 'off' } },
+      ];
+
   const card = buildCard({
     title: isError ? '⚠️ 本地 Antigravity 任务异常结束' : '🔔 本地 Antigravity 任务已完成',
     template: isError ? 'orange' : 'green',
     markdown: lines.join('\n'),
-    buttonRows: [actionRow],
+    buttonRows: [...chunkButtons(actionRow, 3), muteRow],
     footer: conversationId
       ? '点「📱 接管此对话」可在手机飞书无缝续聊电脑端上下文'
       : '点下方按钮可快速切换目录或打开控制面板',

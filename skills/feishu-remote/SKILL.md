@@ -55,6 +55,7 @@ Run commands with `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs`:
   - `--allow-open-id <ou_xxx>` (repeatable; if omitted, first private-chat sender is auto-bound)
   - `--group-policy mention|off|all` (default `mention`)
   - `--stop-hook true|false` (default `true`; desktop completion cards include a `📱 接管此对话` handoff button)
+  - `--notify-mode on|away|off` & `--away-seconds <10..3600>` (default `on`, `120`s; `away` suppresses desktop completion notifications while active at the keyboard)
   - `--add-quick "按钮名称|提示词"` (repeatable; adds custom one-tap quick task buttons)
   - `--reset-quick` (resets quick tasks back to built-in defaults)
   - Note: in `accept-edits` mode, remote tasks can read/edit files but shell/MCP calls may be denied; tap `⚡ 临时全权30m` (or send `/mode full 30m`, auto-reverts after expiry) or `⚡ 常驻全权` in the Control Panel when remote shell/MCP execution is needed.

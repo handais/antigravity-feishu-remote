@@ -15,6 +15,7 @@ const {
   loadConfig,
   loadState,
   maskSecret,
+  resolveStopNotifyMode,
   saveConfig,
   saveState,
   stripProcessProxyEnv,
@@ -27,6 +28,7 @@ const {
   buildDirsCard,
   buildEffortCard,
   buildGitStatusCard,
+  buildNotifyCard,
   buildQueuedCard,
   buildScopesCard,
   sanitizeForFeishuMarkdown,
@@ -754,6 +756,36 @@ try {
   assert.equal(stopSubagentRes.code, 0);
   assert.equal(stopSubagentRes.stdout.trim(), '{}');
   assert.equal(stopSubagentRes.stderr.trim(), '');
+
+  assert.equal(resolveStopNotifyMode({ notifications: { stopHookEnabled: false, stopNotifyMode: 'on' } }), 'off');
+  assert.equal(resolveStopNotifyMode({ notifications: { stopHookEnabled: true, stopNotifyMode: 'away' } }), 'away');
+  assert.equal(resolveStopNotifyMode({ notifications: { stopHookEnabled: true } }), 'on');
+
+  const notifyTestCfg = loadConfig();
+  notifyTestCfg.notifications.stopHookEnabled = true;
+  notifyTestCfg.notifications.stopNotifyMode = 'away';
+  notifyTestCfg.notifications.awayIdleSeconds = 120;
+  saveConfig(notifyTestCfg);
+  assert.equal(buildNotifyCard({ config: notifyTestCfg }).schema, '2.0');
+
+  const stopActiveUserRes = await runSubprocess('scripts/stop-notify.mjs', {
+    env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir, FEISHU_REMOTE_TEST_IDLE_SECONDS: '15' },
+    stdinData: JSON.stringify({ fullyIdle: true, terminationReason: 'NO_TOOL_CALL' }),
+  });
+  assert.equal(stopActiveUserRes.code, 0);
+  assert.equal(stopActiveUserRes.stdout.trim(), '{}');
+  assert.equal(stopActiveUserRes.stderr.trim(), '');
+
+  notifyTestCfg.notifications.stopNotifyMode = 'off';
+  notifyTestCfg.notifications.stopHookEnabled = false;
+  saveConfig(notifyTestCfg);
+  const stopMutedRes = await runSubprocess('scripts/stop-notify.mjs', {
+    env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir, FEISHU_REMOTE_TEST_IDLE_SECONDS: '999' },
+    stdinData: JSON.stringify({ fullyIdle: true, terminationReason: 'NO_TOOL_CALL' }),
+  });
+  assert.equal(stopMutedRes.code, 0);
+  assert.equal(stopMutedRes.stdout.trim(), '{}');
+  assert.equal(stopMutedRes.stderr.trim(), '');
 
   // 6. mcp-server.mjs stdio JSON-RPC handshake
   await testMcpStdio();
