@@ -7,6 +7,87 @@
 
 ---
 
+## 🤖 交给 AI 一键自动部署（Agent Quickstart）
+
+如果你正在使用 **Antigravity / Claude Code / OpenClaw** 等具备终端能力的 AI 助手，**不需要自己手动敲命令**，直接把仓库链接交给它即可完成本地部署。
+
+### 1. 给用户：复制这句话发给你的 AI 助手
+
+```text
+请帮我按这个仓库的 README 自动部署飞书远程控制插件：
+https://github.com/handais/antigravity-feishu-remote
+安装到 ~/.gemini/config/plugins/feishu-remote，遇到需要我在飞书开放平台操作或提供 App ID / App Secret 时再提示我。
+```
+
+### 2. 给 AI 助手（Antigravity / Coding Agent）的部署 SOP
+
+> [!IMPORTANT]
+> 请严格按以下步骤依次执行并校验输出；每步失败立即停止并报告原因，不要跳过检查。
+
+#### Step 1 — 前置环境检查
+1. 检查系统平台（支持 **macOS `launchd`**、**Linux `systemd --user`**；Windows 请提示用户使用 **WSL2**，或仅可前台运行 `node scripts/bridge-daemon.mjs`）。
+2. 检查 Node 版本与 `agy` CLI：
+   ```bash
+   node -v && which agy
+   ```
+   - 要求 **`Node.js >= 22.5.0`**（`/desktop` 只读索引与 `Stop` Hook 子代理过滤依赖内置 `node:sqlite`）。若版本过低，请先协助用户升级 Node 或提示安装。
+   - 若找不到 `agy`，提醒用户先安装并完成 `agy` 登录验证。
+
+#### Step 2 — 下载插件并安装依赖与体检
+1. 若 `~/.gemini/config/plugins/feishu-remote` 尚不存在，克隆仓库并安装生产依赖：
+   ```bash
+   mkdir -p ~/.gemini/config/plugins
+   git clone https://github.com/handais/antigravity-feishu-remote.git ~/.gemini/config/plugins/feishu-remote
+   cd ~/.gemini/config/plugins/feishu-remote && npm install --omit=dev
+   ```
+   *(若已通过 zip 解压到此目录，进入目录执行 `npm install --omit=dev` 即可。)*
+2. 运行代码体检与隔离冒烟测试，确认本地环境完全兼容：
+   ```bash
+   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs check
+   node ~/.gemini/config/plugins/feishu-remote/scripts/smoke-test.mjs
+   ```
+   - 期望：`cli.mjs check` 输出 `"ok": true` 且 `"errors": []`；`smoke-test.mjs` 输出 `ALL SMOKE TESTS PASSED`。
+
+#### Step 3 — 引导用户准备飞书应用与凭证
+1. 告知用户按下方 **[二、飞书开放平台 3 分钟配置清单](#二飞书开放平台-3-分钟配置清单)** 操作（若你当前具备浏览器操作权限且用户同意，可在用户完成登录扫码后协助在网页中点选并发布）：
+   - 创建企业自建应用 → 开启 **机器人（Bot）**能力；
+   - 在 **权限管理 → 批量导入/导出权限** 粘贴下方 JSON 开通权限（如需单人话题群免 `@` 直接发消息，额外开通 `im:message.group_msg`）；
+   - 在 **事件与回调** 中将订阅方式设为 **「使用长连接接收事件 / 回调」**，订阅事件 `im.message.receive_v1`、`application.bot.menu_v6`，订阅回调 `card.action.trigger`；
+   - 创建版本并发布（建议同步配置机器人自定义菜单）。
+2. 向用户索取且**仅索取**两项信息：**`App ID`** 与 **`App Secret`**。
+
+#### Step 4 — 写入配置、启动守护进程与验收
+拿到 `App ID` 和 `App Secret` 后执行：
+```bash
+node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup \
+  --app-id "<APP_ID>" \
+  --app-secret "<APP_SECRET>" \
+  --cwd "$HOME" \
+  --mode accept-edits \
+  --notify-mode away
+
+node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs start
+node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs status
+node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
+```
+- 验收标准：
+  - `cli.mjs status` 中 `configured: true` 且 `daemon.running: true`；
+  - `cli.mjs scopes` 确认基础 `im:message`、`im:resource`、`cardkit:*` 等权限处于 `granted` 状态（若有 `pending`，提醒用户在飞书后台发布版本）。
+
+#### Step 5 — 首轮配对验活
+1. 提示用户在手机/电脑飞书里找到该机器人，**私聊发送一句 `你好`**，触发自动白名单绑定与欢迎卡片。
+2. 绑定完成后，可选执行 `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs test-send --panel` 验证控制面板卡片可正常送达。
+
+#### AI 必守红线与排错速查
+- **凭证隔离红线**：严禁将 `appSecret`、`open_id` 写入 `~/.gemini/config/plugins/feishu-remote/` 仓库目录内，也严禁在回复或日志中明文回显 `appSecret`（所有凭证与状态统一由 `cli.mjs setup` 保存在 `~/.config/antigravity-feishu/`，权限 `0600`）。
+- **子进程重启禁令**：如果当前任务本身是由飞书桥接拉起的子会话（`FEISHU_REMOTE_BRIDGE_CHILD=1`），禁止自行运行 `cli.mjs restart` 杀掉父守护进程；应提示用户在飞书发 `/reload` 安全重启。
+- **常见快速调整**：
+  - 话题群免 `@` 触发：确保飞书后台已开通并发布 `im:message.group_msg`，再执行 `cli.mjs setup --group-policy all`（白名单依然仅放行授权 `open_id`）。
+  - 调整全局并行任务上限（默认 `4`）：`cli.mjs setup --max-concurrent 2`（16 GB 内存日常推荐 2–4）。
+  - 详细维护与排错规则另见仓库内的 `skills/feishu-remote/SKILL.md` 与 `rules/AGENTS.md`。
+
+---
+
 ## 一、功能一览
 
 1. **飞书长连接桥接守护进程（Daemon）**：
