@@ -229,6 +229,7 @@ export function formatHelpMarkdown() {
     '- `/scopes`（或 `/perms`）：自检飞书应用授权状态，支持一键向管理员重发待审权限申请',
     '- `/queue`：查看或取消正在排队等待的任务',
     '- `/doc <链接|ID>` / `/doc create 标题 | Markdown` / `/doc write 链接 | Markdown`：读取或生成飞书云文档',
+    '- `/tasks`（或 `/todo`）：查看、新建、勾选完成或一键执行飞书任务中心待办（需先运行 `cli.mjs auth` 授权）',
     '- `/ops`（或 `/backups`）：打开运维与自迭代面板（安全重启 / 代码体检 / 快照回滚）',
     '- `/reload` / `/check` / `/snapshot` / `/rollback [ID]`：代码检查、快照、安全重启与回滚',
     '- `/dirs` / `/cd <路径或关键词>` / `/pin`：浏览、模糊匹配或收藏工作目录',

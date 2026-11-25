@@ -2,6 +2,8 @@
   "name": "antigravity-feishu-remote",
   "version": "1.0.0",
   "license": "MIT",
+  "author": "handais",
+  "homepage": "https://github.com/handais/antigravity-feishu-remote#readme",
   "type": "module",
   "description": "Feishu WebSocket remote control bridge, MCP server, and completion hook for Antigravity",
   "engines": {

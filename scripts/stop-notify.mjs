@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   getConfigDir,
+  getPluginRoot,
   loadConfig,
   resolveStopNotifyMode,
   stripProcessProxyEnv,
@@ -252,7 +253,7 @@ async function run() {
     markdown: lines.join('\n'),
     buttonRows: [...chunkButtons(actionRow, 3), muteRow],
     footer: conversationId
-      ? '点「📱 接管此对话」可在手机飞书无缝续聊电脑端上下文'
+      ? '点「📱 接管此对话」将同步电脑端最新回复并在手机飞书无缝续聊'
       : '点下方按钮可快速切换目录或打开控制面板',
   });
 
@@ -270,7 +271,11 @@ async function run() {
 try {
   await run();
 } catch (err) {
-  console.error('[feishu-stop-notify] Ignored notification error:', err?.message || err);
+  if (err?.code === 'ERR_MODULE_NOT_FOUND' || err?.code === 'MODULE_NOT_FOUND') {
+    console.error(`[feishu-stop-notify] Missing node_modules; run: cd "${getPluginRoot()}" && npm install --omit=dev`);
+  } else {
+    console.error('[feishu-stop-notify] Ignored notification error:', err?.message || err);
+  }
 } finally {
   process.stdout.write('{}\n');
   process.exit(0);

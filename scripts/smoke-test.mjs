@@ -10,14 +10,17 @@ process.env.FEISHU_REMOTE_CONFIG_DIR = tempConfigDir;
 
 const {
   DEFAULT_CONFIG,
+  clearUserAuth,
   getConfigPath,
   getPluginRoot,
   loadConfig,
   loadState,
+  loadUserAuth,
   maskSecret,
   resolveStopNotifyMode,
   saveConfig,
   saveState,
+  saveUserAuth,
   stripProcessProxyEnv,
 } = await import('./lib/config.mjs');
 const {
@@ -31,12 +34,20 @@ const {
   buildNotifyCard,
   buildQueuedCard,
   buildScopesCard,
+  buildTasksCard,
   sanitizeForFeishuMarkdown,
   searchDirsFuzzy,
   splitMarkdownChunks,
 } = await import('./lib/feishu-api.mjs');
 const {
+  buildOAuthAuthorizeUrl,
+  formatTaskDueText,
+  getUserAuthStatus,
+  parseDueTimeInput,
+} = await import('./lib/feishu-tasks.mjs');
+const {
   buildDesktopHandoffContext,
+  extractLatestAssistantReply,
   extractTranscriptTurns,
   getDesktopSessionDetail,
   isSubagentConversation,
@@ -58,6 +69,7 @@ const {
 const {
   buildMultimodalPrompt,
   cleanupOldInboxFiles,
+  downloadMessageAttachments,
   extractInboundMessage,
   extractInteractiveCardText,
   pruneLogFileIfOversized,
@@ -142,6 +154,9 @@ async function testMcpStdio() {
     const toolNames = listRes.result.tools.map((t) => t.name).sort();
     assert.deepEqual(toolNames, [
       'feishu_bridge_status',
+      'feishu_complete_task',
+      'feishu_create_task',
+      'feishu_list_tasks',
       'feishu_manage_bridge',
       'feishu_read_doc',
       'feishu_send_card',
@@ -267,6 +282,9 @@ try {
   });
   assert.equal(panelCard.schema, '2.0');
   assert.ok(panelCard.body.elements.some((el) => el.tag === 'column_set'));
+  for (const el of panelCard.body.elements.filter((item) => item.tag === 'column_set')) {
+    assert.ok(el.columns.length <= 5, `Panel button row too wide (${el.columns.length} cols)`);
+  }
   assert.ok(JSON.stringify(panelCard).includes('临时全权'));
   assert.ok(JSON.stringify(panelCard).includes('队列(2)'));
 
@@ -340,6 +358,38 @@ try {
   });
   assert.equal(postParsed.text, '日报\n内容');
   assert.equal(postParsed.attachments.length, 1);
+
+  const todoFullParsed = extractInboundMessage({
+    message_type: 'todo',
+    content: JSON.stringify({
+      task_id: 'task_abc_123',
+      due_time: '1764000000000',
+      summary: {
+        title: '排查线上告警',
+        content: [
+          [{ tag: 'text', text: '检查网关超时日志' }],
+          [{ tag: 'img', image_key: 'img_todo_1' }],
+        ],
+      },
+    }),
+  });
+  assert.equal(todoFullParsed.supported, true);
+  assert.ok(todoFullParsed.text.includes('【飞书任务】'));
+  assert.ok(todoFullParsed.text.includes('排查线上告警'));
+  assert.ok(todoFullParsed.text.includes('检查网关超时日志'));
+  assert.ok(todoFullParsed.text.includes('截止时间：'));
+  assert.ok(todoFullParsed.text.includes('task_id=task_abc_123'));
+  assert.equal(todoFullParsed.attachments.length, 1);
+  assert.equal(todoFullParsed.attachments[0].fileKey, 'img_todo_1');
+
+  const todoTitleOnlyParsed = extractInboundMessage({
+    message_type: 'todo',
+    content: JSON.stringify({
+      summary: { title: '仅标题任务' },
+    }),
+  });
+  assert.equal(todoTitleOnlyParsed.supported, true);
+  assert.ok(todoTitleOnlyParsed.text.includes('仅标题任务'));
   const cardText = extractInteractiveCardText({
     title: '旧卡片',
     elements: [[{ tag: 'text', text: '第一行' }], [{ tag: 'a', text: '链接', href: 'https://feishu.cn/docx/abc' }]],
@@ -365,10 +415,11 @@ try {
   // 4e. Self-ops preflight and snapshot
   const preflight = runPreflightCheck();
   assert.equal(preflight.ok, true);
-  assert.equal(preflight.checkedFiles.length, 18);
+  assert.equal(preflight.checkedFiles.length, 19);
   for (const rel of [
     'scripts/lib/cardkit-stream.mjs',
     'scripts/lib/feishu-docs.mjs',
+    'scripts/lib/feishu-tasks.mjs',
     'scripts/lib/bridge-helpers.mjs',
     'scripts/lib/task-runner.mjs',
     'scripts/lib/slash-commands.mjs',
@@ -458,6 +509,21 @@ try {
     [
       JSON.stringify({ step_index: 1, type: 'USER_INPUT', created_at: '2026-11-23T05:00:00Z', content: '<USER_REQUEST>\n分析 PPT 优化方案\n</USER_REQUEST><ADDITIONAL_METADATA>ignored</ADDITIONAL_METADATA>' }),
       JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-23T05:00:10Z', content: '已完成结构梳理，建议补充图表页。' }),
+    ].join('\n'),
+  );
+  const fullMarkdownReply = [
+    '### 完整优化方案',
+    '',
+    '1. 精简封面文字并突出核心结论，控制每页不超过三个关键指标，确保远程汇报与投屏阅读都清晰明了',
+    '2. 新增核心指标对比图表页与季度环比趋势图，并在底部补充数据口径说明与异常波动归因分析',
+    '3. 为每页补充一页一句话结论摘要，方便管理层快速扫读与决策确认，同时附上后续两周的里程碑排期建议',
+  ].join('\n');
+  fs.writeFileSync(
+    path.join(desktopAppDir, 'brain', 'desk-1', '.system_generated', 'logs', 'transcript_full.jsonl'),
+    [
+      JSON.stringify({ step_index: 1, type: 'USER_INPUT', created_at: '2026-11-23T05:00:00Z', content: '<USER_REQUEST>\n分析 PPT 优化方案\n</USER_REQUEST><ADDITIONAL_METADATA>ignored</ADDITIONAL_METADATA>' }),
+      JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-23T05:00:10Z', content: fullMarkdownReply }),
+      JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', created_at: '2026-11-23T05:00:12Z', tool_calls: [{ name: 'read_file' }] }),
     ].join('\n'),
   );
 
@@ -559,13 +625,20 @@ try {
     assert.ok(detail && detail.turns.length === 2);
     assert.ok(path.isAbsolute(detail.brainDir) && detail.brainDir.startsWith(fakeGeminiDir));
     assert.equal(detail.turns[0].text, '分析 PPT 优化方案');
+    assert.equal(detail.lastAssistantReply, fullMarkdownReply);
+    assert.ok(detail.transcriptFile.endsWith('transcript_full.jsonl'));
+    assert.equal(detail.lastAssistantReplyTruncated, false);
+    const truncatedReply = extractLatestAssistantReply(path.join(desktopAppDir, 'brain', 'desk-1'), { maxChars: 100 });
+    assert.ok(truncatedReply && truncatedReply.truncated === true && truncatedReply.totalChars === fullMarkdownReply.length);
     const handoffCtx = buildDesktopHandoffContext(detail);
-    assert.ok(handoffCtx.includes('[电脑端对话上下文接管]') && handoffCtx.includes('已完成结构梳理'));
+    assert.ok(handoffCtx.includes('[电脑端对话上下文接管]') && handoffCtx.includes('电脑端最后一条模型回复：'));
+    assert.ok(handoffCtx.includes('原对话完整日志：') && handoffCtx.includes(fullMarkdownReply));
 
     const listCard = buildDesktopSessionsCard({ items: allDesk, query: 'PPT' });
     assert.equal(listCard.schema, '2.0');
     const previewCard = buildDesktopSessionPreviewCard(detail);
     assert.equal(previewCard.schema, '2.0');
+    assert.ok(JSON.stringify(previewCard).includes('desktop_last_reply'));
     assert.ok(extractTranscriptTurns(path.join(cliAppDir, 'brain', 'cli-1')).length === 0);
     assert.equal(isSubagentConversation('sub-ignored'), true);
     assert.equal(isSubagentConversation('desk-1'), false);
@@ -606,6 +679,27 @@ try {
   assert.equal(fs.existsSync(oldFile), false);
   assert.equal(fs.existsSync(midFile), false);
   assert.equal(fs.existsSync(newFile), true);
+
+  // 4h-2. downloadMessageAttachments must not ENOENT when initial cleanup runs on an empty chat inbox dir
+  const mockJpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+  const mockFeishuClient = {
+    im: {
+      v1: {
+        messageResource: {
+          get: async () => mockJpeg,
+        },
+      },
+    },
+  };
+  const dlRes = await downloadMessageAttachments(mockFeishuClient, {
+    messageId: 'om_test_img_1',
+    chatKey: 'oc_fresh_empty_dir_test',
+    attachments: [{ kind: 'image', resourceType: 'image', fileKey: 'img_v3_test', fileName: '' }],
+  });
+  assert.equal(dlRes.failed.length, 0, `Expected 0 download failures, got: ${JSON.stringify(dlRes.failed)}`);
+  assert.equal(dlRes.downloaded.length, 1);
+  assert.ok(dlRes.downloaded[0].localPath.endsWith('.jpg'));
+  assert.equal(fs.existsSync(dlRes.downloaded[0].localPath), true);
 
   // 4i. Topic group session keys, inheritance, stale thread pruning, and panel badges
   assert.equal(makeSessionKey('oc_topic_1', ''), 'oc_topic_1');
@@ -685,17 +779,22 @@ try {
   assert.ok(topicPanelJson.includes('om_new_1_abc'));
   assert.ok(topicPanelJson.includes('全局并行 2/4'));
 
-  // 4j. Directory browser pagination
+  // 4j. Directory browser pagination & hidden directories toggle
   const manyDirRoot = path.join(tempConfigDir, 'many-dirs');
   for (let i = 1; i <= 15; i += 1) {
     fs.mkdirSync(path.join(manyDirRoot, `dir-${String(i).padStart(2, '0')}`), { recursive: true });
   }
+  fs.mkdirSync(path.join(manyDirRoot, '.gemini-hidden'), { recursive: true });
   const dirPage0Json = JSON.stringify(
     buildDirsCard({ chatState: { cwd: manyDirRoot }, config: topicConfig, page: 0 }),
   );
   assert.ok(dirPage0Json.includes('第 1/2 页'));
   assert.ok(dirPage0Json.includes('▶️ 下一页 (2/2)'));
   assert.ok(!dirPage0Json.includes('◀️ 上一页'));
+  assert.ok(!dirPage0Json.includes('.gemini-hidden'));
+  assert.ok(dirPage0Json.includes('另有 1 个隐藏目录'));
+  assert.ok(dirPage0Json.includes('🙈 显示隐藏'));
+  assert.ok(dirPage0Json.includes('"showHidden":true'));
 
   const dirPage1Json = JSON.stringify(
     buildDirsCard({ chatState: { cwd: manyDirRoot }, config: topicConfig, page: 1 }),
@@ -703,6 +802,74 @@ try {
   assert.ok(dirPage1Json.includes('第 2/2 页'));
   assert.ok(dirPage1Json.includes('◀️ 上一页 (1/2)'));
   assert.ok(dirPage1Json.includes('dir-15'));
+
+  const dirHiddenOnJson = JSON.stringify(
+    buildDirsCard({ chatState: { cwd: manyDirRoot, showHiddenDirs: true }, config: topicConfig, page: 0 }),
+  );
+  assert.ok(dirHiddenOnJson.includes('.gemini-hidden'));
+  assert.ok(dirHiddenOnJson.includes('隐藏 1 个'));
+  assert.ok(dirHiddenOnJson.includes('👁️ 隐藏:开'));
+  assert.ok(dirHiddenOnJson.includes('"showHidden":false'));
+
+  // 4k. Feishu Task v2 OAuth helpers, due parsing, user-auth storage (0600), and tasks card
+  const feishuAuthUrl = buildOAuthAuthorizeUrl({
+    appId: 'cli_test_123',
+    domain: 'feishu',
+    state: 'st_abc',
+  });
+  assert.ok(feishuAuthUrl.startsWith('https://accounts.feishu.cn/open-apis/authen/v1/authorize'));
+  assert.ok(feishuAuthUrl.includes('offline_access') && feishuAuthUrl.includes('task%3Atask%3Aread'));
+  assert.ok(feishuAuthUrl.includes('127.0.0.1%3A18923%2Fcallback'));
+  const larkAuthUrl = buildOAuthAuthorizeUrl({ appId: 'cli_test_123', domain: 'lark' });
+  assert.ok(larkAuthUrl.startsWith('https://accounts.larksuite.com/open-apis/authen/v1/authorize'));
+
+  const dueDateOnly = parseDueTimeInput('2026-11-26');
+  assert.equal(dueDateOnly?.is_all_day, true);
+  assert.equal(formatTaskDueText(dueDateOnly), '2026-11-26');
+  const dueWithTime = parseDueTimeInput('2026-11-26 18:30');
+  assert.equal(dueWithTime?.is_all_day, false);
+  assert.equal(formatTaskDueText(dueWithTime), '2026-11-26 18:30');
+  assert.ok(formatTaskDueText({ timestamp: '1764000000000', is_all_day: false }).length >= 16);
+
+  clearUserAuth();
+  assert.equal(getUserAuthStatus().authorized, false);
+  saveUserAuth({
+    accessToken: 'u-secret-access-token',
+    refreshToken: 'ur-secret-refresh-token',
+    expiresAt: Date.now() + 3600_000,
+    refreshExpiresAt: Date.now() + 86400_000,
+    scope: 'offline_access task:task:read task:task:write',
+    domain: 'feishu',
+  });
+  const loadedUserAuth = loadUserAuth();
+  assert.equal(loadedUserAuth?.accessToken, 'u-secret-access-token');
+  assert.equal(fs.statSync(path.join(tempConfigDir, 'user-auth.json')).mode & 0o777, 0o600);
+  const statusSafe = getUserAuthStatus();
+  assert.equal(statusSafe.authorized, true);
+  assert.equal(statusSafe.hasRefreshToken, true);
+  assert.ok(!JSON.stringify(statusSafe).includes('u-secret-access-token'));
+  assert.ok(!JSON.stringify(statusSafe).includes('ur-secret-refresh-token'));
+
+  const tasksUnauthJson = JSON.stringify(
+    buildTasksCard({ authStatus: { authorized: false }, authUrl: feishuAuthUrl }),
+  );
+  assert.ok(tasksUnauthJson.includes('127.0.0.1:18923/callback'));
+  assert.ok(tasksUnauthJson.includes('cli.mjs auth'));
+
+  const tasksAuthedJson = JSON.stringify(
+    buildTasksCard({
+      authStatus: statusSafe,
+      filter: 'open',
+      items: [
+        { guid: 'task-guid-1111', summary: '修复下载 bug', description: '检查 media.mjs', dueText: '2026-11-26', completed: false },
+        { guid: 'task-guid-2222', summary: '补充单测', description: '', dueText: '', completed: true },
+      ],
+    }),
+  );
+  assert.ok(tasksAuthedJson.includes('修复下载 bug'));
+  assert.ok(tasksAuthedJson.includes('task_run'));
+  assert.ok(tasksAuthedJson.includes('task_toggle'));
+  clearUserAuth();
 
   // 5. stop-notify.mjs subprocess checks
   const stopChildRes = await runSubprocess('scripts/stop-notify.mjs', {
@@ -800,6 +967,24 @@ try {
   // 6. mcp-server.mjs stdio JSON-RPC handshake
   await testMcpStdio();
 
+  // 6b. Plugin manifest & component checks
+  const manifest = JSON.parse(fs.readFileSync(path.join(pluginRoot, 'plugin.json'), 'utf8'));
+  for (const field of ['name', 'displayName', 'description', 'version', 'homepage', 'repository', 'logo']) {
+    assert.equal(typeof manifest[field], 'string', `plugin.json.${field} must be a string`);
+    assert.ok(manifest[field].trim().length > 0, `plugin.json.${field} must be non-empty`);
+  }
+  assert.ok(manifest.author && typeof manifest.author.name === 'string' && manifest.author.name.trim().length > 0);
+  assert.ok(Array.isArray(manifest.suggestedPrompts) && manifest.suggestedPrompts.length > 0);
+  assert.ok(fs.existsSync(path.join(pluginRoot, manifest.logo)), 'plugin.json logo target must exist');
+
+  const mcpCfg = JSON.parse(fs.readFileSync(path.join(pluginRoot, 'mcp_config.json'), 'utf8'));
+  assert.ok(mcpCfg.mcpServers?.['feishu-remote-tools']);
+  assert.ok(fs.existsSync(path.join(pluginRoot, 'scripts', 'mcp-server.mjs')));
+
+  const hooksCfg = JSON.parse(fs.readFileSync(path.join(pluginRoot, 'hooks.json'), 'utf8'));
+  assert.ok(Array.isArray(hooksCfg['feishu-stop-notify']?.Stop));
+  assert.ok(fs.existsSync(path.join(pluginRoot, 'scripts', 'stop-notify.mjs')));
+
   // 7. cli.mjs pack check
   const zipPath = path.join(tempConfigDir, 'feishu-remote-test.zip');
   execFileSync(process.execPath, [path.join(pluginRoot, 'scripts', 'cli.mjs'), 'pack', '--out', zipPath], {
@@ -809,6 +994,8 @@ try {
   assert.ok(zipList.includes('feishu-remote/plugin.json'));
   assert.ok(zipList.includes('feishu-remote/mcp_config.json'));
   assert.ok(zipList.includes('feishu-remote/hooks.json'));
+  assert.ok(zipList.includes('feishu-remote/README_EN.md'));
+  assert.ok(zipList.includes('feishu-remote/LICENSE'));
   assert.ok(zipList.includes('feishu-remote/skills/feishu-remote/SKILL.md'));
   assert.ok(zipList.includes('feishu-remote/scripts/bridge-daemon.mjs'));
   assert.ok(!zipList.includes('node_modules'), 'Zip must not contain node_modules');

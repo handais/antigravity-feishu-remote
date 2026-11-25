@@ -61,7 +61,10 @@ function cleanupDirectoryRecursive(dirPath, cutoffMs, isRoot = false) {
   if (!isRoot) {
     try {
       if (fs.readdirSync(dirPath).length === 0) {
-        fs.rmdirSync(dirPath);
+        const dirStat = fs.statSync(dirPath);
+        if (Date.now() - dirStat.mtimeMs >= 60_000) {
+          fs.rmdirSync(dirPath);
+        }
       }
     } catch {
       // Ignore non-empty or busy dirs
@@ -108,7 +111,10 @@ function pruneEmptySubdirs(dirPath, isRoot = false) {
   if (!isRoot) {
     try {
       if (fs.readdirSync(dirPath).length === 0) {
-        fs.rmdirSync(dirPath);
+        const dirStat = fs.statSync(dirPath);
+        if (Date.now() - dirStat.mtimeMs >= 60_000) {
+          fs.rmdirSync(dirPath);
+        }
       }
     } catch {
       // Ignore non-empty or busy dirs
@@ -333,6 +339,60 @@ function extractPostMessage(parsed) {
   return { text: parts.join('\n').trim(), attachments };
 }
 
+function formatTodoDueTime(rawDueTime) {
+  const rawStr = String(rawDueTime ?? '').trim();
+  if (!rawStr) return '';
+  const num = Number(rawStr);
+  if (!Number.isFinite(num) || num <= 0) return '';
+  const ms = num < 1e11 ? num * 1000 : num;
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function extractTodoMessage(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    return { text: '', attachments: [] };
+  }
+  let bodyText = '';
+  let attachments = [];
+  if (parsed.summary && typeof parsed.summary === 'object') {
+    const postRes = extractPostMessage(parsed.summary);
+    bodyText = postRes.text;
+    attachments = postRes.attachments;
+    if (!bodyText && parsed.summary.title) {
+      bodyText = String(parsed.summary.title).trim();
+    }
+  } else if (typeof parsed.summary === 'string') {
+    bodyText = parsed.summary.trim();
+  } else if (parsed.title) {
+    bodyText = String(parsed.title).trim();
+  }
+
+  const metaParts = [];
+  const dueText = formatTodoDueTime(parsed.due_time);
+  if (dueText) {
+    metaParts.push(`截止时间：${dueText}`);
+  }
+  const taskId = String(parsed.task_id || '').trim();
+  if (taskId) {
+    metaParts.push(`task_id=${taskId}`);
+  }
+
+  const lines = [];
+  if (bodyText) {
+    lines.push('【飞书任务】', bodyText);
+  } else if (metaParts.length > 0 || attachments.length > 0) {
+    lines.push('【飞书任务】');
+  }
+  if (metaParts.length > 0) {
+    lines.push(metaParts.join(' · '));
+  }
+
+  return { text: lines.join('\n').trim(), attachments };
+}
+
 export function extractInboundMessage(message) {
   const msgType = message?.message_type || '';
   const rawContent = message?.content || '';
@@ -357,6 +417,15 @@ export function extractInboundMessage(message) {
   if (msgType === 'post') {
     const { text, attachments } = extractPostMessage(parsed);
     return { supported: true, msgType, text, attachments };
+  }
+  if (msgType === 'todo') {
+    const { text, attachments } = extractTodoMessage(parsed);
+    return {
+      supported: Boolean(text || attachments.length > 0),
+      msgType,
+      text,
+      attachments,
+    };
   }
   if (msgType === 'image') {
     const fileKey = String(parsed?.image_key || '').trim();
@@ -446,6 +515,7 @@ async function readResourceBuffer(resp, tempDir, maxBytes) {
   if (typeof resp?.writeFile === 'function') {
     const tmpFile = path.join(tempDir, `.dl-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
     try {
+      fs.mkdirSync(tempDir, { recursive: true, mode: 0o700 });
       await resp.writeFile(tmpFile);
       const stat = fs.statSync(tmpFile);
       if (stat.size > maxBytes) {
@@ -476,17 +546,17 @@ export async function downloadMessageAttachments(
   client,
   { messageId, chatKey = 'default', attachments = [], maxItems = 6, maxBytes = 30 * 1024 * 1024 },
 ) {
+  if (Date.now() - lastCleanupAt >= 3600_000) {
+    lastCleanupAt = Date.now();
+    cleanupOldInboxFiles(7);
+  }
+
   const chatInboxDir = path.join(getInboxDir(), sanitizeFileName(chatKey, 'default'));
   fs.mkdirSync(chatInboxDir, { recursive: true, mode: 0o700 });
   try {
     fs.chmodSync(chatInboxDir, 0o700);
   } catch {
     // Ignore on unsupported filesystems
-  }
-
-  if (Date.now() - lastCleanupAt >= 3600_000) {
-    lastCleanupAt = Date.now();
-    cleanupOldInboxFiles(7);
   }
 
   const downloaded = [];
@@ -516,6 +586,7 @@ export async function downloadMessageAttachments(
       const finalName = `${stamp}-${i + 1}-${finalBase}`;
       const localPath = path.join(chatInboxDir, finalName);
 
+      fs.mkdirSync(chatInboxDir, { recursive: true, mode: 0o700 });
       fs.writeFileSync(localPath, buf, { mode: 0o600 });
       try {
         fs.chmodSync(localPath, 0o600);

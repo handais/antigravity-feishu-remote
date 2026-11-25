@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
+  clearUserAuth,
   detectAgyBin,
   detectLocalProxy,
   getConfigDir,
@@ -26,6 +27,15 @@ import {
   sendLocalMedia,
 } from './lib/feishu-api.mjs';
 import { queryAppScopes, readFeishuDoc, writeFeishuDoc } from './lib/feishu-docs.mjs';
+import {
+  buildOAuthAuthorizeUrl,
+  createFeishuTask,
+  exchangeOAuthCode,
+  getUserAuthStatus,
+  listFeishuTasks,
+  runInteractiveOAuthFlow,
+  setFeishuTaskCompleted,
+} from './lib/feishu-tasks.mjs';
 import { VALID_EFFORTS, VALID_MODES } from './lib/agy-runner.mjs';
 import { listDesktopSessions } from './lib/desktop-sessions.mjs';
 import {
@@ -561,11 +571,83 @@ function cmdDesktop(flags) {
   }, null, 2));
 }
 
+async function cmdAuth(flags) {
+  const config = loadConfig();
+  if (flags.status) {
+    console.log(JSON.stringify({ ok: true, userAuth: getUserAuthStatus() }, null, 2));
+    return;
+  }
+  if (flags.logout) {
+    clearUserAuth();
+    console.log(JSON.stringify({ ok: true, loggedOut: true, userAuth: getUserAuthStatus() }, null, 2));
+    return;
+  }
+  if (typeof flags.code === 'string' && flags.code.trim()) {
+    const redirectUri = typeof flags['redirect-uri'] === 'string' && flags['redirect-uri'].trim()
+      ? flags['redirect-uri'].trim()
+      : undefined;
+    const status = await exchangeOAuthCode(config, { code: flags.code.trim(), redirectUri });
+    console.log(JSON.stringify({ ok: true, userAuth: status }, null, 2));
+    return;
+  }
+  if (flags.url) {
+    const url = buildOAuthAuthorizeUrl({
+      appId: config?.feishu?.appId,
+      domain: config?.feishu?.domain,
+    });
+    console.log(JSON.stringify({ ok: true, authorizeUrl: url }, null, 2));
+    return;
+  }
+  const port = flags.port ? Number(flags.port) : undefined;
+  const timeoutSeconds = flags.timeout ? Number(flags.timeout) : 180;
+  const result = await runInteractiveOAuthFlow(config, {
+    port,
+    timeoutSeconds,
+    openBrowser: !flags['no-browser'],
+  });
+  console.log(JSON.stringify({ ok: true, redirectUri: result.redirectUri, userAuth: result.auth }, null, 2));
+}
+
+async function cmdTasks(flags) {
+  const config = loadConfig();
+  const filter = String(flags.filter || 'open').trim();
+  const pageSize = flags.limit ? Number(flags.limit) : 50;
+  const res = await listFeishuTasks(config, { filter, pageSize });
+  console.log(JSON.stringify({ ok: true, ...res }, null, 2));
+}
+
+async function cmdTaskCreate(positionals, flags) {
+  const config = loadConfig();
+  const summary = (typeof flags.summary === 'string' && flags.summary.trim()) || positionals[1] || '';
+  if (!summary) {
+    throw new Error('Usage: cli.mjs task-create --summary "..." [--desc "..."] [--due "YYYY-MM-DD"] [--tasklist GUID]');
+  }
+  const task = await createFeishuTask(config, {
+    summary,
+    description: typeof flags.desc === 'string' ? flags.desc : '',
+    due: typeof flags.due === 'string' ? flags.due : '',
+    tasklistGuid: typeof flags.tasklist === 'string' ? flags.tasklist : '',
+    assigneeOpenId: config.notifications.defaultReceiveId || config.security.allowedOpenIds?.[0] || '',
+  });
+  console.log(JSON.stringify({ ok: true, task }, null, 2));
+}
+
+async function cmdTaskDone(positionals, flags) {
+  const config = loadConfig();
+  const guid = (typeof flags.guid === 'string' && flags.guid.trim()) || positionals[1] || '';
+  if (!guid) {
+    throw new Error('Usage: cli.mjs task-done <task_guid> [--reopen]');
+  }
+  const task = await setFeishuTaskCompleted(config, guid, !flags.reopen);
+  console.log(JSON.stringify({ ok: true, task }, null, 2));
+}
+
 function printHelp() {
   console.log(`Usage: node scripts/cli.mjs <command> [options]
 
 Commands:
   setup         Configure Feishu app credentials, proxy, and defaults
+  auth          Authorize Feishu User OAuth for Task v2 (--status|--logout|--url|--no-browser)
   start         Start and register background daemon (launchd / systemd)
   stop          Stop background daemon
   restart       Restart background daemon
@@ -581,6 +663,9 @@ Commands:
   scopes        Inspect Feishu Open Platform scope authorization status
   read-doc      Read a Feishu docx/wiki document (<url|token> [--max-chars N])
   write-doc     Create or append a Feishu docx document (--title|--doc|--file|--markdown)
+  tasks         List Feishu Task v2 tasks (--filter <open|done|all> --limit N)
+  task-create   Create a Feishu Task v2 task (--summary "..." [--desc "..."] [--due "..."])
+  task-done     Mark a Feishu Task v2 task complete (<task_guid> [--reopen])
   desktop       Scan local CLI/Desktop conversations (--query <kw> --filter <all|cli|desktop|running> --limit N)
   pack          Create a clean shareable plugin zip (--out path/to.zip)
 `);
@@ -596,6 +681,10 @@ async function main() {
   }
   if (sub === 'setup') {
     cmdSetup(flags);
+    return;
+  }
+  if (sub === 'auth') {
+    await cmdAuth(flags);
     return;
   }
   if (sub === 'start') {
@@ -656,6 +745,18 @@ async function main() {
   }
   if (sub === 'write-doc') {
     await cmdWriteDoc(flags);
+    return;
+  }
+  if (sub === 'tasks') {
+    await cmdTasks(flags);
+    return;
+  }
+  if (sub === 'task-create') {
+    await cmdTaskCreate(positionals, flags);
+    return;
+  }
+  if (sub === 'task-done') {
+    await cmdTaskDone(positionals, flags);
     return;
   }
   if (sub === 'desktop') {

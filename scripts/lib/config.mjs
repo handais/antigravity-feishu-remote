@@ -26,6 +26,60 @@ export function getStatePath() {
   return path.join(getConfigDir(), 'state.json');
 }
 
+export function getUserAuthPath() {
+  return path.join(getConfigDir(), 'user-auth.json');
+}
+
+export function loadUserAuth() {
+  const authPath = getUserAuthPath();
+  if (!fs.existsSync(authPath)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+    return {
+      accessToken: String(parsed.accessToken || '').trim(),
+      refreshToken: String(parsed.refreshToken || '').trim(),
+      expiresAt: Number(parsed.expiresAt || 0),
+      refreshExpiresAt: Number(parsed.refreshExpiresAt || 0),
+      scope: String(parsed.scope || '').trim(),
+      tokenType: String(parsed.tokenType || 'Bearer').trim() || 'Bearer',
+      domain: String(parsed.domain || 'feishu').trim().toLowerCase() === 'lark' ? 'lark' : 'feishu',
+      updatedAt: Number(parsed.updatedAt || 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function saveUserAuth(auth) {
+  const normalized = {
+    accessToken: String(auth?.accessToken || '').trim(),
+    refreshToken: String(auth?.refreshToken || '').trim(),
+    expiresAt: Number(auth?.expiresAt || 0),
+    refreshExpiresAt: Number(auth?.refreshExpiresAt || 0),
+    scope: String(auth?.scope || '').trim(),
+    tokenType: String(auth?.tokenType || 'Bearer').trim() || 'Bearer',
+    domain: String(auth?.domain || 'feishu').trim().toLowerCase() === 'lark' ? 'lark' : 'feishu',
+    updatedAt: Number(auth?.updatedAt || Date.now()),
+  };
+  writePrivateJsonAtomic(getUserAuthPath(), normalized);
+  return normalized;
+}
+
+export function clearUserAuth() {
+  const authPath = getUserAuthPath();
+  try {
+    fs.rmSync(authPath, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function getLogPaths() {
   const dir = getConfigDir();
   return {

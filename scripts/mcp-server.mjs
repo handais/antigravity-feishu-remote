@@ -1,9 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import {
+  getPluginRoot,
   loadConfig,
   loadState,
   maskSecret,
@@ -19,6 +17,7 @@ import {
 
 let feishuApiPromise = null;
 let feishuDocsPromise = null;
+let feishuTasksPromise = null;
 
 function loadFeishuApi() {
   if (!feishuApiPromise) {
@@ -32,6 +31,13 @@ function loadFeishuDocs() {
     feishuDocsPromise = import('./lib/feishu-docs.mjs');
   }
   return feishuDocsPromise;
+}
+
+function loadFeishuTasks() {
+  if (!feishuTasksPromise) {
+    feishuTasksPromise = import('./lib/feishu-tasks.mjs');
+  }
+  return feishuTasksPromise;
 }
 
 const VALID_CARD_COLORS = new Set([
@@ -76,19 +82,20 @@ function toolResult(data, isError = false) {
   };
 }
 
-const server = new Server(
-  {
-    name: 'feishu-remote-tools',
-    version: '1.0.0',
-  },
-  {
-    capabilities: {
-      tools: {},
+function createMcpServer({ Server, CallToolRequestSchema, ListToolsRequestSchema }) {
+  const server = new Server(
+    {
+      name: 'feishu-remote-tools',
+      version: '1.0.0',
     },
-  },
-);
+    {
+      capabilities: {
+        tools: {},
+      },
+    },
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'feishu_send_message',
@@ -183,6 +190,65 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['markdown'],
+      },
+    },
+    {
+      name: 'feishu_list_tasks',
+      description: 'List Feishu Task v2 tasks (personal "my_tasks" or a specific tasklist) using authorized user OAuth.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filter: {
+            type: 'string',
+            enum: ['open', 'done', 'all'],
+            description: 'Filter tasks by completion state (default open).',
+          },
+          tasklist_guid: {
+            type: 'string',
+            description: 'Optional tasklist GUID to list tasks from a specific shared/group tasklist.',
+          },
+          include_tasklists: {
+            type: 'boolean',
+            description: 'Also return the user\'s accessible tasklists.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum tasks to return (1-100, default 50).',
+          },
+        },
+      },
+    },
+    {
+      name: 'feishu_create_task',
+      description: 'Create a new Feishu Task v2 task using authorized user OAuth.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          summary: { type: 'string', description: 'Task title / summary.' },
+          description: { type: 'string', description: 'Optional detailed description.' },
+          due: { type: 'string', description: 'Optional due date/time (e.g. "2026-11-26" or "2026-11-26 18:00").' },
+          tasklist_guid: { type: 'string', description: 'Optional tasklist GUID to attach the task to.' },
+          assign_to_owner: {
+            type: 'boolean',
+            description: 'Assign to the configured default owner open_id (default true).',
+          },
+        },
+        required: ['summary'],
+      },
+    },
+    {
+      name: 'feishu_complete_task',
+      description: 'Mark a Feishu Task v2 task as completed (or reopen it).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task_guid: { type: 'string', description: 'Feishu Task v2 GUID.' },
+          completed: {
+            type: 'boolean',
+            description: 'true to mark complete (default), false to reopen.',
+          },
+        },
+        required: ['task_guid'],
       },
     },
     {
@@ -310,9 +376,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return toolResult({ ok: true, ...doc });
     }
 
+    if (name === 'feishu_list_tasks') {
+      const { listFeishuTasklistTasks, listFeishuTasklists, listFeishuTasks } = await loadFeishuTasks();
+      const filter = ['open', 'done', 'all'].includes(args.filter) ? args.filter : 'open';
+      const limit = typeof args.limit === 'number' ? args.limit : 50;
+      const tasklistGuid = String(args.tasklist_guid || '').trim();
+      const tasksRes = tasklistGuid
+        ? await listFeishuTasklistTasks(config, tasklistGuid, { filter, pageSize: limit })
+        : await listFeishuTasks(config, { filter, pageSize: limit });
+      let tasklists;
+      if (args.include_tasklists) {
+        tasklists = (await listFeishuTasklists(config, { pageSize: 50 })).items;
+      }
+      return toolResult({
+        ok: true,
+        ...tasksRes,
+        ...(tasklists ? { tasklists } : {}),
+      });
+    }
+
+    if (name === 'feishu_create_task') {
+      const { createFeishuTask } = await loadFeishuTasks();
+      const assignToOwner = args.assign_to_owner !== false;
+      const assigneeOpenId = assignToOwner
+        ? (config.notifications.defaultReceiveId || config.security.allowedOpenIds?.[0] || '')
+        : '';
+      const task = await createFeishuTask(config, {
+        summary: String(args.summary || ''),
+        description: String(args.description || ''),
+        due: String(args.due || ''),
+        tasklistGuid: String(args.tasklist_guid || ''),
+        assigneeOpenId,
+      });
+      return toolResult({ ok: true, task });
+    }
+
+    if (name === 'feishu_complete_task') {
+      const { setFeishuTaskCompleted } = await loadFeishuTasks();
+      const completed = args.completed !== false;
+      const task = await setFeishuTaskCompleted(config, String(args.task_guid || ''), completed);
+      return toolResult({ ok: true, task });
+    }
+
     if (name === 'feishu_bridge_status') {
       const daemon = getDaemonStatus();
       const state = loadState();
+      const { getUserAuthStatus } = await loadFeishuTasks();
       const chats = Object.entries(state.chats || {}).map(([chatId, info]) => ({
         chatId,
         cwd: info.cwd,
@@ -331,6 +440,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           domain: config.feishu.domain,
           proxy: config.feishu.proxy || '',
         },
+        userAuth: getUserAuthStatus(),
         security: config.security,
         agy: config.agy,
         notifications: config.notifications,
@@ -361,9 +471,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (err) {
     return toolResult(`Error: ${err.message || err}`, true);
   }
-});
+  });
+
+  return server;
+}
 
 async function main() {
+  let Server;
+  let StdioServerTransport;
+  let CallToolRequestSchema;
+  let ListToolsRequestSchema;
+  try {
+    ({ Server } = await import('@modelcontextprotocol/sdk/server/index.js'));
+    ({ StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js'));
+    ({ CallToolRequestSchema, ListToolsRequestSchema } = await import('@modelcontextprotocol/sdk/types.js'));
+  } catch (err) {
+    if (err?.code === 'ERR_MODULE_NOT_FOUND' || err?.code === 'MODULE_NOT_FOUND') {
+      console.error(`[feishu-remote-mcp] Dependencies not installed. Run: cd "${getPluginRoot()}" && npm install --omit=dev`);
+      process.exit(1);
+    }
+    throw err;
+  }
+
+  const server = createMcpServer({ Server, CallToolRequestSchema, ListToolsRequestSchema });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

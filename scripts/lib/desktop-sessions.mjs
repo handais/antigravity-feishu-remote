@@ -281,6 +281,80 @@ function readTranscriptText(transcriptPath) {
   }
 }
 
+function resolveTranscriptPaths(brainDir) {
+  if (!brainDir) return { fullPath: '', compactPath: '' };
+  const logsDir = path.join(brainDir, '.system_generated', 'logs');
+  const fullCandidate = path.join(logsDir, 'transcript_full.jsonl');
+  const compactCandidate = path.join(logsDir, 'transcript.jsonl');
+  let fullPath = '';
+  let compactPath = '';
+  try {
+    if (fs.existsSync(fullCandidate)) fullPath = fullCandidate;
+  } catch {
+    fullPath = '';
+  }
+  try {
+    if (fs.existsSync(compactCandidate)) compactPath = compactCandidate;
+  } catch {
+    compactPath = '';
+  }
+  return { fullPath, compactPath };
+}
+
+/**
+ * Extract the latest non-empty assistant Markdown reply from transcript_full.jsonl (preferred) or transcript.jsonl.
+ */
+export function extractLatestAssistantReply(brainDir, { maxChars = 28000 } = {}) {
+  const { fullPath, compactPath } = resolveTranscriptPaths(brainDir);
+  const candidates = [fullPath, compactPath].filter(Boolean);
+  if (candidates.length === 0) return null;
+
+  for (const filePath of candidates) {
+    let rawText = '';
+    try {
+      rawText = readTranscriptText(filePath);
+    } catch {
+      continue;
+    }
+
+    let latestEntry = null;
+    for (const line of rawText.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let entry;
+      try {
+        entry = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      if (entry?.type !== 'PLANNER_RESPONSE') continue;
+      if (typeof entry?.content !== 'string' || !entry.content.trim()) continue;
+      latestEntry = entry;
+    }
+
+    if (!latestEntry) continue;
+
+    const cleaned = latestEntry.content.replace(/\r\n/g, '\n').trim();
+    const totalChars = cleaned.length;
+    const limit = Math.max(100, Number(maxChars) || 28000);
+    const truncated = totalChars > limit;
+    const text = truncated
+      ? `${cleaned.slice(0, limit)}\n\n...(内容较长，已截断，完整内容见本机日志文件)`
+      : cleaned;
+
+    return {
+      text,
+      totalChars,
+      truncated,
+      stepIndex: latestEntry.step_index ?? null,
+      createdAt: String(latestEntry.created_at || ''),
+      sourceFile: filePath,
+    };
+  }
+
+  return null;
+}
+
 /**
  * Extract the last few user/assistant turns from brain/<id>/.system_generated/logs/transcript.jsonl.
  */
@@ -415,9 +489,21 @@ export function getDesktopSessionDetail(conversationId) {
     if (turns.length > 0) break;
   }
 
+  let latestReply = null;
+  for (const dir of brainCandidates) {
+    latestReply = extractLatestAssistantReply(dir);
+    if (latestReply) break;
+  }
+
   return {
     ...match,
     turns,
+    lastAssistantReply: latestReply?.text || '',
+    lastAssistantReplyTotalChars: latestReply?.totalChars || 0,
+    lastAssistantReplyTruncated: Boolean(latestReply?.truncated),
+    lastAssistantReplyStepIndex: latestReply?.stepIndex ?? null,
+    lastAssistantReplyCreatedAt: latestReply?.createdAt || '',
+    transcriptFile: latestReply?.sourceFile || '',
   };
 }
 
@@ -439,8 +525,9 @@ export function formatRelativeTime(ms) {
 /**
  * Build the one-shot handoff context block injected into the next CLI turn for Desktop-only sessions.
  */
-export function buildDesktopHandoffContext(detail, { maxTurns = 6 } = {}) {
+export function buildDesktopHandoffContext(detail, { maxTurns = 6, maxLastReplyChars = 6000 } = {}) {
   const turns = Array.isArray(detail?.turns) ? detail.turns.slice(-maxTurns) : [];
+  const lastReply = String(detail?.lastAssistantReply || '').trim();
   const headerLines = [
     '[电脑端对话上下文接管]',
     `你正在飞书端接管并延续一个来自「${detail?.sourceLabel || '桌面端 App'}」的历史对话（只读上下文接力）：`,
@@ -448,17 +535,32 @@ export function buildDesktopHandoffContext(detail, { maxTurns = 6 } = {}) {
     `- 原对话标题：${detail?.title || '(无标题)'}`,
     detail?.workspace ? `- 原工作目录：${detail.workspace}` : '',
     detail?.stepCount ? `- 累计步数：${detail.stepCount}` : '',
+    detail?.transcriptFile ? `- 原对话完整日志：${detail.transcriptFile}` : '',
     detail?.running ? '- 注意：原桌面端会话在扫描时显示为运行中，请在需要修改文件前先确认当前目录状态。' : '',
   ].filter(Boolean);
 
-  if (turns.length > 0) {
+  const turnsForExcerpt =
+    lastReply && turns.length > 0 && turns[turns.length - 1]?.role === 'assistant'
+      ? turns.slice(0, -1)
+      : turns;
+
+  if (turnsForExcerpt.length > 0) {
     headerLines.push('', '最近对话摘录：');
-    for (const turn of turns) {
+    for (const turn of turnsForExcerpt) {
       const roleLabel = turn.role === 'user' ? '用户' : '助手';
       headerLines.push(`- ${roleLabel}：${turn.text}`);
     }
-  } else if (detail?.preview) {
+  } else if (!lastReply && detail?.preview) {
     headerLines.push('', `对话预览：${detail.preview}`);
+  }
+
+  if (lastReply) {
+    const replyLimit = Math.max(200, Number(maxLastReplyChars) || 6000);
+    const replySnippet =
+      lastReply.length > replyLimit
+        ? `${lastReply.slice(0, replyLimit)}...\n(完整内容可读取上方原对话完整日志)`
+        : lastReply;
+    headerLines.push('', '电脑端最后一条模型回复：', replySnippet);
   }
 
   headerLines.push('', '请基于以上上下文直接响应用户接下来的请求：');

@@ -22,7 +22,10 @@ import {
   buildQuickPromptsCard,
   buildQueueListCard,
   buildScopesCard,
+  buildTasksCard,
+  deliverFinalCard,
   patchCard,
+  sanitizeForFeishuMarkdown,
 } from './feishu-api.mjs';
 import {
   buildDesktopHandoffContext,
@@ -30,6 +33,13 @@ import {
   listDesktopSessions,
 } from './desktop-sessions.mjs';
 import { applyPendingAppScopes, queryAppScopes } from './feishu-docs.mjs';
+import {
+  buildOAuthAuthorizeUrl,
+  getFeishuTask,
+  getUserAuthStatus,
+  listFeishuTasks,
+  setFeishuTaskCompleted,
+} from './feishu-tasks.mjs';
 import {
   createBackupSnapshot,
   findRollbackTarget,
@@ -191,6 +201,60 @@ export async function handleCardAction(ctx, rawEvent) {
     return { mode, detail, resolvedId, title };
   }
 
+  function pushDesktopLastReply(detail, fallbackTitle = '') {
+    const replyText = String(detail?.lastAssistantReply || '').trim();
+    if (!replyText) return false;
+
+    const rawTitle = String(detail?.title || fallbackTitle || '(无标题对话)')
+      .replace(/[`\r\n]+/g, ' ')
+      .trim();
+    const safeTitle = sanitizeForFeishuMarkdown(rawTitle);
+    const shortId = String(detail?.id || '').slice(0, 8) || '-';
+    const quoteLines = [
+      `> 💻 来自「${detail?.sourceLabel || '电脑端'}」· **${safeTitle}**（\`${shortId}\`）`,
+    ];
+    if (detail?.lastAssistantReplyTruncated) {
+      quoteLines.push(
+        `> ⚠️ 原回复共 ${detail.lastAssistantReplyTotalChars} 字，当前展示前 ${replyText.length} 字`,
+      );
+    }
+
+    const fullMarkdown = `${quoteLines.join('\n')}\n\n${replyText}`;
+    const footer = detail?.lastAssistantReplyTotalChars
+      ? `来自电脑端最后一条模型回复 · 共 ${detail.lastAssistantReplyTotalChars} 字`
+      : '来自电脑端最后一条模型回复';
+
+    void deliverFinalCard(client, {
+      chatId: targetChatId,
+      receiveId: openId,
+      receiveIdType: 'open_id',
+      replyTargetMessageId: threadRootId,
+      replyInThread: Boolean(threadRootId),
+      title: '💬 电脑端最新模型回复',
+      template: 'wathet',
+      markdown: fullMarkdown,
+      footer,
+      buttonRows: [[
+        { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
+        { label: '💻 电脑对话', value: { cmd: 'desktop_list', filter: 'all' } },
+      ]],
+    })
+      .then((msgIds) => {
+        if (threadRootId && Array.isArray(msgIds)) {
+          for (const msgId of msgIds) {
+            if (msgId) {
+              recordCardThread(msgId, { sessionKey: runKey, threadRootId, chatId: targetChatId });
+            }
+          }
+        }
+      })
+      .catch((err) => {
+        console.error('[feishu-remote] pushDesktopLastReply error:', err?.message || err);
+      });
+
+    return true;
+  }
+
   if (cmd === 'takeover') {
     const convId = arg.trim();
     if (!convId) {
@@ -198,12 +262,21 @@ export async function handleCardAction(ctx, rawEvent) {
     }
     const rawCwd = String(value?.cwd || '').trim();
     const summary = String(value?.summary || '').trim();
-    const { mode, resolvedId, title } = applyDesktopTakeover({
+    const { mode, detail, resolvedId, title } = applyDesktopTakeover({
       convId,
       fallbackCwd: rawCwd,
       fallbackSummary: summary,
     });
     saveState(state);
+    const pushedReply = pushDesktopLastReply(detail, title);
+
+    const buttonRow = [
+      { label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel', inplace: true } },
+      { label: '💻 电脑对话', value: { cmd: 'desktop_list', filter: 'all', inplace: true } },
+    ];
+    if (pushedReply) {
+      buttonRow.push({ label: '📄 重发最新回复', value: { cmd: 'desktop_last_reply', arg: resolvedId } });
+    }
 
     const card = buildCard({
       title: '📱 已接管电脑端对话',
@@ -215,13 +288,13 @@ export async function handleCardAction(ctx, rawEvent) {
         `- **原会话 ID**：\`${resolvedId.slice(0, 8)}\`（\`${resolvedId}\`）`,
         `- **工作目录**：\`${chatState.cwd}\``,
         title ? `- **原任务摘要**：${title}` : '',
+        pushedReply
+          ? `- **模型最新回复**：✅ 已自动推送至下方卡片（共 ${detail.lastAssistantReplyTotalChars} 字）`
+          : '- **模型最新回复**：_（暂未读取到该会话的模型文本回复）_',
         '',
         '现在可以直接在飞书发消息，继续推进该任务。',
       ].filter(Boolean).join('\n'),
-      buttonRows: [[
-        { label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel', inplace: true } },
-        { label: '💻 电脑对话', value: { cmd: 'desktop_list', filter: 'all', inplace: true } },
-      ]],
+      buttonRows: [buttonRow],
     });
     return toastCardResponse(
       'success',
@@ -270,14 +343,28 @@ export async function handleCardAction(ctx, rawEvent) {
     return toastCardResponse('info', '已打开对话详情预览');
   }
 
+  if (cmd === 'desktop_last_reply') {
+    saveState(state);
+    const detail = getDesktopSessionDetail(arg);
+    if (!detail) {
+      return toastCardResponse('error', '未找到对应的电脑端对话记录');
+    }
+    const pushed = pushDesktopLastReply(detail, detail.title);
+    return toastCardResponse(
+      pushed ? 'success' : 'info',
+      pushed ? '💬 正在推送电脑端最新模型回复...' : '该对话暂无可展示的模型文本回复',
+    );
+  }
+
   if (cmd === 'desktop_takeover') {
     const convId = arg.trim();
     if (!convId) {
       return toastCardResponse('error', '缺少要接管的会话 ID');
     }
     const summarize = Boolean(value?.summarize);
-    const { mode, resolvedId, title } = applyDesktopTakeover({ convId });
+    const { mode, detail, resolvedId, title } = applyDesktopTakeover({ convId });
     saveState(state);
+    const pushedReply = !summarize ? pushDesktopLastReply(detail, title) : false;
 
     let summarizeQueuedMsg = '';
     if (summarize) {
@@ -303,6 +390,14 @@ export async function handleCardAction(ctx, rawEvent) {
       });
     }
 
+    const buttonRow = [
+      { label: '⚙️ 控制面板', type: 'primary', value: { cmd: 'panel', inplace: true } },
+      { label: '💻 电脑对话', value: { cmd: 'desktop_list', filter: 'all', inplace: true } },
+    ];
+    if (pushedReply) {
+      buttonRow.push({ label: '📄 重发最新回复', value: { cmd: 'desktop_last_reply', arg: resolvedId } });
+    }
+
     const card = buildCard({
       title: summarize ? '👀 已接管并启动进展总结' : '✅ 已接管电脑端对话',
       template: 'green',
@@ -313,12 +408,14 @@ export async function handleCardAction(ctx, rawEvent) {
         `- **对话标题**：${title}`,
         `- **原会话 ID**：\`${resolvedId.slice(0, 8)}\``,
         `- **当前目录**：\`${chatState.cwd}\``,
+        !summarize
+          ? pushedReply
+            ? `- **模型最新回复**：✅ 已自动推送至下方卡片（共 ${detail.lastAssistantReplyTotalChars} 字）`
+            : '- **模型最新回复**：_（暂未读取到该会话的模型文本回复）_'
+          : '',
         summarizeQueuedMsg ? `- **自动动作**：${summarizeQueuedMsg}` : '',
       ].filter(Boolean).join('\n'),
-      buttonRows: [[
-        { label: '⚙️ 控制面板', type: 'primary', value: { cmd: 'panel', inplace: true } },
-        { label: '💻 电脑对话', value: { cmd: 'desktop_list', filter: 'all', inplace: true } },
-      ]],
+      buttonRows: [buttonRow],
     });
     return toastCardResponse(
       'success',
@@ -612,6 +709,106 @@ export async function handleCardAction(ctx, rawEvent) {
     }
   }
 
+  if (cmd === 'tasks') {
+    saveState(state);
+    const filter = String(value?.filter || 'open').toLowerCase();
+    const authUrl = config?.feishu?.appId
+      ? buildOAuthAuthorizeUrl({ appId: config.feishu.appId, domain: config.feishu.domain })
+      : '';
+    try {
+      const res = await listFeishuTasks(config, { filter, pageSize: 20 });
+      const card = buildTasksCard({
+        items: res.items,
+        filter: res.filter,
+        authStatus: getUserAuthStatus(),
+        authUrl,
+      });
+      if (inplace) {
+        return toastCardResponse('info', `已加载 ${res.items.length} 条飞书任务`, card);
+      }
+      void sendToTarget(card).catch((err) => {
+        console.error('[feishu-remote] send tasks card error:', err.message);
+      });
+      return toastCardResponse('info', '已打开飞书任务中心');
+    } catch (err) {
+      const card = buildTasksCard({
+        items: [],
+        filter,
+        authStatus: getUserAuthStatus(),
+        error: err?.message || String(err),
+        authUrl,
+      });
+      if (inplace) {
+        return toastCardResponse('warning', '读取飞书任务需要授权或权限', card);
+      }
+      void sendToTarget(card).catch(() => {});
+      return toastCardResponse('warning', '请查看飞书任务授权提示卡片');
+    }
+  }
+
+  if (cmd === 'task_toggle') {
+    saveState(state);
+    const taskGuid = arg.trim();
+    const done = Boolean(value?.done);
+    const filter = String(value?.filter || 'open').toLowerCase();
+    const authUrl = config?.feishu?.appId
+      ? buildOAuthAuthorizeUrl({ appId: config.feishu.appId, domain: config.feishu.domain })
+      : '';
+    try {
+      await setFeishuTaskCompleted(config, taskGuid, done);
+      const res = await listFeishuTasks(config, { filter, pageSize: 20 });
+      const card = buildTasksCard({
+        items: res.items,
+        filter: res.filter,
+        authStatus: getUserAuthStatus(),
+        authUrl,
+      });
+      return toastCardResponse('success', done ? '✅ 任务已标记完成' : '↩️ 任务已重新打开', inplace ? card : null);
+    } catch (err) {
+      return toastCardResponse('error', `更新任务失败：${err?.message || err}`);
+    }
+  }
+
+  if (cmd === 'task_run') {
+    const taskGuid = arg.trim();
+    if (!taskGuid) {
+      return toastCardResponse('error', '缺少 task_guid');
+    }
+    const wasRunning = Boolean(runKey && activeRuns.has(runKey));
+    if (wasRunning && runner.getQueueForChat(runKey).length >= 5) {
+      return toastCardResponse('warning', '任务队列已满（最多 5 条），请稍后再试');
+    }
+    try {
+      const task = await getFeishuTask(config, taskGuid);
+      saveState(state);
+      const promptLines = [
+        '【飞书待办任务】',
+        `- 标题：${task.summary}`,
+        task.description ? `- 说明：${task.description}` : '',
+        task.dueText ? `- 截止时间：${task.dueText}` : '',
+        `- task_guid：${task.guid}`,
+        '',
+        '请根据当前工作区上下文处理该任务；若任务已完成且具备对应 MCP 权限，可按需调用 `feishu_complete_task` 标记完成。',
+      ].filter(Boolean);
+      void runner.enqueueOrExecutePrompt({
+        text: promptLines.join('\n'),
+        displayPreview: `[待办] ${task.summary.slice(0, 32)}`,
+        chatId: targetChatId,
+        openId,
+        messageId: '',
+        sessionKey: runKey,
+        threadRootId,
+        replyInThread: Boolean(threadRootId),
+        config,
+      }).catch((err) => {
+        console.error('[feishu-remote] task_run error:', err);
+      });
+      return toastCardResponse('success', wasRunning ? `📥 已加入队列：${task.summary}` : `🚀 开始执行：${task.summary}`);
+    } catch (err) {
+      return toastCardResponse('error', `读取任务失败：${err?.message || err}`);
+    }
+  }
+
   if (cmd === 'queue_list') {
     saveState(state);
     const card = buildQueueListCard({
@@ -762,11 +959,21 @@ export async function handleCardAction(ctx, rawEvent) {
   }
 
   if (cmd === 'dirs') {
+    if (value?.showHidden !== undefined) {
+      chatState.showHiddenDirs = Boolean(value.showHidden);
+    }
     saveState(state);
     const page = Number(value?.page || 0);
     const card = buildDirsCard({ chatState, config, page });
     if (inplace) {
-      return toastCardResponse('info', value?.page !== undefined ? '已切换目录页' : '目录浏览', card);
+      const toastMsg = value?.showHidden !== undefined
+        ? chatState.showHiddenDirs
+          ? '👁️ 已开启显示隐藏目录'
+          : '🙈 已隐藏点开头目录'
+        : value?.page !== undefined
+          ? '已切换目录页'
+          : '目录浏览';
+      return toastCardResponse('info', toastMsg, card);
     }
     void sendToTarget(card).catch((err) => {
       console.error('[feishu-remote] send dirs card error:', err.message);
@@ -1075,6 +1282,30 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
 
   if (key === 'quick' || key === 'tasks') {
     await sendToTarget(buildQuickPromptsCard({ chatState, config }));
+    return;
+  }
+
+  if (key === 'todo' || key === 'feishu_tasks') {
+    const authUrl = config?.feishu?.appId
+      ? buildOAuthAuthorizeUrl({ appId: config.feishu.appId, domain: config.feishu.domain })
+      : '';
+    try {
+      const res = await listFeishuTasks(config, { filter: 'open', pageSize: 20 });
+      await sendToTarget(buildTasksCard({
+        items: res.items,
+        filter: res.filter,
+        authStatus: getUserAuthStatus(),
+        authUrl,
+      }));
+    } catch (err) {
+      await sendToTarget(buildTasksCard({
+        items: [],
+        filter: 'open',
+        authStatus: getUserAuthStatus(),
+        error: err?.message || String(err),
+        authUrl,
+      }));
+    }
     return;
   }
 

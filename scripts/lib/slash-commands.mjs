@@ -13,12 +13,20 @@ import {
   buildQueueListCard,
   buildQuickPromptsCard,
   buildScopesCard,
+  buildTasksCard,
   replyCard as sendReplyCard,
   searchDirsFuzzy,
   sendLocalMedia,
 } from './feishu-api.mjs';
 import { listDesktopSessions } from './desktop-sessions.mjs';
 import { queryAppScopes, readFeishuDoc, writeFeishuDoc } from './feishu-docs.mjs';
+import {
+  buildOAuthAuthorizeUrl,
+  createFeishuTask,
+  getUserAuthStatus,
+  listFeishuTasks,
+  setFeishuTaskCompleted,
+} from './feishu-tasks.mjs';
 import {
   createBackupSnapshot,
   findRollbackTarget,
@@ -207,6 +215,14 @@ export async function handleSlashCommand(
   }
 
   if (cmd === '/dirs') {
+    const subArg = arg.trim().toLowerCase();
+    if (['-a', 'all', 'hidden', 'show', 'on'].includes(subArg)) {
+      chatState.showHiddenDirs = true;
+      saveState(state);
+    } else if (['hide', 'off', 'nohidden', 'normal'].includes(subArg)) {
+      chatState.showHiddenDirs = false;
+      saveState(state);
+    }
     await replyCard(client, {
       messageId,
       card: buildDirsCard({ chatState, config }),
@@ -907,6 +923,135 @@ export async function handleSlashCommand(
         title: '❌ 读取飞书云文档失败',
         template: 'red',
         markdown: String(err?.message || err),
+      });
+    }
+    return true;
+  }
+
+  if (cmd === '/tasks' || cmd === '/todo') {
+    const authStatus = getUserAuthStatus();
+    const authUrl = config?.feishu?.appId
+      ? buildOAuthAuthorizeUrl({
+          appId: config.feishu.appId,
+          domain: config.feishu.domain,
+        })
+      : '';
+
+    if (/^auth$/i.test(arg)) {
+      await replyCard(client, {
+        messageId,
+        card: buildTasksCard({
+          items: [],
+          filter: 'open',
+          authStatus,
+          authUrl,
+        }),
+      });
+      return true;
+    }
+
+    if (/^add\s+/i.test(arg)) {
+      const body = arg.replace(/^add\s+/i, '');
+      const sepIdx = body.search(/[|｜]/);
+      const summary = (sepIdx !== -1 ? body.slice(0, sepIdx) : body).trim();
+      const description = sepIdx !== -1 ? body.slice(sepIdx + 1).trim() : '';
+      if (!summary) {
+        await replySimple({
+          title: '⚠️ 新建待办用法',
+          template: 'orange',
+          markdown: '格式：`/tasks add 任务标题 | 可选描述`',
+          buttonRows: [[{ label: '✅ 查看飞书待办', value: { cmd: 'tasks', filter: 'open' } }]],
+        });
+        return true;
+      }
+      try {
+        const created = await createFeishuTask(config, {
+          summary,
+          description,
+          assigneeOpenId: openId || config.security.allowedOpenIds?.[0] || '',
+        });
+        await replySimple({
+          title: '✅ 已创建飞书任务',
+          template: 'green',
+          markdown: [
+            `- **任务标题**：${created.summary}`,
+            created.description ? `- **任务说明**：${created.description}` : '',
+            created.guid ? `- **GUID**：\`${created.guid}\`` : '',
+          ].filter(Boolean).join('\n'),
+          buttonRows: [[
+            { label: '✅ 查看飞书待办', type: 'primary', value: { cmd: 'tasks', filter: 'open' } },
+            { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
+          ]],
+        });
+      } catch (err) {
+        await replyCard(client, {
+          messageId,
+          card: buildTasksCard({
+            items: [],
+            filter: 'open',
+            authStatus: getUserAuthStatus(),
+            error: err?.message || String(err),
+            authUrl,
+          }),
+        });
+      }
+      return true;
+    }
+
+    const toggleMatch = arg.match(/^(complete|done|reopen|undo)\s+(\S+)$/i);
+    if (toggleMatch) {
+      const completed = ['complete', 'done'].includes(toggleMatch[1].toLowerCase());
+      const guid = toggleMatch[2].trim();
+      try {
+        const updated = await setFeishuTaskCompleted(config, guid, completed);
+        await replySimple({
+          title: completed ? '✅ 任务已标记完成' : '↩️ 任务已重新打开',
+          template: completed ? 'green' : 'blue',
+          markdown: `- **任务**：${updated.summary}\n- **GUID**：\`${updated.guid}\``,
+          buttonRows: [[{ label: '✅ 查看飞书待办', type: 'primary', value: { cmd: 'tasks', filter: 'open' } }]],
+        });
+      } catch (err) {
+        await replyCard(client, {
+          messageId,
+          card: buildTasksCard({
+            items: [],
+            filter: 'open',
+            authStatus: getUserAuthStatus(),
+            error: err?.message || String(err),
+            authUrl,
+          }),
+        });
+      }
+      return true;
+    }
+
+    const filterArg = arg.trim().toLowerCase();
+    const filter = ['done', 'completed'].includes(filterArg)
+      ? 'done'
+      : ['all', '-a'].includes(filterArg)
+        ? 'all'
+        : 'open';
+    try {
+      const res = await listFeishuTasks(config, { filter, pageSize: 20 });
+      await replyCard(client, {
+        messageId,
+        card: buildTasksCard({
+          items: res.items,
+          filter: res.filter,
+          authStatus: getUserAuthStatus(),
+          authUrl,
+        }),
+      });
+    } catch (err) {
+      await replyCard(client, {
+        messageId,
+        card: buildTasksCard({
+          items: [],
+          filter,
+          authStatus: getUserAuthStatus(),
+          error: err?.message || String(err),
+          authUrl,
+        }),
       });
     }
     return true;

@@ -1,5 +1,9 @@
 # 飞书远程控制 (Feishu Remote) — Antigravity 插件
 
+**简体中文** | [English Documentation (README_EN.md)](./README_EN.md)
+
+> Remotely control your local Antigravity CLI/IDE from Feishu or Lark over WebSocket long connection (no public IP required), with CardKit 2.0 streaming, MCP push & cloud doc tools, and desktop completion handoff hooks. All secrets stay isolated outside the plugin folder (`~/.config/antigravity-feishu/`, mode `0600`).
+
 通过飞书 **WebSocket 长连接**，让你在手机（安卓 / iOS）飞书里直接向本机 Antigravity 发任务、实时看流式卡片进度、继续多轮上下文，并支持本地目录切换、模型/权限模式切换、MCP 主动推送和任务完成通知。
 
 > **免公网 IP / 免内网穿透 / 分享不泄密**
@@ -113,11 +117,12 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
    - `/scopes`（或 `/perms`）：自检飞书应用各项能力权限授权状态，有待审权限时支持一键向管理员重发审批申请
    - `/queue`：查看和管理当前对话的排队任务列表（支持单条取消或清空）
    - `/doc`：读取或生成飞书云文档（`/doc <链接|ID>`、`/doc create 标题 | Markdown`、`/doc write 链接 | Markdown`）
+   - `/tasks`（或 `/todo`）：查看、新建（`/tasks add 标题 | 说明`）、勾选完成或一键交给 Antigravity 执行飞书任务中心待办（需先配置 OAuth 回调并运行一次 `cli.mjs auth`）
    - `/ops`（或 `/backups`）：打开**运维与自迭代面板**（查看运行版本 vs 磁盘版本、触发代码体检、保存快照、安全重启、二次确认回滚历史快照）
    - `/reload`：执行语法 + ESM 导入双阶段预检，通过后安全重启守护进程并推送上线确认卡片
    - `/check`：仅执行插件脚本代码体检（`node --check` + 导入导出检查），不重启
    - `/snapshot` / `/rollback [快照ID]`：手动保存当前可用快照，或回滚到上一版快照（带确认按钮）
-   - `/dirs`：打开交互式**目录浏览卡片**（支持进入子目录、返回上一级、`🏠 ~`、一键 `📌 收藏/取消收藏此目录`）
+   - `/dirs`：打开交互式**目录浏览卡片**（支持进入子目录、返回上一级、`🏠 ~`、一键 `📌 收藏/取消收藏此目录`、以及点击 `🙈 显示隐藏` 或 `/dirs -a` 切换显示 `.` 开头隐藏目录）
    - `/quick`：打开**一键快捷任务卡片**，点击按钮直接触发预设 Prompt；支持点击 `🗑️ 管理/删除` 按钮图形化管理，或用 `/quick add 名称 | 提示词`、`/quick del <序号>`、`/quick reset` 自定义或恢复默认
    - `/help`：查看全部命令
    - `/status`：查看当前工作目录、模式（含临时全权倒计时）、模型、队列条数、会话 ID 与运行状态
@@ -135,9 +140,10 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
    - `/stop`（或 `/cancel`）：立即中止当前正在执行的任务
    - **多模态收发**：手机直接发送图片/截图、文件（PDF/代码/文档）、语音或图文混排，自动下载至 `~/.config/antigravity-feishu/inbox/`（7 天自动清理）并由 Antigravity 原生读取分析。
    - **基础存储与性能治理**：`mcp-server.mjs` 按需懒加载飞书 SDK；守护进程默认 `warn` 级静音，启动及每 24 小时自动原地截断超 5 MB 的日志文件，并限制 `inbox/` 附件 7 天过期与 200 MB 总上限。
-3. **MCP 主动推送与文档工具（`feishu-remote-tools`）**：
+3. **MCP 主动推送与文档/任务工具（`feishu-remote-tools`）**：
    - `feishu_send_message` / `feishu_send_card` / `feishu_send_file`：让桌面端 Antigravity 主动向你手机发汇报或回传本地图片/文件。
    - `feishu_read_doc` / `feishu_write_doc`：读取飞书云文档/Wiki，或将 Markdown 分析报告直接新建/追加写入飞书云文档。
+   - `feishu_list_tasks` / `feishu_create_task` / `feishu_complete_task`：查询个人/清单待办、创建或完成飞书 Task v2 任务（需先在飞书后台配置 `http://127.0.0.1:18923/callback` 并运行一次 `cli.mjs auth`）。
    - `feishu_bridge_status` / `feishu_manage_bridge`：直接查询或启停桥接后台服务。
 4. **任务完成提醒 & 电脑→手机接力 Hook（`Stop`）**：
    - 当你在电脑端发起的任务执行结束时，自动给绑定的飞书账号发送完成卡片（带 **`📱 接管此对话`** 与 **`📂 切到此目录`** 按钮，点一下即可在手机飞书无缝续聊电脑端上下文；由飞书桥接拉起的子任务会自动跳过）。
@@ -206,7 +212,16 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
 
 > **环境要求**：`Node.js 22.5+`（`/desktop` 只读索引扫描依赖内置 `node:sqlite`）及已登录的 `agy` CLI。守护进程托管支持 **macOS (`launchd`)**、**Linux (`systemd --user`)** 与 **原生 Windows**（PowerShell/CMD 下自动走分离后台 `pid` 模式，支持 `where agy`、系统代理读取与 `GetLastInputInfo` 离开感应；Windows 如需开机自启可配合计划任务或使用 WSL2）。
 
-### 1. 克隆并安装依赖
+### 1. 安装插件与依赖
+
+**方式 A（推荐，Antigravity CLI 一键安装）**：
+```bash
+agy plugin install https://github.com/handais/antigravity-feishu-remote
+# 然后在插件安装目录安装生产依赖（全局目录默认如下，若安装在工作区请进入对应路径）：
+cd ~/.gemini/config/plugins/feishu-remote && npm install --omit=dev
+```
+
+**方式 B（Git 克隆安装）**：
 ```bash
 git clone https://github.com/handais/antigravity-feishu-remote.git ~/.gemini/config/plugins/feishu-remote
 cd ~/.gemini/config/plugins/feishu-remote && npm install --omit=dev

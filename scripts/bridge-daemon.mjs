@@ -258,7 +258,7 @@ async function handleIncomingMessage(rawEvent) {
       const sentErrId = await replySimpleCard(client, replyTargetId, {
         title: 'ℹ️ 暂不支持该消息类型',
         template: 'grey',
-        markdown: `当前支持文本、富文本、图片/截图、文件和语音消息，暂不支持 \`${msgType || 'unknown'}\` 类型。`,
+        markdown: `当前支持文本、富文本、任务(todo)、图片/截图、文件和语音消息，暂不支持 \`${msgType || 'unknown'}\` 类型。`,
         replyInThread: isTopicThread,
       });
       if (isTopicThread && sentErrId) {

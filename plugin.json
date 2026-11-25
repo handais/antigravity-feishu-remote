@@ -1,12 +1,18 @@
 {
   "name": "feishu-remote",
-  "displayName": "飞书远程控制 (Feishu Remote)",
-  "description": "通过飞书长连接在手机上远程操控本机 Antigravity（支持流式卡片、多轮续聊、目录/模型/模式切换、账号白名单），并附带飞书 MCP 主动推送与任务完成提醒 Hook。",
+  "displayName": "Feishu Remote (飞书远程控制)",
+  "description": "Remotely control local Antigravity from Feishu / Lark mobile or desktop via WebSocket long connection (no public IP required), with CardKit 2.0 streaming, multi-turn sessions, directory/model/mode controls, MCP push & cloud doc tools, and desktop completion handoff hooks. / 通过飞书长连接在手机上远程操控本机 Antigravity，附带飞书 MCP 主动推送、云文档读写与任务完成提醒 Hook。",
   "version": "1.0.0",
+  "author": {
+    "name": "handais",
+    "url": "https://github.com/handais"
+  },
+  "homepage": "https://github.com/handais/antigravity-feishu-remote#readme",
+  "repository": "https://github.com/handais/antigravity-feishu-remote",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "帮我配置并启动飞书远程控制机器人",
-    "查看飞书远程控制后台服务状态和最近日志",
-    "帮我把 feishu-remote 插件打包成可分享给朋友的 zip"
+    "Set up and start the Feishu Remote Control bot (帮我配置并启动飞书远程控制机器人)",
+    "Check Feishu Remote daemon status and recent logs (查看飞书远程控制后台服务状态和最近日志)",
+    "Package the feishu-remote plugin into a clean shareable zip (帮我把 feishu-remote 插件打包成可分享给朋友的 zip)"
   ]
 }

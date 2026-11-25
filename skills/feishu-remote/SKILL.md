@@ -11,7 +11,7 @@ All user secrets and runtime state live strictly outside the plugin folder at `~
 
 ## 1. First-Time Dependency Check
 
-Before running any script, make sure Node.js dependencies are installed inside the plugin root (`~/.gemini/config/plugins/feishu-remote/`):
+Before running any script, make sure Node.js dependencies are installed inside the active plugin root (default `~/.gemini/config/plugins/feishu-remote/`, or the directory where `agy plugin install` placed the plugin):
 
 ```bash
 cd ~/.gemini/config/plugins/feishu-remote
@@ -25,6 +25,7 @@ cd ~/.gemini/config/plugins/feishu-remote
 3. Under **权限管理 (Permissions)**, enable:
    - Core: `im:message`, `im:message:send_as_bot`, `im:message.p2p_msg:readonly`, `im:resource` (required for inbound/outbound images & files), and optionally `im:message.group_at_msg:readonly`.
    - Enhanced UX & Cloud Docs (recommended): `cardkit:card:write`, `cardkit:card:read`, `im:message.reactions:write_only`, `im:message:readonly`, `docx:document:readonly`, `docx:document:write_only`, `docx:document.block:convert`, `wiki:node:read`.
+   - Feishu Task Center v2 (optional, requires user OAuth via `cli.mjs auth` and redirect URI `http://127.0.0.1:18923/callback`): `offline_access`, `task:task:read`, `task:task:write`, `task:tasklist:read`.
 4. Under **事件与回调 (Events & Callbacks)**:
    - **事件配置**: Choose **使用长连接接收事件 (WebSocket Long Connection)** and subscribe to **`im.message.receive_v1`** and **`application.bot.menu_v6`** (for Bot Custom Menu click events).
    - **回调配置**: Choose **使用长连接接收回调** and subscribe to **`card.action.trigger`** (for interactive Control Panel, Directory Browser (`/dirs`), Quick Prompt Tasks (`/quick`), Git (`/git`), Scopes (`/scopes`), Queue (`/queue`), Retry, Session, Model, and Abort buttons).
@@ -69,6 +70,8 @@ Run commands with `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs`:
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs backups
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs rollback
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
+  node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs auth
+  node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs tasks --filter open
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs read-doc "<URL_OR_TOKEN>"
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs write-doc --title "Report" --file ./report.md
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs desktop --limit 5

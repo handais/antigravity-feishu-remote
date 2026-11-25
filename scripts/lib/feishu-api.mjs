@@ -305,29 +305,35 @@ export function buildControlPanelCard({
     lines.push(`- **守护进程在线**：\`${uptimeText}\``);
   }
 
+  const activeRow = [];
+  if (isRunning) {
+    activeRow.push({ label: '🛑 立即中止', type: 'danger', value: { cmd: 'stop', inplace: true } });
+  }
+  if (queueLength > 0) {
+    activeRow.push({ label: `📋 队列(${queueLength})`, value: { cmd: 'queue_list', inplace: true } });
+  }
+
   const row1 = [
     { label: '🆕 新对话', value: { cmd: 'new', inplace: true } },
     { label: '🗂️ 最近会话', value: { cmd: 'sessions', inplace: true } },
     { label: '🧠 模型', value: { cmd: 'models', inplace: true } },
     { label: '🎛️ 强度', value: { cmd: 'effort_menu', inplace: true } },
-    { label: '🌿 Git', value: { cmd: 'git', inplace: true } },
-    { label: '🔐 权限', value: { cmd: 'scopes', inplace: true } },
     { label: '🔄 刷新', value: { cmd: 'panel', inplace: true } },
   ];
-  if (isRunning) {
-    row1.push({ label: '🛑 立即中止', type: 'danger', value: { cmd: 'stop', inplace: true } });
-  }
-  if (queueLength > 0) {
-    row1.push({ label: `📋 队列(${queueLength})`, value: { cmd: 'queue_list', inplace: true } });
-  }
 
   const row2 = [
     { label: '⚡ 快捷任务', type: 'primary', value: { cmd: 'quick', inplace: true } },
+    { label: '✅ 飞书待办', value: { cmd: 'tasks', filter: 'open', inplace: true } },
     { label: '📁 浏览目录', value: { cmd: 'dirs', inplace: true } },
     {
       label: isPinned ? '📌 取消收藏' : '📌 收藏目录',
       value: { cmd: 'pin', inplace: true },
     },
+  ];
+
+  const row3 = [
+    { label: '🌿 Git', value: { cmd: 'git', inplace: true } },
+    { label: '🔐 权限', value: { cmd: 'scopes', inplace: true } },
     {
       label: notifyMode === 'on' ? '🔔 提醒:开' : notifyMode === 'away' ? '🧠 提醒:离开' : '🔕 提醒:关',
       value: { cmd: 'notify_menu', inplace: true },
@@ -336,7 +342,7 @@ export function buildControlPanelCard({
     { label: '⏪ 快照回滚', value: { cmd: 'ops', inplace: true } },
   ];
 
-  const row3 = [
+  const row4 = [
     {
       label: '✏️ 改文件',
       type: mode === 'accept-edits' ? 'primary' : 'default',
@@ -365,25 +371,29 @@ export function buildControlPanelCard({
   ];
 
   const home = path.resolve(os.homedir());
-  const row4 = quickDirs.map((dirPath) => ({
-    label: `📂 ${formatShortDirName(dirPath, home)}`,
-    type: dirPath === resolvedCwd ? 'primary' : 'default',
-    value: { cmd: 'cd', arg: dirPath, inplace: true },
-  }));
+  const dirRows = chunkButtons(
+    quickDirs.map((dirPath) => ({
+      label: `📂 ${formatShortDirName(dirPath, home)}`,
+      type: dirPath === resolvedCwd ? 'primary' : 'default',
+      value: { cmd: 'cd', arg: dirPath, inplace: true },
+    })),
+    4,
+  );
 
   return buildCard({
     title: '⚙️ Antigravity 控制面板',
     template: isRunning ? 'wathet' : 'blue',
     markdown: lines.join('\n'),
-    buttonRows: [row1, row2, row3, row4].filter((r) => r.length > 0),
+    buttonRows: [activeRow, row1, row2, row3, row4, ...dirRows].filter((r) => r.length > 0),
     footer: '推荐按需点「⚡ 临时全权30m」（到期自动切回安全模式）',
   });
 }
 
-export function buildDirsCard({ chatState, config, page = 0, pageSize = 12 }) {
+export function buildDirsCard({ chatState, config, page = 0, pageSize = 12, showHidden }) {
   const cwd = path.resolve(chatState?.cwd || config?.agy?.defaultCwd || os.homedir());
   const home = path.resolve(os.homedir());
   const parentDir = path.dirname(cwd);
+  const includeHidden = showHidden !== undefined ? Boolean(showHidden) : Boolean(chatState?.showHiddenDirs);
 
   const rawFavorites = Array.isArray(config?.agy?.favoriteDirs) ? config.agy.favoriteDirs : [];
   const favoriteSeen = new Set();
@@ -404,13 +414,23 @@ export function buildDirsCard({ chatState, config, page = 0, pageSize = 12 }) {
   const isPinned = favorites.includes(cwd);
 
   let allSubDirs = [];
+  let hiddenCount = 0;
   let readErr = '';
   try {
-    allSubDirs = fs
+    const dirNames = fs
       .readdirSync(cwd, { withFileTypes: true })
-      .filter((entry) => !entry.name.startsWith('.') && isDirectoryEntry(cwd, entry))
-      .map((entry) => entry.name)
-      .sort((a, b) => a.localeCompare(b));
+      .filter((entry) => isDirectoryEntry(cwd, entry))
+      .map((entry) => entry.name);
+    hiddenCount = dirNames.filter((name) => name.startsWith('.')).length;
+    allSubDirs = (includeHidden ? dirNames : dirNames.filter((name) => !name.startsWith('.')))
+      .sort((a, b) => {
+        if (includeHidden) {
+          const aHidden = a.startsWith('.');
+          const bHidden = b.startsWith('.');
+          if (aHidden !== bHidden) return aHidden ? -1 : 1;
+        }
+        return a.localeCompare(b);
+      });
   } catch (err) {
     readErr = err?.message || '无法读取目录';
   }
@@ -420,14 +440,21 @@ export function buildDirsCard({ chatState, config, page = 0, pageSize = 12 }) {
   const startIdx = safePage * perPage;
   const subDirs = allSubDirs.slice(startIdx, startIdx + perPage);
 
+  const hiddenHint = hiddenCount > 0 ? `（另有 ${hiddenCount} 个隐藏目录）` : '';
+  const dirSummaryLine = readErr
+    ? `- **子目录读取失败**：\`${readErr}\``
+    : includeHidden
+      ? allSubDirs.length > 0
+        ? `- **子目录（含隐藏）**：共 ${allSubDirs.length} 个（隐藏 ${hiddenCount} 个）${totalPages > 1 ? `（第 ${safePage + 1}/${totalPages} 页，显示 ${startIdx + 1}–${startIdx + subDirs.length}）` : ''}`
+        : '- **子目录（含隐藏）**：当前目录下暂无子文件夹'
+      : allSubDirs.length > 0
+        ? `- **可见子目录**：共 ${allSubDirs.length} 个${hiddenHint}${totalPages > 1 ? `（第 ${safePage + 1}/${totalPages} 页，显示 ${startIdx + 1}–${startIdx + subDirs.length}）` : ''}`
+        : `- **可见子目录**：当前目录下暂无可见子文件夹${hiddenHint}`;
+
   const lines = [
     `- **当前目录**：\`${cwd}\``,
     `- **收藏目录**：${favorites.length} 个${isPinned ? '（当前目录已收藏）' : ''}`,
-    readErr
-      ? `- **子目录读取失败**：\`${readErr}\``
-      : allSubDirs.length > 0
-        ? `- **可见子目录**：共 ${allSubDirs.length} 个${totalPages > 1 ? `（第 ${safePage + 1}/${totalPages} 页，显示 ${startIdx + 1}–${startIdx + subDirs.length}）` : ''}`
-        : '- **可见子目录**：当前目录下暂无可见子文件夹',
+    dirSummaryLine,
   ];
 
   const navRow = [
@@ -444,6 +471,11 @@ export function buildDirsCard({ chatState, config, page = 0, pageSize = 12 }) {
   navRow.push({
     label: isPinned ? '📌 取消收藏' : '📌 收藏此目录',
     value: { cmd: 'pin_in_dirs', page: safePage, inplace: true },
+  });
+  navRow.push({
+    label: includeHidden ? '👁️ 隐藏:开' : '🙈 显示隐藏',
+    type: includeHidden ? 'primary' : 'default',
+    value: { cmd: 'dirs', page: 0, showHidden: !includeHidden, inplace: true },
   });
 
   const favRows = favorites.length > 0
@@ -492,7 +524,7 @@ export function buildDirsCard({ chatState, config, page = 0, pageSize = 12 }) {
     template: 'blue',
     markdown: lines.join('\n'),
     buttonRows: [navRow, ...favRows, ...subDirRows, ...(pagerRow.length > 0 ? [pagerRow] : [])],
-    footer: '点子目录进入，支持翻页；也可发送 /cd <关键词> 模糊直达',
+    footer: '点子目录进入，支持翻页与显示隐藏目录（如 .gemini）；也可发 /dirs -a 或 /cd <关键词>',
   });
 }
 
@@ -730,6 +762,7 @@ export async function deliverFinalCard(
   const targetId = chatId || receiveId;
   const targetType = chatId ? 'chat_id' : receiveIdType;
 
+  const sentMessageIds = [];
   for (let i = 0; i < chunks.length; i += 1) {
     const isLast = i === chunks.length - 1;
     const partTitle = chunks.length > 1 ? `${title} (${i + 1}/${chunks.length})` : title;
@@ -746,17 +779,21 @@ export async function deliverFinalCard(
     if (i === 0 && replyMessageId) {
       try {
         await patchCard(client, { messageId: replyMessageId, card });
+        sentMessageIds.push(replyMessageId);
         continue;
       } catch {
         // Fallback to sending a new card if patching fails (e.g., expired or deleted)
       }
     }
     if (replyInThread && replyTargetMessageId) {
-      await replyCard(client, { messageId: replyTargetMessageId, card, replyInThread: true });
+      const msgId = await replyCard(client, { messageId: replyTargetMessageId, card, replyInThread: true });
+      if (msgId) sentMessageIds.push(msgId);
     } else if (targetId) {
-      await sendCard(client, { receiveId: targetId, receiveIdType: targetType, card });
+      const msgId = await sendCard(client, { receiveId: targetId, receiveIdType: targetType, card });
+      if (msgId) sentMessageIds.push(msgId);
     }
   }
+  return sentMessageIds;
 }
 
 export function unwrapLarkError(err, action) {
@@ -1131,6 +1168,9 @@ const KEY_APP_SCOPES = [
   { name: 'docx:document:write_only', label: '云文档写入' },
   { name: 'docx:document.block:convert', label: 'Markdown 转云文档块' },
   { name: 'wiki:node:read', label: 'Wiki 知识库节点解析' },
+  { name: 'task:task:read', label: '飞书任务只读（个人/话题待办）' },
+  { name: 'task:task:write', label: '飞书任务新建/完成' },
+  { name: 'task:tasklist:read', label: '飞书任务清单只读' },
 ];
 
 export function buildScopesCard({ scopes = [], granted = [], pending = [], applyResult = null } = {}) {
@@ -1416,6 +1456,21 @@ export function buildDesktopSessionPreviewCard(detail, { filter = 'all', query =
     lines.push('', '_暂未提取到对话正文，将仅使用标题与工作目录接管。_');
   }
 
+  const secondRow = [];
+  if (detail?.lastAssistantReply) {
+    secondRow.push({
+      label: '📄 查看最新回复',
+      value: { cmd: 'desktop_last_reply', arg: detail.id },
+    });
+  }
+  secondRow.push(
+    {
+      label: '⬅️ 返回列表',
+      value: { cmd: 'desktop_list', filter, query: safeQuery, inplace: true },
+    },
+    { label: '⚙️ 控制面板', value: { cmd: 'panel', inplace: true } },
+  );
+
   return buildCard({
     title: '🔍 电脑端对话详情预览',
     template: detail?.running ? 'orange' : 'blue',
@@ -1432,15 +1487,9 @@ export function buildDesktopSessionPreviewCard(detail, { filter = 'all', query =
           value: { cmd: 'desktop_takeover', arg: detail.id, summarize: true, inplace: false },
         },
       ],
-      [
-        {
-          label: '⬅️ 返回列表',
-          value: { cmd: 'desktop_list', filter, query: safeQuery, inplace: true },
-        },
-        { label: '⚙️ 控制面板', value: { cmd: 'panel', inplace: true } },
-      ],
+      secondRow,
     ],
-    footer: '只读扫描本地索引，绝不修改桌面 App 数据库',
+    footer: '点「接管」将自动推送电脑端最新模型回复 · 只读扫描绝不修改桌面数据库',
   });
 }
 
@@ -1508,5 +1557,116 @@ export function buildNotifyCard({ config } = {}) {
       [{ label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } }],
     ],
     footer: '也可在聊天发送 /notify <on|away|off> 或 /mute',
+  });
+}
+
+export function buildTasksCard({
+  items = [],
+  filter = 'open',
+  authStatus = null,
+  error = '',
+  authUrl = '',
+} = {}) {
+  const safeFilter = ['open', 'done', 'all'].includes(filter) ? filter : 'open';
+  const isAuthorized = Boolean(authStatus?.authorized);
+  const authNeeded =
+    !isAuthorized ||
+    /FEISHU_USER_AUTH_REQUIRED|尚未完成飞书用户授权|授权已过期|缺少 refresh_token/i.test(String(error || ''));
+
+  if (authNeeded) {
+    const lines = [
+      '- **当前状态**：🔒 尚未完成飞书用户 OAuth 授权（或授权已过期）',
+      error ? `- **详细信息**：\`${sanitizeForFeishuMarkdown(String(error).slice(0, 220))}\`` : '',
+      '',
+      '**一次性授权步骤（3 步）：**',
+      '1. 飞书开放平台 → **安全设置 → 重定向 URL**：添加 `http://127.0.0.1:18923/callback`',
+      '2. 飞书开放平台 → **权限管理** 开通权限：`offline_access`、`task:task:read`、`task:task:write`、`task:tasklist:read` 并发布新版本',
+      '3. 在 Mac/本机终端运行一次：',
+      '```bash',
+      'node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs auth',
+      '```',
+      authUrl ? `- **备用授权链接**：[点此打开飞书授权页](${authUrl})` : '',
+    ].filter(Boolean);
+
+    return buildCard({
+      title: '✅ 飞书任务中心（待授权）',
+      template: 'orange',
+      markdown: lines.join('\n'),
+      buttonRows: [[
+        { label: '🔄 重新检查', type: 'primary', value: { cmd: 'tasks', filter: safeFilter, inplace: true } },
+        { label: '🔐 权限自检', value: { cmd: 'scopes', inplace: true } },
+        { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
+      ]],
+      footer: '授权凭证加密存于 ~/.config/antigravity-feishu/user-auth.json（0600），支持自动刷新续期',
+    });
+  }
+
+  const visibleItems = Array.isArray(items) ? items.slice(0, 10) : [];
+  const filterTitle = safeFilter === 'open' ? '未完成' : safeFilter === 'done' ? '已完成' : '全部';
+  const lines = [
+    `- **视图**：\`${filterTitle}\`（展示 ${visibleItems.length}${Array.isArray(items) && items.length > visibleItems.length ? ` / ${items.length}` : ''} 条）`,
+  ];
+  if (error) {
+    lines.push(`- **接口提示**：\`${sanitizeForFeishuMarkdown(String(error).slice(0, 200))}\``);
+  }
+  lines.push('');
+
+  if (visibleItems.length === 0) {
+    lines.push('_（当前视图下暂无任务）_');
+  } else {
+    visibleItems.forEach((item, idx) => {
+      const icon = item.completed ? '✅' : '⬜';
+      const title = sanitizeForFeishuMarkdown(String(item.summary || '(无标题任务)').replace(/\s+/g, ' ').trim());
+      const duePart = item.dueText ? ` · ⏰ \`${item.dueText}\`` : '';
+      const shortGuid = item.guid ? ` \`${item.guid.slice(0, 8)}\`` : '';
+      lines.push(`${idx + 1}. ${icon} **${title}**${duePart}${shortGuid}`);
+      if (item.description) {
+        const descOneLine = String(item.description).replace(/\s+/g, ' ').trim();
+        const snippet = descOneLine.length > 60 ? `${descOneLine.slice(0, 58)}…` : descOneLine;
+        lines.push(`   > ${sanitizeForFeishuMarkdown(snippet)}`);
+      }
+    });
+  }
+
+  const filterRow = [
+    {
+      label: '📋 未完成',
+      type: safeFilter === 'open' ? 'primary' : 'default',
+      value: { cmd: 'tasks', filter: 'open', inplace: true },
+    },
+    {
+      label: '✅ 已完成',
+      type: safeFilter === 'done' ? 'primary' : 'default',
+      value: { cmd: 'tasks', filter: 'done', inplace: true },
+    },
+    {
+      label: '📑 全部',
+      type: safeFilter === 'all' ? 'primary' : 'default',
+      value: { cmd: 'tasks', filter: 'all', inplace: true },
+    },
+    { label: '🔄 刷新', value: { cmd: 'tasks', filter: safeFilter, inplace: true } },
+    { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
+  ];
+
+  const actionButtons = [];
+  visibleItems.slice(0, 4).forEach((item, idx) => {
+    if (!item.guid) return;
+    actionButtons.push({
+      label: `🤖 执行 #${idx + 1}`,
+      type: 'primary',
+      value: { cmd: 'task_run', arg: item.guid },
+    });
+    actionButtons.push({
+      label: item.completed ? `↩️ 重开 #${idx + 1}` : `✅ 完成 #${idx + 1}`,
+      value: { cmd: 'task_toggle', arg: item.guid, done: !item.completed, filter: safeFilter, inplace: true },
+    });
+  });
+
+  return buildCard({
+    title: `✅ 飞书任务中心（${filterTitle}）`,
+    template: error ? 'orange' : 'blue',
+    markdown: lines.join('\n'),
+    buttonRows: [filterRow, ...chunkButtons(actionButtons, 2)],
+    footer: '支持 /tasks add 标题 | 说明 新建待办；直接发或引用任务卡片也可触发执行',
   });
 }
