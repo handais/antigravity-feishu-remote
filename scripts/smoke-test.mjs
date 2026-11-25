@@ -111,6 +111,20 @@ function runSubprocess(scriptRel, { env = {}, stdinData = '' } = {}) {
   });
 }
 
+function stripNodeExperimentalWarnings(stderr = '') {
+  return String(stderr)
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return false;
+      if (/^\(node:\d+\)\s+ExperimentalWarning:/.test(trimmed)) return false;
+      if (/^\(Use `node --trace-warnings \.\.\.` to show where the warning was created\)$/.test(trimmed)) return false;
+      return true;
+    })
+    .join('\n')
+    .trim();
+}
+
 async function testMcpStdio() {
   const child = spawn(process.execPath, [path.join(pluginRoot, 'scripts', 'mcp-server.mjs')], {
     env: { ...process.env, FEISHU_REMOTE_CONFIG_DIR: tempConfigDir },
@@ -903,7 +917,7 @@ try {
   });
   assert.equal(stopNotIdleRes.code, 0);
   assert.equal(stopNotIdleRes.stdout.trim(), '{}');
-  assert.equal(stopNotIdleRes.stderr.trim(), '');
+  assert.equal(stripNodeExperimentalWarnings(stopNotIdleRes.stderr), '');
 
   const stopTerminalStepRes = await runSubprocess('scripts/stop-notify.mjs', {
     env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir },
@@ -911,7 +925,7 @@ try {
   });
   assert.equal(stopTerminalStepRes.code, 0);
   assert.equal(stopTerminalStepRes.stdout.trim(), '{}');
-  assert.equal(stopTerminalStepRes.stderr.trim(), '');
+  assert.equal(stripNodeExperimentalWarnings(stopTerminalStepRes.stderr), '');
 
   const stopCanceledRes = await runSubprocess('scripts/stop-notify.mjs', {
     env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir },
@@ -919,7 +933,7 @@ try {
   });
   assert.equal(stopCanceledRes.code, 0);
   assert.equal(stopCanceledRes.stdout.trim(), '{}');
-  assert.equal(stopCanceledRes.stderr.trim(), '');
+  assert.equal(stripNodeExperimentalWarnings(stopCanceledRes.stderr), '');
 
   const stopSubagentRes = await runSubprocess('scripts/stop-notify.mjs', {
     env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir, FEISHU_REMOTE_GEMINI_DIR: fakeGeminiDir },
@@ -927,7 +941,7 @@ try {
   });
   assert.equal(stopSubagentRes.code, 0);
   assert.equal(stopSubagentRes.stdout.trim(), '{}');
-  assert.equal(stopSubagentRes.stderr.trim(), '');
+  assert.equal(stripNodeExperimentalWarnings(stopSubagentRes.stderr), '');
 
   assert.equal(resolveStopNotifyMode({ notifications: { stopHookEnabled: false, stopNotifyMode: 'on' } }), 'off');
   assert.equal(resolveStopNotifyMode({ notifications: { stopHookEnabled: true, stopNotifyMode: 'away' } }), 'away');
@@ -946,7 +960,7 @@ try {
   });
   assert.equal(stopActiveUserRes.code, 0);
   assert.equal(stopActiveUserRes.stdout.trim(), '{}');
-  assert.equal(stopActiveUserRes.stderr.trim(), '');
+  assert.equal(stripNodeExperimentalWarnings(stopActiveUserRes.stderr), '');
 
   notifyTestCfg.notifications.stopNotifyMode = 'off';
   notifyTestCfg.notifications.stopHookEnabled = false;
@@ -957,7 +971,7 @@ try {
   });
   assert.equal(stopMutedRes.code, 0);
   assert.equal(stopMutedRes.stdout.trim(), '{}');
-  assert.equal(stopMutedRes.stderr.trim(), '');
+  assert.equal(stripNodeExperimentalWarnings(stopMutedRes.stderr), '');
 
   const ioregSample = '    | | |   "HIDIdleTime" = 6728880875\n';
   const ioregMatch = ioregSample.match(/"?HIDIdleTime"?\s*=\s*(\d+)/);
