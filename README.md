@@ -1,5 +1,10 @@
 # 飞书远程控制 (Feishu Remote) — Antigravity 插件
 
+[![CI](https://github.com/handais/antigravity-feishu-remote/actions/workflows/ci.yml/badge.svg)](https://github.com/handais/antigravity-feishu-remote/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/handais/antigravity-feishu-remote)](https://github.com/handais/antigravity-feishu-remote/releases)
+[![Node](https://img.shields.io/badge/node-%3E%3D22.5.0-brightgreen)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+
 **简体中文** | [English Documentation (README_EN.md)](./README_EN.md)
 
 > Remotely control your local Antigravity CLI/IDE from Feishu or Lark over WebSocket long connection (no public IP required), with CardKit 2.0 streaming, MCP push & cloud doc tools, and desktop completion handoff hooks. All secrets stay isolated outside the plugin folder (`~/.config/antigravity-feishu/`, mode `0600`).

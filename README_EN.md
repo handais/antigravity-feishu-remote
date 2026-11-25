@@ -1,5 +1,10 @@
 # Feishu Remote — Antigravity Plugin
 
+[![CI](https://github.com/handais/antigravity-feishu-remote/actions/workflows/ci.yml/badge.svg)](https://github.com/handais/antigravity-feishu-remote/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/handais/antigravity-feishu-remote)](https://github.com/handais/antigravity-feishu-remote/releases)
+[![Node](https://img.shields.io/badge/node-%3E%3D22.5.0-brightgreen)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+
 **English** | [简体中文 (README.md)](./README.md)
 
 Control your local **Antigravity** CLI / IDE directly from **Feishu** or **Lark** (mobile or desktop) over a **WebSocket long connection**—no public IP, reverse proxy, or webhook server required. Includes **CardKit 2.0** typewriter streaming, multi-turn session management, Topic Group parallel threads, Desktop-to-Phone handoff, MCP proactive messaging & cloud doc tools, and a `Stop` completion notification hook.

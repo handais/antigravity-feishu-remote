@@ -193,7 +193,9 @@ try {
   const loaded = loadConfig();
   assert.equal(loaded.feishu.appId, 'cli_test_123');
   assert.equal(loaded.feishu.appSecret, 'super_secret_token_987654');
-  assert.equal(fs.statSync(getConfigPath()).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(getConfigPath()).mode & 0o777, 0o600);
+  }
   assert.equal(maskSecret('super_secret_token_987654'), 'sup***654');
   assert.equal(maskSecret(''), '');
 
@@ -843,7 +845,9 @@ try {
   });
   const loadedUserAuth = loadUserAuth();
   assert.equal(loadedUserAuth?.accessToken, 'u-secret-access-token');
-  assert.equal(fs.statSync(path.join(tempConfigDir, 'user-auth.json')).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(path.join(tempConfigDir, 'user-auth.json')).mode & 0o777, 0o600);
+  }
   const statusSafe = getUserAuthStatus();
   assert.equal(statusSafe.authorized, true);
   assert.equal(statusSafe.hasRefreshToken, true);
@@ -986,20 +990,24 @@ try {
   assert.ok(fs.existsSync(path.join(pluginRoot, 'scripts', 'stop-notify.mjs')));
 
   // 7. cli.mjs pack check
-  const zipPath = path.join(tempConfigDir, 'feishu-remote-test.zip');
-  execFileSync(process.execPath, [path.join(pluginRoot, 'scripts', 'cli.mjs'), 'pack', '--out', zipPath], {
-    env: { ...process.env, FEISHU_REMOTE_CONFIG_DIR: tempConfigDir },
-  });
-  const zipList = execFileSync('unzip', ['-Z1', zipPath], { encoding: 'utf8' });
-  assert.ok(zipList.includes('feishu-remote/plugin.json'));
-  assert.ok(zipList.includes('feishu-remote/mcp_config.json'));
-  assert.ok(zipList.includes('feishu-remote/hooks.json'));
-  assert.ok(zipList.includes('feishu-remote/README_EN.md'));
-  assert.ok(zipList.includes('feishu-remote/LICENSE'));
-  assert.ok(zipList.includes('feishu-remote/skills/feishu-remote/SKILL.md'));
-  assert.ok(zipList.includes('feishu-remote/scripts/bridge-daemon.mjs'));
-  assert.ok(!zipList.includes('node_modules'), 'Zip must not contain node_modules');
-  assert.ok(!zipList.includes('super_secret_token_987654'), 'Zip must not contain secrets');
+  if (process.platform !== 'win32') {
+    const folderName = path.basename(pluginRoot);
+    const zipPath = path.join(tempConfigDir, 'feishu-remote-test.zip');
+    execFileSync(process.execPath, [path.join(pluginRoot, 'scripts', 'cli.mjs'), 'pack', '--out', zipPath], {
+      env: { ...process.env, FEISHU_REMOTE_CONFIG_DIR: tempConfigDir },
+    });
+    const zipList = execFileSync('unzip', ['-Z1', zipPath], { encoding: 'utf8' });
+    assert.ok(zipList.includes(`${folderName}/plugin.json`));
+    assert.ok(zipList.includes(`${folderName}/mcp_config.json`));
+    assert.ok(zipList.includes(`${folderName}/hooks.json`));
+    assert.ok(zipList.includes(`${folderName}/README_EN.md`));
+    assert.ok(zipList.includes(`${folderName}/LICENSE`));
+    assert.ok(zipList.includes(`${folderName}/skills/feishu-remote/SKILL.md`));
+    assert.ok(zipList.includes(`${folderName}/scripts/bridge-daemon.mjs`));
+    assert.ok(!zipList.includes('node_modules'), 'Zip must not contain node_modules');
+    assert.ok(!zipList.includes('.github/'), 'Zip must not contain .github');
+    assert.ok(!zipList.includes('super_secret_token_987654'), 'Zip must not contain secrets');
+  }
 
   console.log('ALL SMOKE TESTS PASSED');
 } finally {

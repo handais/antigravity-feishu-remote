@@ -388,6 +388,8 @@ function cmdPack(flags) {
       `${folderName}/node_modules/**`,
       `${folderName}/.git/*`,
       `${folderName}/.git/**`,
+      `${folderName}/.github/*`,
+      `${folderName}/.github/**`,
       `${folderName}/*.zip`,
       '*/.DS_Store',
       '**/.DS_Store',
