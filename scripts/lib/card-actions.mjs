@@ -67,7 +67,6 @@ function withTimeout(promise, ms) {
     timer = setTimeout(() => {
       reject(new Error(`Timed out after ${ms}ms`));
     }, ms);
-    timer.unref?.();
   });
   return Promise.race([promise, timeoutPromise]).finally(() => {
     if (timer !== null) {

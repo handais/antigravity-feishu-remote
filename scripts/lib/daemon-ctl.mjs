@@ -26,15 +26,15 @@ export function getSystemdUnitPath() {
  */
 export function resolveStableNodeBin(execPath = process.execPath, platform = process.platform) {
   const raw = String(execPath || process.execPath).trim();
-  if (platform === 'darwin' && /\/Cellar\/node\//i.test(raw)) {
-    for (const candidate of ['/opt/homebrew/bin/node', '/usr/local/bin/node']) {
-      try {
-        if (fs.existsSync(candidate)) {
-          return candidate;
-        }
-      } catch {
-        // Try next candidate
+  const cellarMatch = raw.match(/^(.*)\/Cellar\/node\/[^/]+\/bin\/node$/i);
+  if (platform === 'darwin' && cellarMatch) {
+    const stableCandidate = `${cellarMatch[1]}/bin/node`;
+    try {
+      if (fs.existsSync(stableCandidate)) {
+        return stableCandidate;
       }
+    } catch {
+      // Fall through to raw path
     }
   }
   return raw;

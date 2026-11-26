@@ -264,11 +264,19 @@ describe('Comprehensive security, concurrency, perf & UX audit fixes', () => {
   });
 
   it('P1 #5, #8, #9: Stable Homebrew Node path, no group pollution of lastP2pChatByOpenId, and atomic rollback restore on failure', () => {
-    // Only asserts on real symlink if /opt/homebrew/bin/node exists on this host
-    const expectedStable = fs.existsSync('/opt/homebrew/bin/node')
-      ? '/opt/homebrew/bin/node'
-      : '/opt/homebrew/Cellar/node/26.0.0/bin/node';
-    assert.equal(resolveStableNodeBin('/opt/homebrew/Cellar/node/26.0.0/bin/node', 'darwin'), expectedStable);
+    const fakePrefix = path.join(env.workDir, 'fake-homebrew');
+    const fakeStableNode = path.join(fakePrefix, 'bin', 'node');
+    fs.mkdirSync(path.dirname(fakeStableNode), { recursive: true });
+    fs.writeFileSync(fakeStableNode, '', 'utf8');
+    const fakePrefixPosix = fakePrefix.replace(/\\/g, '/');
+    assert.equal(
+      resolveStableNodeBin(`${fakePrefixPosix}/Cellar/node/26.0.0/bin/node`, 'darwin'),
+      `${fakePrefixPosix}/bin/node`,
+    );
+    assert.equal(
+      resolveStableNodeBin(`${fakePrefixPosix}/missing-prefix/Cellar/node/26.0.0/bin/node`, 'darwin'),
+      `${fakePrefixPosix}/missing-prefix/Cellar/node/26.0.0/bin/node`,
+    );
     assert.equal(resolveStableNodeBin('C:\\Program Files\\nodejs\\node.exe', 'win32'), 'C:\\Program Files\\nodejs\\node.exe');
 
     // Clicking a group card when lastP2pChatByOpenId is empty must NOT pollute it
