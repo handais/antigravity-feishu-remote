@@ -312,3 +312,9 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs pack --out ~/Desktop
    node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs start
    ```
 4. 他自己在手机飞书私聊自己的机器人发一条消息，即可自动绑定并开始使用。
+
+---
+
+## 五、致谢
+
+感谢 [LINUX DO](https://linux.do) 社区的支持与交流。

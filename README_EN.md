@@ -174,6 +174,10 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs pack --out ~/Desktop
 
 The generated archive excludes `node_modules`, `.git`, and `~/.config/antigravity-feishu/`, so it contains zero personal credentials.
 
+## Acknowledgments
+
+Thanks to the [LINUX DO](https://linux.do) community for support and discussions.
+
 ## License
 
 [MIT](./LICENSE)
