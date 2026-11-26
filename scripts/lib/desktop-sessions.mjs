@@ -33,6 +33,11 @@ function getAppStores() {
       sourceLabel: '桌面端 App',
       dir: path.join(root, 'antigravity'),
     },
+    {
+      source: 'ide',
+      sourceLabel: '桌面 IDE',
+      dir: path.join(root, 'antigravity-ide'),
+    },
   ];
 }
 
@@ -303,10 +308,29 @@ function resolveTranscriptPaths(brainDir) {
 
 /**
  * Extract the latest non-empty assistant Markdown reply from transcript_full.jsonl (preferred) or transcript.jsonl.
+ * Also accepts a direct `.jsonl` file path.
  */
-export function extractLatestAssistantReply(brainDir, { maxChars = 28000 } = {}) {
-  const { fullPath, compactPath } = resolveTranscriptPaths(brainDir);
-  const candidates = [fullPath, compactPath].filter(Boolean);
+export function extractLatestAssistantReply(brainDirOrFile, { maxChars = 28000 } = {}) {
+  const inputPath = String(brainDirOrFile || '').trim();
+  if (!inputPath) return null;
+
+  let candidates = [];
+  if (inputPath.endsWith('.jsonl')) {
+    try {
+      if (fs.existsSync(inputPath) && fs.statSync(inputPath).isFile()) {
+        candidates.push(inputPath);
+        const fullSibling = path.join(path.dirname(inputPath), 'transcript_full.jsonl');
+        if (path.basename(inputPath) !== 'transcript_full.jsonl' && fs.existsSync(fullSibling)) {
+          candidates.unshift(fullSibling);
+        }
+      }
+    } catch {
+      candidates = [];
+    }
+  } else {
+    const { fullPath, compactPath } = resolveTranscriptPaths(inputPath);
+    candidates = [fullPath, compactPath].filter(Boolean);
+  }
   if (candidates.length === 0) return null;
 
   for (const filePath of candidates) {
@@ -353,6 +377,42 @@ export function extractLatestAssistantReply(brainDir, { maxChars = 28000 } = {})
   }
 
   return null;
+}
+
+/**
+ * Extract a compact reply preview for desktop Stop notifications.
+ */
+export function extractStopReplyPreview({ conversationId = '', transcriptPath = '', maxChars = 360 } = {}) {
+  const limit = Math.max(80, Number(maxChars) || 360);
+  let reply = null;
+
+  const rawTranscript = String(transcriptPath || '').trim();
+  if (rawTranscript) {
+    reply = extractLatestAssistantReply(rawTranscript, { maxChars: limit * 4 });
+  }
+  if (!reply && conversationId) {
+    const detail = getDesktopSessionDetail(conversationId);
+    if (detail?.lastAssistantReply) {
+      reply = {
+        text: detail.lastAssistantReply,
+        totalChars: detail.lastAssistantReplyTotalChars || detail.lastAssistantReply.length,
+      };
+    }
+  }
+  if (!reply?.text) return null;
+
+  const normalized = String(reply.text)
+    .replace(/\r\n/g, '\n')
+    .replace(/```[\s\S]*?```/g, '[代码块]')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (!normalized) return null;
+
+  const totalChars = Number(reply.totalChars || normalized.length);
+  const truncated = normalized.length > limit;
+  const preview = truncated ? `${normalized.slice(0, limit).trimEnd()}…` : normalized;
+  return { preview, totalChars, truncated };
 }
 
 /**
@@ -405,76 +465,88 @@ export function extractTranscriptTurns(brainDir, { maxTurns = 6, maxCharsPerTurn
 }
 
 /**
- * Look up a single session by full ID or unique prefix and attach recent transcript turns.
+ * Look up SQLite metadata for a single conversation without reading any transcript JSONL files.
  */
-export function getDesktopSessionDetail(conversationId) {
+export function getDesktopSessionMeta(conversationId) {
   const target = String(conversationId || '').trim();
   if (!target) return null;
 
-  const all = listDesktopSessions({ limit: 50 });
-  let match = all.find((item) => item.id === target || item.id.startsWith(target));
-
-  if (!match) {
-    for (const store of getAppStores()) {
-      const dbPath = path.join(store.dir, 'conversation_summaries.db');
-      if (!fs.existsSync(dbPath)) continue;
-      let db;
+  let best = null;
+  for (const store of getAppStores()) {
+    const dbPath = path.join(store.dir, 'conversation_summaries.db');
+    if (!fs.existsSync(dbPath)) continue;
+    let db;
+    try {
+      db = new DatabaseSync(dbPath, { readOnly: true });
+      db.exec('PRAGMA busy_timeout = 1000;');
+      const row = db
+        .prepare(`
+          SELECT
+            conversation_id,
+            title,
+            preview,
+            step_count,
+            last_modified_time,
+            workspace_uris,
+            status,
+            nesting_depth,
+            app_data_dir
+          FROM conversation_summaries
+          WHERE conversation_id = ? OR conversation_id LIKE ?
+          ORDER BY (conversation_id = ?) DESC, last_modified_time DESC
+          LIMIT 1
+        `)
+        .get(target, `${target}%`, target);
+      if (row) {
+        const id = String(row.conversation_id || '').trim();
+        const isNative = store.source === 'cli' || hasCliNativeConversation(id);
+        const appDataDir = resolveAppDataDir(row.app_data_dir, store.dir);
+        const candidate = {
+          id,
+          title: String(row.title || '').trim() || '(无标题对话)',
+          preview: String(row.preview || '').trim(),
+          source: store.source,
+          sourceLabel: store.sourceLabel,
+          takeoverMode: isNative ? 'native' : 'handoff',
+          takeoverLabel: isNative ? '原生直连' : '摘要接管',
+          running: String(row.status || '') === 'CASCADE_RUN_STATUS_RUNNING',
+          status: String(row.status || ''),
+          stepCount: Number(row.step_count || 0),
+          workspace: decodeWorkspaceUris(row.workspace_uris),
+          lastModifiedTime: String(row.last_modified_time || ''),
+          lastModifiedMs: parseTimestampMs(row.last_modified_time),
+          appDataDir,
+          brainDir: path.join(appDataDir, 'brain', id),
+        };
+        if (!best) {
+          best = candidate;
+        } else {
+          const preferNew =
+            (candidate.takeoverMode === 'native' && best.takeoverMode !== 'native') ||
+            (candidate.takeoverMode === best.takeoverMode && candidate.lastModifiedMs > best.lastModifiedMs);
+          if (preferNew) {
+            best = candidate;
+          }
+        }
+      }
+    } catch {
+      // Ignore single-store errors
+    } finally {
       try {
-        db = new DatabaseSync(dbPath, { readOnly: true });
-        db.exec('PRAGMA busy_timeout = 1000;');
-        const row = db
-          .prepare(`
-            SELECT
-              conversation_id,
-              title,
-              preview,
-              step_count,
-              last_modified_time,
-              workspace_uris,
-              status,
-              nesting_depth,
-              app_data_dir
-            FROM conversation_summaries
-            WHERE conversation_id = ? OR conversation_id LIKE ?
-            ORDER BY last_modified_time DESC
-            LIMIT 1
-          `)
-          .get(target, `${target}%`);
-        if (row) {
-          const id = String(row.conversation_id || '').trim();
-          const isNative = store.source === 'cli' || hasCliNativeConversation(id);
-          const appDataDir = resolveAppDataDir(row.app_data_dir, store.dir);
-          match = {
-            id,
-            title: String(row.title || '').trim() || '(无标题对话)',
-            preview: String(row.preview || '').trim(),
-            source: store.source,
-            sourceLabel: store.sourceLabel,
-            takeoverMode: isNative ? 'native' : 'handoff',
-            takeoverLabel: isNative ? '原生直连' : '摘要接管',
-            running: String(row.status || '') === 'CASCADE_RUN_STATUS_RUNNING',
-            status: String(row.status || ''),
-            stepCount: Number(row.step_count || 0),
-            workspace: decodeWorkspaceUris(row.workspace_uris),
-            lastModifiedTime: String(row.last_modified_time || ''),
-            lastModifiedMs: parseTimestampMs(row.last_modified_time),
-            appDataDir,
-            brainDir: path.join(appDataDir, 'brain', id),
-          };
-          break;
-        }
+        db?.close();
       } catch {
-        // Ignore single-store errors
-      } finally {
-        try {
-          db?.close();
-        } catch {
-          // Ignore close failures
-        }
+        // Ignore close failures
       }
     }
   }
+  return best;
+}
 
+/**
+ * Look up a single session by full ID or unique prefix and attach recent transcript turns.
+ */
+export function getDesktopSessionDetail(conversationId) {
+  const match = getDesktopSessionMeta(conversationId);
   if (!match) return null;
 
   const brainCandidates = [

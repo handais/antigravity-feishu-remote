@@ -25,6 +25,7 @@ import {
   consumePendingRestartNotice,
   createBackupSnapshot,
 } from './lib/self-ops.mjs';
+import { maskIdentifier } from './lib/io-utils.mjs';
 import {
   enforceTempFullExpiry,
   formatHelpMarkdown,
@@ -64,6 +65,22 @@ const chatQueues = new Map(); // runKey -> Array<{ id, queuedAt, payload, queueM
 const lastTaskByChat = new Map(); // runKey -> payload
 const cardThreadMap = new Map(); // cardMessageId -> { sessionKey, threadRootId, chatId }
 const chatModeCache = new Map(); // chatId -> 'topic' | 'group' | ...
+let cachedBotOpenId = '';
+let botInfoFetchedAt = 0;
+
+async function getBotOpenId() {
+  if (cachedBotOpenId) return cachedBotOpenId;
+  if (Date.now() - botInfoFetchedAt < 60_000) return '';
+  botInfoFetchedAt = Date.now();
+  try {
+    const res = await client.request({ method: 'GET', url: '/open-apis/bot/v3/info' });
+    const id = String(res?.bot?.open_id || res?.data?.bot?.open_id || '').trim();
+    if (id) cachedBotOpenId = id;
+  } catch {
+    // Non-fatal; fallback to non-empty mentions check
+  }
+  return cachedBotOpenId;
+}
 
 function recordCardThread(cardMessageId, meta) {
   if (!cardMessageId || !meta?.threadRootId) return;
@@ -158,6 +175,7 @@ const ctx = {
   chatQueues,
   lastTaskByChat,
   cardThreadMap,
+  chatModeCache,
   recordCardThread,
   runner,
   stopWsForRestart,
@@ -188,13 +206,19 @@ async function handleIncomingMessage(rawEvent) {
   if (chatType === 'group') {
     const policy = config.security.groupPolicy || 'mention';
     if (policy === 'off') return;
-    if (policy === 'mention' && (!Array.isArray(message.mentions) || message.mentions.length === 0)) {
-      return;
+    if (policy === 'mention') {
+      const mentions = Array.isArray(message.mentions) ? message.mentions : [];
+      if (mentions.length === 0) return;
+      const botId = await getBotOpenId();
+      if (botId) {
+        const mentionedBot = mentions.some((m) => (m?.id?.open_id || m?.open_id || '') === botId);
+        if (!mentionedBot) return;
+      }
     }
   }
 
   const { supported, text: rawText, msgType, attachments } = extractInboundMessage(message);
-  const text = stripMentions(rawText);
+  const text = stripMentions(rawText, message.mentions);
 
   const allowed = config.security.allowedOpenIds || [];
   let justBound = false;
@@ -208,7 +232,7 @@ async function handleIncomingMessage(rawEvent) {
     }
     saveConfig(config);
     justBound = true;
-    console.error(`[feishu-remote] Auto-bound first p2p user open_id=${openId}`);
+    console.error(`[feishu-remote] Auto-bound first p2p user open_id=${maskIdentifier(openId)}`);
 
     await replySimpleCard(client, messageId, {
       title: '🎉 绑定成功，已授权为主人账号',
@@ -230,18 +254,27 @@ async function handleIncomingMessage(rawEvent) {
       }
       return;
     }
-  } else if (allowed.length > 0 && !allowed.includes(openId)) {
+  } else if (!openId || allowed.length === 0 || !allowed.includes(openId)) {
     if (chatType === 'p2p') {
       await replySimpleCard(client, messageId, {
         title: '🔒 未授权访问',
         template: 'grey',
-        markdown: `当前机器人仅限白名单用户使用。\n你的 \`open_id\` 为：\`${openId}\`\n\n如需授权，请在主机运行：\n\`cli.mjs setup --allow-open-id ${openId}\``,
+        markdown: allowed.length === 0
+          ? `当前机器人未配置允许白名单且已关闭自动绑定（Fail-Closed）。\n请在主机运行以下命令添加你的 \`open_id\`：\n\`cli.mjs setup --allow-open-id ${openId || '<OPEN_ID>'}\``
+          : `当前机器人仅限白名单用户使用。\n你的 \`open_id\` 为：\`${openId}\`\n\n如需授权，请在主机运行：\n\`cli.mjs setup --allow-open-id ${openId}\``,
       });
     }
     return;
   }
 
   if (chatType === 'p2p') {
+    if (chatModeCache.get(chatId) !== 'p2p') {
+      if (chatModeCache.size >= 500) {
+        const oldest = chatModeCache.keys().next().value;
+        if (oldest !== undefined) chatModeCache.delete(oldest);
+      }
+      chatModeCache.set(chatId, 'p2p');
+    }
     const p2pState = loadState();
     if (p2pState.lastP2pChatByOpenId[openId] !== chatId) {
       p2pState.lastP2pChatByOpenId[openId] = chatId;
@@ -250,6 +283,13 @@ async function handleIncomingMessage(rawEvent) {
   }
 
   const { isTopicThread, threadRootId, sessionKey } = await resolveTopicContext(message, chatId, chatType);
+  if (isTopicThread && chatId) {
+    const topicState = loadState();
+    if (topicState.lastTopicChatId !== chatId) {
+      topicState.lastTopicChatId = chatId;
+      saveState(topicState);
+    }
+  }
   const runKey = sessionKey || chatId || openId;
   const replyTargetId = isTopicThread ? (threadRootId || messageId) : messageId;
 
@@ -406,8 +446,23 @@ const dispatcher = new Lark.EventDispatcher({ loggerLevel: Lark.LoggerLevel.warn
     });
   },
   'card.action.trigger': async (data) => {
+    const started = Date.now();
     try {
-      return await handleCardAction(ctx, data);
+      const result = await handleCardAction(ctx, data);
+      const elapsed = Date.now() - started;
+      if (elapsed >= 1000) {
+        let rawVal = (data?.action || data?.event?.action)?.value;
+        if (typeof rawVal === 'string') {
+          try {
+            rawVal = JSON.parse(rawVal);
+          } catch {
+            rawVal = {};
+          }
+        }
+        const cmdLabel = String(rawVal?.cmd || 'unknown');
+        console.error(`[feishu-remote] Slow card action cmd=${cmdLabel} took ${elapsed}ms`);
+      }
+      return result;
     } catch (err) {
       console.error('[feishu-remote] Unhandled card action error:', err);
       return toastCardResponse('error', '操作处理失败');
@@ -430,6 +485,9 @@ function shutdown(signalName) {
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('unhandledRejection', (reason) => {
+  console.error('[feishu-remote] Unhandled promise rejection:', reason);
+});
 
 setInterval(() => {
   try {
@@ -459,7 +517,13 @@ setInterval(() => {
           markdown: `临时全权限已到期，系统已自动切回 \`${chatInfo.mode}\` 安全模式。`,
           buttonRows: [[{ label: '⚙️ 打开控制面板', value: { cmd: 'panel' } }]],
         }),
-      }).catch(() => {});
+      })
+        .then((sentId) => {
+          if (threadRootId && sentId) {
+            recordCardThread(sentId, { sessionKey: key, threadRootId, chatId: targetChatId });
+          }
+        })
+        .catch(() => {});
     }
     if (dirty) {
       saveState(currentState);

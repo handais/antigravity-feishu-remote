@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { cleanupStaleApprovals } from './command-guard.mjs';
 import { getConfigDir, getLogPaths, loadState, saveState } from './config.mjs';
 
 export const IMAGE_EXTENSIONS = new Set([
@@ -239,7 +240,8 @@ export function maintainRuntimeStorage({
   }
   cleanupOldInboxFiles(inboxMaxAgeDays, { maxTotalBytes: inboxMaxBytes });
   const prunedThreads = pruneStaleThreadStates(threadMaxAgeDays);
-  return { outLog: outRes, errLog: errRes, prunedThreads };
+  const prunedApprovals = cleanupStaleApprovals();
+  return { outLog: outRes, errLog: errRes, prunedThreads, prunedApprovals };
 }
 
 export function detectExtensionFromBuffer(buf, fallbackExt = '.bin') {

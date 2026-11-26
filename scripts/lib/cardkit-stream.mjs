@@ -162,6 +162,7 @@ export async function createStreamingCardSession(
     initialStream = '_已接收指令，正在启动处理..._',
     footer = '点下方按钮或发送 /stop 可中止',
     stopButton = true,
+    minWriteIntervalMs = 350,
   } = {},
 ) {
   const STATUS_ID = 'md_status';
@@ -267,6 +268,7 @@ export async function createStreamingCardSession(
   }
 
   const CARDKIT_STREAM_MAX_MS = 9 * 60 * 1000 + 20 * 1000;
+  const MIN_CARDKIT_WRITE_MS = Math.max(0, Number(minWriteIntervalMs ?? 350));
   const streamStartedAt = Date.now();
   let closed = false;
   let streamingActive = true;
@@ -282,15 +284,26 @@ export async function createStreamingCardSession(
   let streamTimer = null;
   let longRunTimer = null;
   let patchTimer = null;
+  let lastCardWriteAt = 0;
   let lastStatusAt = 0;
   let lastStreamAt = 0;
   let lastLongRunUpdateAt = 0;
   let lastPatchAt = 0;
 
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
   const enqueueOp = (fn) => {
     const next = queue.then(fn);
     queue = next.catch(() => {});
     return next;
+  };
+
+  const paceCardKitWrite = async () => {
+    const waitMs = MIN_CARDKIT_WRITE_MS - (Date.now() - lastCardWriteAt);
+    if (waitMs > 0) {
+      await sleep(waitMs);
+    }
+    lastCardWriteAt = Date.now();
   };
 
   const pushCardKitLongRunUpdate = () => enqueueOp(async () => {
@@ -384,6 +397,8 @@ export async function createStreamingCardSession(
 
   const pushElementContent = (elementId, content) => enqueueOp(async () => {
     if (closed || mode !== 'cardkit' || !cardId || !streamingActive) return;
+    await paceCardKitWrite();
+    if (closed || mode !== 'cardkit' || !cardId || !streamingActive) return;
     try {
       const res = await client.cardkit.v1.cardElement.content({
         path: { card_id: cardId, element_id: elementId },
@@ -448,13 +463,14 @@ export async function createStreamingCardSession(
       switchToLongRunUpdates();
       return;
     }
-    const elapsed = Date.now() - lastStatusAt;
-    if (elapsed < 350) {
+    const lastAt = Math.max(lastStatusAt, lastCardWriteAt);
+    const elapsed = Date.now() - lastAt;
+    if (elapsed < MIN_CARDKIT_WRITE_MS) {
       if (!statusTimer) {
         statusTimer = setTimeout(() => {
           statusTimer = null;
           flushStatusCardKit();
-        }, 350 - elapsed);
+        }, MIN_CARDKIT_WRITE_MS - elapsed);
       }
       return;
     }
@@ -470,13 +486,14 @@ export async function createStreamingCardSession(
       switchToLongRunUpdates();
       return;
     }
-    const elapsed = Date.now() - lastStreamAt;
-    if (elapsed < 250) {
+    const lastAt = Math.max(lastStreamAt, lastCardWriteAt);
+    const elapsed = Date.now() - lastAt;
+    if (elapsed < MIN_CARDKIT_WRITE_MS) {
       if (!streamTimer) {
         streamTimer = setTimeout(() => {
           streamTimer = null;
           flushStreamCardKit();
-        }, 250 - elapsed);
+        }, MIN_CARDKIT_WRITE_MS - elapsed);
       }
       return;
     }
@@ -562,9 +579,10 @@ export async function createStreamingCardSession(
       await queue;
 
       const clean = sanitizeForFeishuMarkdown(markdown);
-      const chunks = splitMarkdownChunks(clean, 7000);
+      const chunks = splitMarkdownChunks(clean, 7000, { maxUtf8Bytes: 22_000 });
       const targetId = targetChatId || targetOpenId;
       const targetType = targetChatId ? 'chat_id' : 'open_id';
+      const sentMessageIds = [];
 
       if (mode === 'cardkit' && cardId) {
         const part0Title = chunks.length > 1 ? `${finalTitle} (1/${chunks.length})` : finalTitle;
@@ -578,6 +596,7 @@ export async function createStreamingCardSession(
           buttonRows: part0Buttons,
         });
 
+        let settingsCalled = false;
         if (wasStreamingActive) {
           try {
             await client.cardkit.v1.card.settings({
@@ -595,9 +614,13 @@ export async function createStreamingCardSession(
                 uuid: crypto.randomUUID(),
               },
             });
+            settingsCalled = true;
           } catch (err) {
             console.error('[feishu-remote] cardkit settings close error:', unwrapLarkError(err, 'cardkit.settings').message);
           }
+        }
+        if (settingsCalled) {
+          await sleep(250);
         }
 
         let updatedOk = false;
@@ -620,9 +643,13 @@ export async function createStreamingCardSession(
             '[feishu-remote] cardkit final update failed, falling back to deliverFinalCard:',
             unwrapLarkError(err, 'cardkit.update').message,
           );
+          await sleep(350);
         }
 
         if (updatedOk) {
+          if (replyMessageId) {
+            sentMessageIds.push(replyMessageId);
+          }
           for (let i = 1; i < chunks.length; i += 1) {
             if (!targetId && !(finalReplyInThread && finalReplyTarget)) break;
             const isLast = i === chunks.length - 1;
@@ -634,20 +661,26 @@ export async function createStreamingCardSession(
               buttonRows: isLast ? buttonRows : [],
             });
             if (finalReplyInThread && finalReplyTarget) {
-              await replyCard(client, {
+              const extraId = await replyCard(client, {
                 messageId: finalReplyTarget,
                 card: extraCard,
                 replyInThread: true,
               });
+              if (extraId) sentMessageIds.push(extraId);
             } else {
-              await sendCard(client, { receiveId: targetId, receiveIdType: targetType, card: extraCard });
+              const extraId = await sendCard(client, {
+                receiveId: targetId,
+                receiveIdType: targetType,
+                card: extraCard,
+              });
+              if (extraId) sentMessageIds.push(extraId);
             }
           }
-          return;
+          return sentMessageIds;
         }
       }
 
-      await deliverFinalCard(client, {
+      const fallbackIds = await deliverFinalCard(client, {
         replyMessageId,
         replyTargetMessageId: finalReplyTarget,
         replyInThread: finalReplyInThread,
@@ -660,6 +693,7 @@ export async function createStreamingCardSession(
         footer: finalFooter,
         buttonRows,
       });
+      return Array.isArray(fallbackIds) ? fallbackIds : [];
     },
   };
 }

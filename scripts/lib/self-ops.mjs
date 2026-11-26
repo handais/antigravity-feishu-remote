@@ -1,9 +1,13 @@
 import crypto from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { ensureConfigDir, getConfigDir, getPluginRoot } from './config.mjs';
+import { writePrivateJsonAtomic } from './io-utils.mjs';
 import { getDaemonStatus } from './daemon-ctl.mjs';
+
+const execFileAsync = promisify(execFile);
 
 const MAX_SNAPSHOTS = 5;
 
@@ -36,7 +40,15 @@ function collectFilesRecursive(baseDir, relPrefix = '') {
 
 function collectTrackedPluginFiles(pluginRoot = getPluginRoot()) {
   const files = collectFilesRecursive(path.join(pluginRoot, 'scripts'), 'scripts');
-  for (const extra of ['package.json', 'README.md', 'skills/feishu-remote/SKILL.md']) {
+  for (const extra of [
+    'plugin.json',
+    'mcp_config.json',
+    'hooks.json',
+    'package.json',
+    'README.md',
+    'rules/AGENTS.md',
+    'skills/feishu-remote/SKILL.md',
+  ]) {
     const abs = path.join(pluginRoot, extra);
     try {
       if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
@@ -51,24 +63,6 @@ function collectTrackedPluginFiles(pluginRoot = getPluginRoot()) {
 
 function collectScriptMjsFiles(pluginRoot = getPluginRoot()) {
   return collectFilesRecursive(path.join(pluginRoot, 'scripts'), 'scripts').filter((rel) => rel.endsWith('.mjs'));
-}
-
-function writePrivateJsonAtomic(filePath, data) {
-  const parentDir = path.dirname(filePath);
-  fs.mkdirSync(parentDir, { recursive: true, mode: 0o700 });
-  try {
-    fs.chmodSync(parentDir, 0o700);
-  } catch {
-    // Ignore on filesystems that don't support chmod
-  }
-  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
-  fs.writeFileSync(tmpPath, `${JSON.stringify(data, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-  try {
-    fs.chmodSync(tmpPath, 0o600);
-  } catch {
-    // Ignore
-  }
-  fs.renameSync(tmpPath, filePath);
 }
 
 export function computePluginCodeHash(pluginRoot = getPluginRoot()) {
@@ -139,12 +133,57 @@ const IMPORT_VERIFIER_CODE = [
   '      }',
   '    }',
   '  }',
+  '  const dynRe = /\\bimport\\(\\s*[\'"](\\.[^\'"]+)[\'"]\\s*\\)/g;',
+  '  while ((m = dynRe.exec(src)) !== null) {',
+  '    const spec = m[1];',
+  '    const resolved = path.resolve(path.dirname(scriptFile), spec);',
+  '    if (!fs.existsSync(resolved)) {',
+  "      errors.push({ file: rel, stage: 'imports', error: `Missing dynamic import target: ${spec}` });",
+  '    }',
+  '  }',
+  '}',
+  'for (const dep of [\'@larksuiteoapi/node-sdk\', \'@modelcontextprotocol/sdk/server/index.js\']) {',
+  '  try {',
+  '    await import(dep);',
+  '  } catch (err) {',
+  "    errors.push({ file: 'package.json', stage: 'imports', error: `Dependency check failed (${dep}): ${err?.message || err}` });",
+  '  }',
   '}',
   'if (errors.length > 0) {',
   '  process.stdout.write(JSON.stringify({ errors }));',
   '  process.exit(1);',
   '}',
 ].join('\n');
+
+function parseImportCheckError(err) {
+  const stdout = String(err?.stdout || '').trim();
+  const stderr = String(err?.stderr || '').trim();
+  let parsedErrors = null;
+  if (stdout) {
+    try {
+      const parsed = JSON.parse(stdout);
+      if (Array.isArray(parsed?.errors) && parsed.errors.length > 0) {
+        parsedErrors = parsed.errors;
+      }
+    } catch {
+      // Ignore non-JSON stdout
+    }
+  }
+  if (parsedErrors) {
+    return parsedErrors.map((item) => ({
+      file: String(item?.file || 'scripts'),
+      stage: 'imports',
+      error: String(item?.error || 'Import verification error').trim().slice(0, 500),
+    }));
+  }
+  return [
+    {
+      file: 'scripts/lib',
+      stage: 'imports',
+      error: (stderr || stdout || err?.message || 'Import verification failed').trim().slice(0, 500),
+    },
+  ];
+}
 
 export function runPreflightCheck(pluginRoot = getPluginRoot()) {
   const startedAt = Date.now();
@@ -176,34 +215,54 @@ export function runPreflightCheck(pluginRoot = getPluginRoot()) {
         env: { ...process.env, FEISHU_PREFLIGHT_ROOT: pluginRoot },
       });
     } catch (err) {
-      const stdout = String(err?.stdout || '').trim();
-      const stderr = String(err?.stderr || '').trim();
-      let parsedErrors = null;
-      if (stdout) {
-        try {
-          const parsed = JSON.parse(stdout);
-          if (Array.isArray(parsed?.errors) && parsed.errors.length > 0) {
-            parsedErrors = parsed.errors;
-          }
-        } catch {
-          // Ignore non-JSON stdout
-        }
-      }
-      if (parsedErrors) {
-        for (const item of parsedErrors) {
-          errors.push({
-            file: String(item?.file || 'scripts'),
-            stage: 'imports',
-            error: String(item?.error || 'Import verification error').trim().slice(0, 500),
-          });
-        }
-      } else {
+      errors.push(...parseImportCheckError(err));
+    }
+  }
+
+  return {
+    ok: errors.length === 0,
+    checkedFiles: mjsFiles,
+    errors,
+    durationMs: Date.now() - startedAt,
+    hash: computePluginCodeHash(pluginRoot),
+  };
+}
+
+export async function runPreflightCheckAsync(pluginRoot = getPluginRoot()) {
+  const startedAt = Date.now();
+  const mjsFiles = collectScriptMjsFiles(pluginRoot);
+  const errors = [];
+
+  const concurrency = 8;
+  let nextIdx = 0;
+  const workers = Array.from({ length: Math.min(concurrency, mjsFiles.length) }, async () => {
+    while (nextIdx < mjsFiles.length) {
+      const relPath = mjsFiles[nextIdx++];
+      try {
+        await execFileAsync(process.execPath, ['--check', path.join(pluginRoot, relPath)], {
+          encoding: 'utf8',
+          timeout: 8000,
+        });
+      } catch (err) {
         errors.push({
-          file: 'scripts/lib',
-          stage: 'imports',
-          error: (stderr || stdout || err?.message || 'Import verification failed').trim().slice(0, 500),
+          file: relPath,
+          stage: 'syntax',
+          error: String(err?.stderr || err?.message || err).trim().slice(0, 500),
         });
       }
+    }
+  });
+  await Promise.all(workers);
+
+  if (errors.length === 0) {
+    try {
+      await execFileAsync(process.execPath, ['--input-type=module', '-e', IMPORT_VERIFIER_CODE], {
+        encoding: 'utf8',
+        timeout: 10000,
+        env: { ...process.env, FEISHU_PREFLIGHT_ROOT: pluginRoot },
+      });
+    } catch (err) {
+      errors.push(...parseImportCheckError(err));
     }
   }
 
@@ -308,14 +367,17 @@ export function findRollbackTarget(requestedId = '', pluginRoot = getPluginRoot(
   return snapshots.find((s) => s.hash !== currentHash) || null;
 }
 
-export function restoreBackupSnapshot(requestedId = '', pluginRoot = getPluginRoot()) {
+function prepareRestoreBackup(requestedId = '', pluginRoot = getPluginRoot()) {
   const target = findRollbackTarget(requestedId, pluginRoot);
   if (!target) {
     return {
       ok: false,
-      error: '没有可回滚的历史快照',
-      snapshot: null,
-      check: null,
+      result: {
+        ok: false,
+        error: '没有可回滚的历史快照',
+        snapshot: null,
+        check: null,
+      },
     };
   }
 
@@ -329,19 +391,50 @@ export function restoreBackupSnapshot(requestedId = '', pluginRoot = getPluginRo
   if (!buffered.has('scripts/bridge-daemon.mjs')) {
     return {
       ok: false,
-      error: `快照 ${target.id} 缺少核心文件 scripts/bridge-daemon.mjs`,
-      snapshot: target,
-      check: null,
+      result: {
+        ok: false,
+        error: `快照 ${target.id} 缺少核心文件 scripts/bridge-daemon.mjs`,
+        snapshot: target,
+        check: null,
+      },
     };
   }
 
-  if (computePluginCodeHash(pluginRoot) !== target.hash) {
-    const currentCheck = runPreflightCheck(pluginRoot);
-    if (currentCheck.ok) {
-      createBackupSnapshot({ reason: 'pre-rollback', force: false, pluginRoot });
+  return { ok: true, target, buffered };
+}
+
+function pruneEmptyDirs(dir, { removeSelf = false } = {}) {
+  try {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        pruneEmptyDirs(path.join(dir, entry.name), { removeSelf: true });
+      }
+    }
+    if (removeSelf && fs.readdirSync(dir).length === 0) {
+      fs.rmdirSync(dir);
+    }
+  } catch {
+    // Ignore directory cleanup failures
+  }
+}
+
+function captureTrackedFilesMap(pluginRoot) {
+  const captured = new Map();
+  for (const rel of collectTrackedPluginFiles(pluginRoot)) {
+    const abs = path.join(pluginRoot, rel);
+    try {
+      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+        captured.set(rel, fs.readFileSync(abs));
+      }
+    } catch {
+      // Ignore unreadable file
     }
   }
+  return captured;
+}
 
+function applyRestoreBackupFiles(pluginRoot, buffered) {
   for (const [rel, buf] of buffered.entries()) {
     const dest = path.join(pluginRoot, rel);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -357,12 +450,65 @@ export function restoreBackupSnapshot(requestedId = '', pluginRoot = getPluginRo
       }
     }
   }
+  pruneEmptyDirs(path.join(pluginRoot, 'scripts'), { removeSelf: false });
+}
 
+export function restoreBackupSnapshot(requestedId = '', pluginRoot = getPluginRoot()) {
+  const prep = prepareRestoreBackup(requestedId, pluginRoot);
+  if (!prep.ok) return prep.result;
+  const { target, buffered } = prep;
+
+  const previousFiles = captureTrackedFilesMap(pluginRoot);
+  if (computePluginCodeHash(pluginRoot) !== target.hash) {
+    const currentCheck = runPreflightCheck(pluginRoot);
+    if (currentCheck.ok) {
+      createBackupSnapshot({ reason: 'pre-rollback', force: false, pluginRoot });
+    }
+  }
+
+  applyRestoreBackupFiles(pluginRoot, buffered);
   const check = runPreflightCheck(pluginRoot);
+  let restoredPreviousOnFailure = false;
+  if (!check.ok && previousFiles.size > 0) {
+    applyRestoreBackupFiles(pluginRoot, previousFiles);
+    restoredPreviousOnFailure = true;
+  }
   return {
     ok: check.ok,
     snapshot: target,
     restoredFilesCount: buffered.size,
+    restoredPreviousOnFailure,
+    error: check.ok ? '' : '回滚目标快照未通过预检，已自动恢复到回滚前磁盘状态',
+    check,
+  };
+}
+
+export async function restoreBackupSnapshotAsync(requestedId = '', pluginRoot = getPluginRoot()) {
+  const prep = prepareRestoreBackup(requestedId, pluginRoot);
+  if (!prep.ok) return prep.result;
+  const { target, buffered } = prep;
+
+  const previousFiles = captureTrackedFilesMap(pluginRoot);
+  if (computePluginCodeHash(pluginRoot) !== target.hash) {
+    const currentCheck = await runPreflightCheckAsync(pluginRoot);
+    if (currentCheck.ok) {
+      createBackupSnapshot({ reason: 'pre-rollback', force: false, pluginRoot });
+    }
+  }
+
+  applyRestoreBackupFiles(pluginRoot, buffered);
+  const check = await runPreflightCheckAsync(pluginRoot);
+  let restoredPreviousOnFailure = false;
+  if (!check.ok && previousFiles.size > 0) {
+    applyRestoreBackupFiles(pluginRoot, previousFiles);
+    restoredPreviousOnFailure = true;
+  }
+  return {
+    ok: check.ok,
+    snapshot: target,
+    restoredFilesCount: buffered.size,
+    restoredPreviousOnFailure,
+    error: check.ok ? '' : '回滚目标快照未通过预检，已自动恢复到回滚前磁盘状态',
     check,
   };
 }

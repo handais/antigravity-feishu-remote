@@ -6,8 +6,22 @@ import { detectAgyBin } from './config.mjs';
 export const VALID_MODES = ['accept-edits', 'plan', 'auto', 'full', 'default'];
 export const VALID_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-export function buildAgyArgs({ prompt, conversationId = '', mode = 'accept-edits', model = '', effort = '', timeoutSeconds = 3600 }) {
-  const args = ['-p', prompt, '--output-format', 'stream-json'];
+export function buildAgyStreamInputLine(prompt) {
+  return `${JSON.stringify({ event: 'user', message: { content: String(prompt ?? '') } })}\n`;
+}
+
+export function buildAgyArgs({
+  prompt = '',
+  useStdin = false,
+  conversationId = '',
+  mode = 'accept-edits',
+  model = '',
+  effort = '',
+  timeoutSeconds = 3600,
+}) {
+  const args = useStdin
+    ? ['--input-format', 'stream-json', '--output-format', 'stream-json']
+    : ['-p', prompt, '--output-format', 'stream-json'];
   if (conversationId) {
     args.push('--conversation', conversationId);
   }
@@ -74,6 +88,7 @@ export function parseAgyStreamLine(line) {
         stepIndex: su.step_index,
         toolName,
         summary: summarizeToolParameters(toolName, su.tool_info?.parameters),
+        parameters: su.tool_info?.parameters || null,
       };
     }
     if (stepType === 'tool' && state === 'DONE') {
@@ -116,7 +131,7 @@ export function parseAgyStreamLine(line) {
   return { kind: 'other', raw: parsed };
 }
 
-export function buildChildEnv(config, agyBin) {
+export function buildChildEnv(config, agyBin, bridgeMeta = {}) {
   const isWin = process.platform === 'win32';
   const delim = path.delimiter;
   const pathParts = [
@@ -147,6 +162,12 @@ export function buildChildEnv(config, agyBin) {
     FEISHU_REMOTE_BRIDGE_CHILD: '1',
   };
 
+  if (bridgeMeta?.chatId) env.FEISHU_REMOTE_CHAT_ID = String(bridgeMeta.chatId);
+  if (bridgeMeta?.openId) env.FEISHU_REMOTE_OPEN_ID = String(bridgeMeta.openId);
+  if (bridgeMeta?.sessionKey) env.FEISHU_REMOTE_SESSION_KEY = String(bridgeMeta.sessionKey);
+  if (bridgeMeta?.threadRootId) env.FEISHU_REMOTE_THREAD_ROOT_ID = String(bridgeMeta.threadRootId);
+  if (bridgeMeta?.mode) env.FEISHU_REMOTE_MODE = String(bridgeMeta.mode);
+
   if (isWin) {
     for (const winKey of [
       'USERPROFILE',
@@ -166,6 +187,13 @@ export function buildChildEnv(config, agyBin) {
         env[winKey] = process.env[winKey];
       }
     }
+  }
+
+  if (process.env.FEISHU_REMOTE_CONFIG_DIR) {
+    env.FEISHU_REMOTE_CONFIG_DIR = process.env.FEISHU_REMOTE_CONFIG_DIR;
+  }
+  if (!isWin && process.env.TMPDIR) {
+    env.TMPDIR = process.env.TMPDIR;
   }
 
   if (process.env.ANTIGRAVITY_API_KEY) {
@@ -194,7 +222,7 @@ function getWindowsSpawnOpts(binPath) {
   };
 }
 
-export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-edits', model = '', effort = '', config, onEvent, signal }) {
+export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-edits', model = '', effort = '', config, bridgeMeta = {}, onEvent, signal }) {
   return new Promise((resolve, reject) => {
     const agyBin = config?.agy?.bin?.trim() || detectAgyBin();
     if (!agyBin) {
@@ -203,21 +231,33 @@ export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-ed
     }
 
     const args = buildAgyArgs({
-      prompt,
+      useStdin: true,
       conversationId,
       mode,
       model,
       effort,
       timeoutSeconds: config?.agy?.timeoutSeconds ?? 3600,
     });
-    const env = buildChildEnv(config, agyBin);
+    const env = buildChildEnv(config, agyBin, bridgeMeta);
+    const useDetached = process.platform !== 'win32';
 
     const child = spawn(agyBin, args, {
       cwd: cwd || config?.agy?.defaultCwd || process.cwd(),
       env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: useDetached,
+      stdio: ['pipe', 'pipe', 'pipe'],
       ...getWindowsSpawnOpts(agyBin),
     });
+
+    child.stdin.on('error', () => {
+      // Ignore EPIPE if child exits before stdin completes
+    });
+    try {
+      child.stdin.write(buildAgyStreamInputLine(prompt));
+      child.stdin.end();
+    } catch {
+      // Handled via child error/close listeners
+    }
 
     let stderr = '';
     let resolvedConvId = conversationId;
@@ -227,16 +267,47 @@ export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-ed
     let aborted = false;
     let killTimer = null;
 
+    const killChildTree = (sig) => {
+      if (process.platform === 'win32') {
+        if (sig === 'SIGKILL' && child.pid) {
+          try {
+            spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+              windowsHide: true,
+              stdio: 'ignore',
+            }).unref();
+            return;
+          } catch {
+            // Fall back to child.kill
+          }
+        }
+        try {
+          child.kill(sig);
+        } catch {
+          // Ignore
+        }
+        return;
+      }
+      if (useDetached && child.pid) {
+        try {
+          process.kill(-child.pid, sig);
+          return;
+        } catch {
+          // Fall back to direct child signal
+        }
+      }
+      try {
+        child.kill(sig);
+      } catch {
+        // Ignore
+      }
+    };
+
     const handleAbort = () => {
       aborted = true;
       if (!child.killed) {
-        child.kill('SIGTERM');
+        killChildTree('SIGTERM');
         killTimer = setTimeout(() => {
-          try {
-            child.kill('SIGKILL');
-          } catch {
-            // Ignore
-          }
+          killChildTree('SIGKILL');
         }, 3000);
         killTimer.unref();
       }
@@ -312,7 +383,7 @@ export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-ed
   });
 }
 
-export function listAgyModels(config) {
+export function listAgyModels(config, { timeoutMs = 15_000 } = {}) {
   return new Promise((resolve, reject) => {
     const agyBin = config?.agy?.bin?.trim() || detectAgyBin();
     if (!agyBin) {
@@ -326,14 +397,35 @@ export function listAgyModels(config) {
     });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // Ignore kill failures
+      }
+      reject(new Error(`agy models timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, Math.max(2000, Number(timeoutMs) || 15_000));
+    timer.unref();
+
     child.stdout.on('data', (d) => {
       stdout += d.toString('utf8');
     });
     child.stderr.on('data', (d) => {
       stderr += d.toString('utf8');
     });
-    child.on('error', reject);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
     child.on('close', (code) => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
       if (code !== 0 && !stdout.trim()) {
         reject(new Error(stderr.trim() || `agy models exited with code ${code}`));
         return;

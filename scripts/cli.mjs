@@ -8,7 +8,6 @@ import {
   detectLocalProxy,
   getConfigDir,
   getConfigPath,
-  getEffectiveQuickPrompts,
   getPluginRoot,
   loadConfig,
   loadState,
@@ -21,7 +20,6 @@ import {
   buildCard,
   buildControlPanelCard,
   buildDirsCard,
-  buildQuickPromptsCard,
   createFeishuClient,
   sendCard,
   sendLocalMedia,
@@ -39,6 +37,12 @@ import {
 import { VALID_EFFORTS, VALID_MODES } from './lib/agy-runner.mjs';
 import { listDesktopSessions } from './lib/desktop-sessions.mjs';
 import {
+  copyToSystemClipboard,
+  listMobileSessions,
+  readMobileSession,
+  writeHandoffSnapshot,
+} from './lib/mobile-handoff.mjs';
+import {
   getDaemonStatus,
   readDaemonLogs,
   restartDaemon,
@@ -52,6 +56,7 @@ import {
   restoreBackupSnapshot,
   runPreflightCheck,
 } from './lib/self-ops.mjs';
+import { expandHomePath } from './lib/io-utils.mjs';
 
 function parseArgs(argv) {
   const positionals = [];
@@ -146,30 +151,6 @@ function cmdSetup(flags) {
     }
   }
 
-  if (flags['reset-quick']) {
-    config.agy.quickPrompts = [];
-  }
-  if (flags['add-quick'] !== undefined) {
-    const rawItems = Array.isArray(flags['add-quick']) ? flags['add-quick'] : [flags['add-quick']];
-    const current = Array.isArray(config.agy.quickPrompts) && config.agy.quickPrompts.length > 0
-      ? [...config.agy.quickPrompts]
-      : getEffectiveQuickPrompts(config);
-    for (const rawItem of rawItems) {
-      const str = String(rawItem || '').trim();
-      const sepIdx = str.search(/[|｜]/);
-      if (sepIdx === -1) {
-        throw new Error('--add-quick must be formatted as "Label|Prompt"');
-      }
-      const label = str.slice(0, sepIdx).trim();
-      const prompt = str.slice(sepIdx + 1).trim();
-      if (!label || !prompt) {
-        throw new Error('--add-quick label and prompt must both be non-empty');
-      }
-      current.push({ label, prompt });
-    }
-    config.agy.quickPrompts = current.slice(0, 8);
-  }
-
   if (typeof flags['agy-bin'] === 'string') {
     config.agy.bin = flags['agy-bin'].trim();
   } else if (!config.agy.bin) {
@@ -256,6 +237,20 @@ function cmdSetup(flags) {
     }
     config.notifications.awayIdleSeconds = Math.floor(sec);
   }
+  if (typeof flags['risky-approval'] === 'string') {
+    const val = flags['risky-approval'].trim().toLowerCase();
+    if (val !== 'on' && val !== 'off') {
+      throw new Error('--risky-approval must be on or off');
+    }
+    config.security.riskyCommandApproval = val;
+  }
+  if (typeof flags['approval-timeout'] === 'string') {
+    const sec = Number(flags['approval-timeout']);
+    if (!Number.isFinite(sec) || sec < 15 || sec > 160) {
+      throw new Error('--approval-timeout must be between 15 and 160');
+    }
+    config.security.approvalTimeoutSeconds = Math.floor(sec);
+  }
 
   const saved = saveConfig(config);
   console.log(JSON.stringify({
@@ -321,7 +316,7 @@ async function cmdTestSend(flags) {
   }
 
   const client = createFeishuClient(config, { quiet: true });
-  const cardType = flags.panel ? 'panel' : flags.quick ? 'quick' : flags.dirs ? 'dirs' : 'test';
+  const cardType = flags.panel ? 'panel' : flags.dirs ? 'dirs' : 'test';
   let card;
   if (cardType !== 'test') {
     const state = loadState();
@@ -334,12 +329,15 @@ async function cmdTestSend(flags) {
           model: config.agy.defaultModel,
           conversationId: '',
         };
-    if (cardType === 'quick') {
-      card = buildQuickPromptsCard({ chatState, config });
-    } else if (cardType === 'dirs') {
+    if (cardType === 'dirs') {
       card = buildDirsCard({ chatState, config });
     } else {
-      card = buildControlPanelCard({ chatState, config, isRunning: false });
+      card = buildControlPanelCard({
+        chatState,
+        config,
+        isRunning: false,
+        panelActionUsage: state.panelActionUsage,
+      });
     }
   } else {
     card = buildCard({
@@ -365,11 +363,7 @@ function cmdPack(flags) {
   const outRaw = typeof flags.out === 'string'
     ? flags.out
     : path.join(os.homedir(), 'Desktop', 'feishu-remote-plugin.zip');
-  const outPath = outRaw === '~'
-    ? os.homedir()
-    : outRaw.startsWith('~/')
-      ? path.join(os.homedir(), outRaw.slice(2))
-      : path.resolve(outRaw);
+  const outPath = expandHomePath(outRaw);
 
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.rmSync(outPath, { force: true });
@@ -377,25 +371,63 @@ function cmdPack(flags) {
   const parentDir = path.dirname(pluginRoot);
   const folderName = path.basename(pluginRoot);
 
-  execFileSync(
-    'zip',
-    [
-      '-r',
-      outPath,
-      folderName,
-      '-x',
-      `${folderName}/node_modules/*`,
-      `${folderName}/node_modules/**`,
-      `${folderName}/.git/*`,
-      `${folderName}/.git/**`,
-      `${folderName}/.github/*`,
-      `${folderName}/.github/**`,
-      `${folderName}/*.zip`,
-      '*/.DS_Store',
-      '**/.DS_Store',
-    ],
-    { cwd: parentDir, stdio: 'pipe' },
-  );
+  if (process.platform === 'win32') {
+    const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-remote-pack-'));
+    const stageDir = path.join(stageRoot, folderName);
+    const skipDirNames = new Set(['node_modules', '.git', '.github', 'tests']);
+    const isExcludedFile = (name) =>
+      name === '.DS_Store' ||
+      name === '.env' ||
+      name.startsWith('.env.') ||
+      /\.(?:zip|log|pem|key)$/i.test(name);
+    try {
+      fs.cpSync(pluginRoot, stageDir, {
+        recursive: true,
+        filter: (src) => {
+          const base = path.basename(src);
+          if (src !== pluginRoot && (skipDirNames.has(base) || isExcludedFile(base))) {
+            return false;
+          }
+          return true;
+        },
+      });
+      const psCmd = `Compress-Archive -Path '${stageDir.replace(/'/g, "''")}' -DestinationPath '${outPath.replace(/'/g, "''")}' -Force`;
+      execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], {
+        windowsHide: true,
+        stdio: 'pipe',
+      });
+    } finally {
+      fs.rmSync(stageRoot, { recursive: true, force: true });
+    }
+  } else {
+    execFileSync(
+      'zip',
+      [
+        '-r',
+        outPath,
+        folderName,
+        '-x',
+        `${folderName}/node_modules/*`,
+        `${folderName}/node_modules/**`,
+        `${folderName}/.git/*`,
+        `${folderName}/.git/**`,
+        `${folderName}/.github/*`,
+        `${folderName}/.github/**`,
+        `${folderName}/tests/*`,
+        `${folderName}/tests/**`,
+        `${folderName}/*.zip`,
+        '**/*.zip',
+        '**/.env',
+        '**/.env.*',
+        '**/*.log',
+        '**/*.pem',
+        '**/*.key',
+        '*/.DS_Store',
+        '**/.DS_Store',
+      ],
+      { cwd: parentDir, stdio: 'pipe' },
+    );
+  }
 
   console.log(JSON.stringify({
     ok: true,
@@ -573,6 +605,57 @@ function cmdDesktop(flags) {
   }, null, 2));
 }
 
+function cmdHandoff(positionals, flags) {
+  const cwd = typeof flags.cwd === 'string' ? flags.cwd.trim() : '';
+  const originDesktopId = typeof flags.origin === 'string' ? flags.origin.trim() : '';
+  const conversationId =
+    (typeof flags.conv === 'string' && flags.conv.trim()) ||
+    positionals[1] ||
+    '';
+
+  if (flags.list) {
+    const sessions = listMobileSessions({
+      cwd,
+      originDesktopId,
+      limit: flags.limit ? Number(flags.limit) : 10,
+    });
+    console.log(JSON.stringify({ ok: true, count: sessions.length, sessions }, null, 2));
+    return;
+  }
+
+  const session = readMobileSession({ conversationId, cwd, originDesktopId });
+  if (!session.found) {
+    console.log(JSON.stringify({ ok: false, error: session.error }, null, 2));
+    process.exitCode = 1;
+    return;
+  }
+
+  const snap = writeHandoffSnapshot({
+    conversationId: session.conversationId,
+    cwd: session.cwd,
+    cliResumeCommand: session.cliResumeCommand,
+    desktopHandoffPrompt: session.desktopHandoffPrompt,
+    modifiedFiles: session.modifiedFiles,
+    originDesktopSession: session.originDesktopSession,
+  });
+
+  let clipboard = null;
+  if (typeof flags.copy === 'string' || flags.copy === true) {
+    const mode = String(flags.copy).toLowerCase() === 'desktop' ? 'desktop' : 'cli';
+    clipboard = {
+      target: mode,
+      ...copyToSystemClipboard(mode === 'desktop' ? session.desktopHandoffPrompt : session.cliResumeCommand),
+    };
+  }
+
+  console.log(JSON.stringify({
+    ok: true,
+    ...session,
+    snapshotPath: snap.latestPath,
+    clipboard,
+  }, null, 2));
+}
+
 async function cmdAuth(flags) {
   const config = loadConfig();
   if (flags.status) {
@@ -660,7 +743,7 @@ Commands:
   rollback      Restore a backup snapshot ([id|hash]) and restart if running
   status        Show daemon status and masked configuration
   logs          Print recent daemon stdout/stderr logs (--lines N)
-  test-send     Send a test card to the bound Feishu user (--panel|--quick|--dirs)
+  test-send     Send a test card to the bound Feishu user (--panel|--dirs)
   send-file     Upload and send a local image or file (<path> [--as-file])
   scopes        Inspect Feishu Open Platform scope authorization status
   read-doc      Read a Feishu docx/wiki document (<url|token> [--max-chars N])
@@ -669,6 +752,7 @@ Commands:
   task-create   Create a Feishu Task v2 task (--summary "..." [--desc "..."] [--due "..."])
   task-done     Mark a Feishu Task v2 task complete (<task_guid> [--reopen])
   desktop       Scan local CLI/Desktop conversations (--query <kw> --filter <all|cli|desktop|running> --limit N)
+  handoff       Inspect or copy mobile session handoff (--list|--conv <id>|--cwd <dir>|--origin <id>|--copy cli|desktop)
   pack          Create a clean shareable plugin zip (--out path/to.zip)
 `);
 }
@@ -676,6 +760,16 @@ Commands:
 async function main() {
   const { positionals, flags } = parseArgs(process.argv.slice(2));
   const sub = positionals[0] || 'help';
+
+  const isBridgeChild = process.env.FEISHU_REMOTE_BRIDGE_CHILD === '1' && !flags.force;
+  if (isBridgeChild && ['stop', 'restart', 'safe-restart', 'rollback'].includes(sub)) {
+    console.error(JSON.stringify({
+      ok: false,
+      blocked: true,
+      error: `Refused to run \`cli.mjs ${sub}\` from inside a bridge-spawned child session. Ask the user to run \`/reload\` in Feishu, or pass --force outside child contexts.`,
+    }, null, 2));
+    process.exit(1);
+  }
 
   if (sub === 'help' || flags.help || flags.h) {
     printHelp();
@@ -763,6 +857,10 @@ async function main() {
   }
   if (sub === 'desktop') {
     cmdDesktop(flags);
+    return;
+  }
+  if (sub === 'handoff') {
+    cmdHandoff(positionals, flags);
     return;
   }
   if (sub === 'pack') {

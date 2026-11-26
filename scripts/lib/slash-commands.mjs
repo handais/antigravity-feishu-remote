@@ -1,8 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { listAgyModels, VALID_EFFORTS, VALID_MODES } from './agy-runner.mjs';
-import { getEffectiveQuickPrompts, loadState, resolveStopNotifyMode, saveConfig, saveState } from './config.mjs';
 import {
+  loadState,
+  resolveRiskyApprovalEnabled,
+  resolveStopNotifyMode,
+  saveConfig,
+  saveState,
+} from './config.mjs';
+import {
+  buildAgySkillsCard,
   buildControlPanelCard,
   buildDesktopSessionsCard,
   buildDirSearchCard,
@@ -11,14 +18,20 @@ import {
   buildGitStatusCard,
   buildNotifyCard,
   buildQueueListCard,
-  buildQuickPromptsCard,
   buildScopesCard,
   buildTasksCard,
+  canonicalizeDirPath,
   replyCard as sendReplyCard,
   searchDirsFuzzy,
   sendLocalMedia,
 } from './feishu-api.mjs';
 import { listDesktopSessions } from './desktop-sessions.mjs';
+import {
+  buildHandoffCard,
+  copyToSystemClipboardAsync,
+  readMobileSession,
+  writeHandoffSnapshot,
+} from './mobile-handoff.mjs';
 import { queryAppScopes, readFeishuDoc, writeFeishuDoc } from './feishu-docs.mjs';
 import {
   buildOAuthAuthorizeUrl,
@@ -30,7 +43,7 @@ import {
 import {
   createBackupSnapshot,
   findRollbackTarget,
-  runPreflightCheck,
+  runPreflightCheckAsync,
   scheduleDaemonSelfRestart,
   writePendingRestartNotice,
 } from './self-ops.mjs';
@@ -38,7 +51,7 @@ import {
   buildCurrentOpsCard,
   buildModelsCard,
   buildSessionsCard,
-  collectGitInfo,
+  collectGitInfoAsync,
   enforceTempFullExpiry,
   expandHomePath,
   formatHelpMarkdown,
@@ -48,6 +61,7 @@ import {
   normalizeTempMinutes,
   parseTimeoutArg,
   replySimpleCard,
+  resolveDefaultTopicChatId,
 } from './bridge-helpers.mjs';
 
 export async function handleSlashCommand(
@@ -97,6 +111,36 @@ export async function handleSlashCommand(
     return sentId;
   };
 
+  if (cmd === '/' || cmd === '/skills' || cmd === '/commands') {
+    await replyCard(client, {
+      messageId,
+      card: buildAgySkillsCard(),
+    });
+    return true;
+  }
+
+  if (cmd === '/agy') {
+    if (!arg) {
+      await replyCard(client, {
+        messageId,
+        card: buildAgySkillsCard(),
+      });
+      return true;
+    }
+    await runner.enqueueOrExecutePrompt({
+      text: arg,
+      displayPreview: `[agy] ${arg.slice(0, 40)}`,
+      chatId,
+      openId,
+      messageId,
+      sessionKey: runKey,
+      threadRootId,
+      replyInThread,
+      config,
+    });
+    return true;
+  }
+
   if (cmd === '/panel' || cmd === '/menu') {
     await replyCard(client, {
       messageId,
@@ -109,6 +153,7 @@ export async function handleSlashCommand(
         threadRootId,
         activeParallelCount: activeRuns.size,
         maxConcurrentRuns: config.agy.maxConcurrentRuns || 4,
+        panelActionUsage: state.panelActionUsage,
       }),
     });
     return true;
@@ -123,7 +168,7 @@ export async function handleSlashCommand(
   }
 
   if (cmd === '/check') {
-    const check = runPreflightCheck();
+    const check = await runPreflightCheckAsync();
     await replyCard(client, {
       messageId,
       card: buildCurrentOpsCard({ bootCodeHash, checkResult: check, isRunning }),
@@ -132,7 +177,7 @@ export async function handleSlashCommand(
   }
 
   if (cmd === '/snapshot') {
-    const check = runPreflightCheck();
+    const check = await runPreflightCheckAsync();
     if (!check.ok) {
       await replyCard(client, {
         messageId,
@@ -162,7 +207,7 @@ export async function handleSlashCommand(
       });
       return true;
     }
-    const check = runPreflightCheck();
+    const check = await runPreflightCheckAsync();
     if (!check.ok) {
       await replyCard(client, {
         messageId,
@@ -230,81 +275,6 @@ export async function handleSlashCommand(
     return true;
   }
 
-  if (cmd === '/quick') {
-    if (!arg) {
-      await replyCard(client, {
-        messageId,
-        card: buildQuickPromptsCard({ chatState, config }),
-      });
-      return true;
-    }
-    if (arg.toLowerCase() === 'reset') {
-      config.agy.quickPrompts = [];
-      saveConfig(config);
-      await replyCard(client, {
-        messageId,
-        card: buildQuickPromptsCard({ chatState, config }),
-      });
-      return true;
-    }
-    if (/^add\s+/i.test(arg)) {
-      const body = arg.replace(/^add\s+/i, '');
-      const sepIdx = body.search(/[|｜]/);
-      const rawLabel = sepIdx !== -1 ? body.slice(0, sepIdx).trim() : '';
-      const rawPrompt = sepIdx !== -1 ? body.slice(sepIdx + 1).trim() : '';
-      if (!rawLabel || !rawPrompt) {
-        await replySimple({
-          title: '⚠️ 添加快捷任务用法',
-          template: 'orange',
-          markdown: '格式：`/quick add 按钮名称 | 要发送的提示词`\n例如：`/quick add 🔍 查日志 | 请检查最近 100 行错误日志并定位原因`',
-          buttonRows: [[{ label: '⚡ 打开快捷任务', value: { cmd: 'quick' } }]],
-        });
-        return true;
-      }
-      config.agy.quickPrompts = [...getEffectiveQuickPrompts(config), { label: rawLabel, prompt: rawPrompt }].slice(0, 8);
-      saveConfig(config);
-      await replyCard(client, {
-        messageId,
-        card: buildQuickPromptsCard({ chatState, config }),
-      });
-      return true;
-    }
-    const delMatch = arg.match(/^(?:del|rm|remove)\s+(\d+)$/i);
-    if (delMatch) {
-      const idx = Number(delMatch[1]) - 1;
-      const current = [...getEffectiveQuickPrompts(config)];
-      if (!Number.isInteger(idx) || idx < 0 || idx >= current.length) {
-        await replySimple({
-          title: '❌ 序号超出范围',
-          template: 'red',
-          markdown: `当前共有 ${current.length} 条快捷任务，请发送 \`/quick\` 查看序号后再删除。`,
-          buttonRows: [[{ label: '⚡ 打开快捷任务', value: { cmd: 'quick' } }]],
-        });
-        return true;
-      }
-      current.splice(idx, 1);
-      config.agy.quickPrompts = current;
-      saveConfig(config);
-      await replyCard(client, {
-        messageId,
-        card: buildQuickPromptsCard({ chatState, config }),
-      });
-      return true;
-    }
-    await replySimple({
-      title: '⚠️ /quick 用法说明',
-      template: 'orange',
-      markdown: [
-        '- `/quick`：打开快捷任务面板',
-        '- `/quick add 名称 | 提示词`：添加快捷任务（最多 8 个）',
-        '- `/quick del <序号>`：删除指定快捷任务',
-        '- `/quick reset`：恢复内置默认快捷任务',
-      ].join('\n'),
-      buttonRows: [[{ label: '⚡ 打开快捷任务', type: 'primary', value: { cmd: 'quick' } }]],
-    });
-    return true;
-  }
-
   if (cmd === '/help') {
     await replySimple({
       title: '🤖 Antigravity 飞书遥控指令',
@@ -312,7 +282,7 @@ export async function handleSlashCommand(
       markdown: formatHelpMarkdown(),
       buttonRows: [[
         { label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel' } },
-        { label: '⚡ 快捷任务', value: { cmd: 'quick' } },
+        { label: '🧩 命令与技能', value: { cmd: 'skills_menu' } },
       ]],
     });
     return true;
@@ -339,8 +309,12 @@ export async function handleSlashCommand(
       `- **单轮超时**：\`${formatTimeoutLabel(config.agy.timeoutSeconds)}\``,
       `- **当前模型**：\`${chatState.model || 'default (随 CLI 配置)'}\``,
       `- **推理强度**：\`${chatState.effort || config.agy.defaultEffort || 'default (随 CLI 配置)'}\``,
+      `- **高危命令审批**：${resolveRiskyApprovalEnabled(config) ? '🛡️ 已开启' : '⚪ 已关闭'}`,
       `- **电脑端提醒**：${notifyText}`,
       `- **当前会话**：\`${chatState.conversationId || '(未开始，下条消息新建)'}\``,
+      chatState.originDesktopSession?.id
+        ? `- **关联桌面会话**：${chatState.originDesktopSession.title || '(无标题)'}（\`${chatState.originDesktopSession.id.slice(0, 8)}\`）`
+        : '',
       chatState.pendingHandoff
         ? `- **待注入电脑端上下文**：\`${chatState.pendingHandoff.id?.slice(0, 8) || '-'}\` · ${chatState.pendingHandoff.title || '(无标题)'}`
         : '',
@@ -355,7 +329,7 @@ export async function handleSlashCommand(
       markdown: lines.join('\n'),
       buttonRows: [[
         { label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel' } },
-        { label: '⚡ 快捷任务', value: { cmd: 'quick' } },
+        { label: '🧩 命令与技能', value: { cmd: 'skills_menu' } },
         { label: '📋 查看队列', value: { cmd: 'queue_list' } },
       ]],
     });
@@ -365,12 +339,153 @@ export async function handleSlashCommand(
   if (cmd === '/new') {
     chatState.conversationId = '';
     chatState.pendingHandoff = null;
+    chatState.originDesktopSession = null;
+    chatState.lastTurnArtifacts = null;
+    chatState.topicClosed = false;
     saveState(state);
     await replySimple({
       title: '🆕 已开启新对话',
       template: 'green',
       markdown: `下条消息将在 \`${chatState.cwd}\` 下开启全新上下文。`,
       buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+    });
+    return true;
+  }
+
+  if (cmd === '/unlink' || cmd === '/close') {
+    chatState.topicClosed = true;
+    chatState.originDesktopSession = null;
+    chatState.pendingHandoff = null;
+    saveState(state);
+    await replySimple({
+      title: '🔓 已结束当前对话的电脑端自动回流追踪',
+      template: 'grey',
+      markdown: '后续电脑端若再运行原对话，完成通知将回到私聊总收件箱，不再推送到此话题楼。',
+      buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+    });
+    return true;
+  }
+
+  if (cmd === '/topic') {
+    const sub = arg.trim().toLowerCase();
+    if (sub === 'set') {
+      if (!replyInThread || !chatId) {
+        await replySimple({
+          title: '⚠️ 请在话题群内使用 `/topic set`',
+          template: 'orange',
+          markdown: '请在飞书「话题群」的任意消息或话题楼里发送 `/topic set`，即可将该群设为「🧵 新开话题接管」的默认目标群。',
+        });
+        return true;
+      }
+      config.notifications.defaultTopicChatId = chatId;
+      saveConfig(config);
+      state.lastTopicChatId = chatId;
+      saveState(state);
+      await replySimple({
+        title: '🧵 已绑定默认接管话题群',
+        template: 'green',
+        markdown: `已将当前话题群（\`${chatId}\`）设为默认接管群。以后在私聊点「🧵 新开话题接管」时，会自动在此群创建独立话题楼。`,
+      });
+      return true;
+    }
+    if (sub === 'clear' || sub === 'reset') {
+      config.notifications.defaultTopicChatId = '';
+      saveConfig(config);
+      await replySimple({
+        title: '🧹 已清除手动指定的默认话题群',
+        template: 'grey',
+        markdown: '后续将恢复自动识别最近活跃的话题群。',
+      });
+      return true;
+    }
+    const resolvedTopic = resolveDefaultTopicChatId(state, config, chatId, Boolean(replyInThread));
+    const configured = String(config?.notifications?.defaultTopicChatId || '').trim();
+    await replySimple({
+      title: '🧵 默认接管话题群',
+      template: resolvedTopic ? 'blue' : 'grey',
+      markdown: [
+        `- **当前生效话题群**：\`${resolvedTopic || '(未绑定，请先在话题群发消息或 /topic set)'}\``,
+        configured ? `- **来源**：手动指定（\`defaultTopicChatId\`）` : '- **来源**：自动记忆最近活跃话题群',
+        '',
+        '用法：在话题群发送 `/topic set` 绑定，`/topic clear` 清除手动绑定。',
+      ].join('\n'),
+    });
+    return true;
+  }
+
+  if (cmd === '/handoff' || cmd === '/back' || cmd === '/return') {
+    const target = arg.trim().toLowerCase() === 'desktop' ? 'desktop' : 'cli';
+    const session = readMobileSession({
+      conversationId: chatState.conversationId || '',
+      cwd: chatState.cwd,
+      originDesktopId: chatState.originDesktopSession?.id || '',
+    });
+    if (!session.found) {
+      await replySimple({
+        title: 'ℹ️ 暂无可交回电脑的手机端会话',
+        template: 'grey',
+        markdown: session.error || '请先在飞书端发送一条任务消息后再使用 `/handoff`。',
+        buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+      });
+      return true;
+    }
+    const textToCopy = target === 'desktop' ? session.desktopHandoffPrompt : session.cliResumeCommand;
+    const clipboardResult = await copyToSystemClipboardAsync(textToCopy);
+    const snap = writeHandoffSnapshot({
+      conversationId: session.conversationId,
+      cwd: session.cwd,
+      cliResumeCommand: session.cliResumeCommand,
+      desktopHandoffPrompt: session.desktopHandoffPrompt,
+      modifiedFiles: session.modifiedFiles,
+      originDesktopSession: session.originDesktopSession,
+    });
+    await replyCard(client, {
+      messageId,
+      card: buildHandoffCard({
+        session,
+        clipboardResult,
+        copiedTarget: target,
+        snapshotPath: snap.latestPath,
+      }),
+    });
+    return true;
+  }
+
+  if (cmd === '/guard' || cmd === '/approval') {
+    const sub = arg.trim().toLowerCase();
+    if (sub === 'on' || sub === 'enable' || sub === '开') {
+      config.security.riskyCommandApproval = 'on';
+      saveConfig(config);
+    } else if (sub === 'off' || sub === 'disable' || sub === '关') {
+      config.security.riskyCommandApproval = 'off';
+      saveConfig(config);
+    } else if (sub) {
+      await replySimple({
+        title: '⚠️ /guard 用法提示',
+        template: 'orange',
+        markdown: '用法：`/guard`（查看状态）、`/guard on`（开启高危命令审批）、`/guard off`（关闭）。',
+        buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+      });
+      return true;
+    }
+    const enabled = resolveRiskyApprovalEnabled(config);
+    const timeoutSec = Math.max(15, Math.min(160, Number(config.security?.approvalTimeoutSeconds || 120)));
+    await replySimple({
+      title: '🛡️ 高危命令飞书审批',
+      template: enabled ? 'green' : 'grey',
+      markdown: [
+        `- **当前状态**：${enabled ? '🛡️ **已开启**' : '⚪ **已关闭**'}`,
+        `- **审批超时**：\`${timeoutSec}s\`（超时默认拒绝 Fail-Closed）`,
+        '- **拦截范围**：`rm -rf`、`git push --force`、`git reset --hard`、`sudo`、`curl | sh`、系统目录覆写等高危命令',
+      ].join('\n'),
+      buttonRows: [[
+        {
+          label: enabled ? '⚪ 关闭高危审批' : '🛡️ 开启高危审批',
+          type: enabled ? 'default' : 'primary',
+          value: { cmd: 'guard_toggle', arg: enabled ? 'off' : 'on', inplace: true },
+        },
+        { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
+      ]],
     });
     return true;
   }
@@ -428,6 +543,9 @@ export async function handleSlashCommand(
     }
     chatState.conversationId = targetId;
     chatState.pendingHandoff = null;
+    chatState.originDesktopSession = null;
+    chatState.lastTurnArtifacts = null;
+    chatState.topicClosed = false;
     saveState(state);
     await replySimple({
       title: '🔁 已切换会话',
@@ -565,17 +683,19 @@ export async function handleSlashCommand(
 
   if (cmd === '/pin') {
     const resolved = path.resolve(chatState.cwd);
+    const canonicalCurrent = canonicalizeDirPath(resolved);
     const existing = Array.isArray(config.agy.favoriteDirs) ? config.agy.favoriteDirs.map((d) => path.resolve(d)) : [];
-    const idx = existing.indexOf(resolved);
+    const hasMatch = existing.some((d) => canonicalizeDirPath(d) === canonicalCurrent);
     let actionLabel = '';
-    if (idx !== -1) {
-      existing.splice(idx, 1);
+    let nextFavorites;
+    if (hasMatch) {
+      nextFavorites = existing.filter((d) => canonicalizeDirPath(d) !== canonicalCurrent);
       actionLabel = '已从快捷目录取消收藏';
     } else {
-      existing.unshift(resolved);
+      nextFavorites = [resolved, ...existing];
       actionLabel = '已收藏到控制面板快捷目录';
     }
-    config.agy.favoriteDirs = existing;
+    config.agy.favoriteDirs = nextFavorites;
     saveConfig(config);
     await replySimple({
       title: '📌 快捷目录已更新',
@@ -806,7 +926,7 @@ export async function handleSlashCommand(
   }
 
   if (cmd === '/git') {
-    const gitInfo = collectGitInfo(chatState.cwd);
+    const gitInfo = await collectGitInfoAsync(chatState.cwd);
     await replyCard(client, {
       messageId,
       card: buildGitStatusCard({ cwd: chatState.cwd, gitInfo }),

@@ -135,6 +135,7 @@ export async function exchangeOAuthCode(config, { code, redirectUri = DEFAULT_OA
   const resp = await fetch(`${apiBase}/open-apis/authen/v2/oauth/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    signal: AbortSignal.timeout(15_000),
     body: JSON.stringify({
       grant_type: 'authorization_code',
       client_id: appId,
@@ -158,7 +159,22 @@ export async function refreshUserAccessToken(config, existingAuth = loadUserAuth
     return refreshInFlight;
   }
   refreshInFlight = (async () => {
-    const auth = existingAuth || loadUserAuth();
+    const diskLatest = loadUserAuth();
+    const auth =
+      diskLatest?.accessToken &&
+      (!existingAuth?.updatedAt || Number(diskLatest.updatedAt || 0) > Number(existingAuth.updatedAt || 0)) &&
+      Number(diskLatest.expiresAt || 0) - Date.now() > 120_000
+        ? diskLatest
+        : existingAuth || diskLatest;
+    if (
+      auth &&
+      existingAuth &&
+      auth !== existingAuth &&
+      auth.accessToken &&
+      Number(auth.expiresAt || 0) - Date.now() > 120_000
+    ) {
+      return auth;
+    }
     if (!auth?.refreshToken) {
       throw makeAuthRequiredError(
         '缺少 refresh_token，请重新运行 `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs auth` 完成飞书用户授权。',
@@ -175,23 +191,36 @@ export async function refreshUserAccessToken(config, existingAuth = loadUserAuth
     const { apiBase } = getOAuthEndpoints(domain);
     stripProcessProxyEnv(config?.feishu?.proxy);
 
-    const resp = await fetch(`${apiBase}/open-apis/authen/v2/oauth/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({
-        grant_type: 'refresh_token',
-        client_id: appId,
-        client_secret: appSecret,
-        refresh_token: auth.refreshToken,
-      }),
-    });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok && !data?.error && data?.code === undefined) {
-      throw new Error(`Feishu OAuth refresh HTTP ${resp.status}`);
+    try {
+      const resp = await fetch(`${apiBase}/open-apis/authen/v2/oauth/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          client_id: appId,
+          client_secret: appSecret,
+          refresh_token: auth.refreshToken,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok && !data?.error && data?.code === undefined) {
+        throw new Error(`Feishu OAuth refresh HTTP ${resp.status}`);
+      }
+      const normalized = parseTokenResponsePayload(data, domain, auth.refreshToken);
+      saveUserAuth(normalized);
+      return normalized;
+    } catch (err) {
+      const reloaded = loadUserAuth();
+      if (
+        reloaded?.accessToken &&
+        reloaded.updatedAt > Number(auth.updatedAt || 0) &&
+        Number(reloaded.expiresAt || 0) - Date.now() > 60_000
+      ) {
+        return reloaded;
+      }
+      throw err;
     }
-    const normalized = parseTokenResponsePayload(data, domain, auth.refreshToken);
-    saveUserAuth(normalized);
-    return normalized;
   })();
 
   try {
@@ -275,6 +304,7 @@ export async function runInteractiveOAuthFlow(
     const cleanup = (server) => {
       if (timer) clearTimeout(timer);
       try {
+        server.closeAllConnections?.();
         server.close();
       } catch {
         // Ignore close error
@@ -377,6 +407,7 @@ async function callUserApi(config, method, apiPath, { query = null, body = undef
     const token = await getValidUserAccessToken(config, { forceRefresh: attempt === 1 });
     const resp = await fetch(url.toString(), {
       method,
+      signal: AbortSignal.timeout(15_000),
       headers: {
         Authorization: `Bearer ${token}`,
         ...(body !== undefined ? { 'Content-Type': 'application/json; charset=utf-8' } : {}),

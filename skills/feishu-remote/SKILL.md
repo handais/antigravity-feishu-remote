@@ -28,9 +28,9 @@ cd ~/.gemini/config/plugins/feishu-remote
    - Feishu Task Center v2 (optional, requires user OAuth via `cli.mjs auth` and redirect URI `http://127.0.0.1:18923/callback`): `offline_access`, `task:task:read`, `task:task:write`, `task:tasklist:read`.
 4. Under **事件与回调 (Events & Callbacks)**:
    - **事件配置**: Choose **使用长连接接收事件 (WebSocket Long Connection)** and subscribe to **`im.message.receive_v1`** and **`application.bot.menu_v6`** (for Bot Custom Menu click events).
-   - **回调配置**: Choose **使用长连接接收回调** and subscribe to **`card.action.trigger`** (for interactive Control Panel, Directory Browser (`/dirs`), Quick Prompt Tasks (`/quick`), Git (`/git`), Scopes (`/scopes`), Queue (`/queue`), Retry, Session, Model, and Abort buttons).
+   - **回调配置**: Choose **使用长连接接收回调** and subscribe to **`card.action.trigger`** (for interactive Control Panel, Directory Browser (`/dirs`), Commands & Skills (`/` / `/skills`), Git (`/git`), Scopes (`/scopes`), Queue (`/queue`), Retry, Session, Model, and Abort buttons).
 5. Under **应用能力 → 机器人 → 机器人自定义菜单 (Optional, Recommended)**:
-   - Enable **机器人自定义菜单** (prefer **悬浮菜单**) with shortcut buttons pushing event keys `menu_panel`, `menu_quick`, `menu_dirs`, `menu_new`, `menu_stop` (also supports `menu_git`, `menu_scopes`, `menu_queue`, `menu_mode_temp_full`, `menu_ops`, `menu_reload`, `menu_sessions`, `menu_models`, `menu_mode_full`, `menu_help`) or sending `/panel`, `/quick`, `/dirs`, `/new`, `/stop`.
+   - Enable **机器人自定义菜单** (prefer **悬浮菜单**) with shortcut buttons pushing event keys `menu_panel`, `menu_commands`, `menu_new`, `menu_stop` (also supports `menu_skills`, `menu_dirs`, `menu_git`, `menu_scopes`, `menu_queue`, `menu_mode_temp_full`, `menu_ops`, `menu_reload`, `menu_sessions`, `menu_models`, `menu_mode_full`, `menu_help`) or sending `/panel`, `/`, `/new`, `/stop`.
 6. Under **版本管理与发布**, create and publish a version (or enable in test/dev scope).
 
 ## 3. Setup & Manage Daemon (`scripts/cli.mjs`)
@@ -57,8 +57,6 @@ Run commands with `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs`:
   - `--group-policy mention|off|all` (default `mention`)
   - `--stop-hook true|false` (default `true`; desktop completion cards include a `📱 接管此对话` handoff button)
   - `--notify-mode on|away|off` & `--away-seconds <10..3600>` (default `on`, `120`s; `away` suppresses desktop completion notifications while active at the keyboard)
-  - `--add-quick "按钮名称|提示词"` (repeatable; adds custom one-tap quick task buttons)
-  - `--reset-quick` (resets quick tasks back to built-in defaults)
   - Note: in `accept-edits` mode, remote tasks can read/edit files but shell/MCP calls may be denied; tap `⚡ 临时全权30m` (or send `/mode full 30m`, auto-reverts after expiry) or `⚡ 常驻全权` in the Control Panel when remote shell/MCP execution is needed.
 - **Start / Stop / Restart background daemon** (`launchd` on macOS, `systemd --user` on Linux):
   ```bash
@@ -75,6 +73,7 @@ Run commands with `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs`:
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs read-doc "<URL_OR_TOKEN>"
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs write-doc --title "Report" --file ./report.md
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs desktop --limit 5
+  node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs handoff --copy cli
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs restart
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs stop
   ```
@@ -84,12 +83,11 @@ Run commands with `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs`:
   - `scopes` / `read-doc` / `write-doc`: inspect Feishu Open Platform scopes and read/write Feishu Docx/Wiki documents from CLI (MCP tools `feishu_read_doc` and `feishu_write_doc` are also exposed via `mcp-server.mjs`).
   - `desktop`: read-only scan/FTS5 search of local CLI & Desktop App conversations (`--query`, `--filter`, `--limit`).
   - `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs send-file <path> [--as-file]`: upload and send a local image or file back to Feishu (requires `im:resource` scope).
-  - Inside Feishu chat: supports CardKit 2.0 typewriter streaming (auto-fallback to `patchCard`), message completion reaction (`DONE`), per-chat FIFO task queuing (`/queue`), quoted message context fetching, auto-reading shared `feishu.cn/docx/...` & `/wiki/...` URLs, `/doc`, `/git`, `/scopes`, `/effort`, `/timeout`, `/sessions` + `/desktop` (`/pc`) proactive local conversation scanning & dual-track takeover, temporary full mode (`/mode full 30m`), desktop Stop-card `📱 接管此对话` handoff, retry buttons on failed/aborted cards, inbound/outbound media (`/send`), fuzzy `/cd <keyword>`, and graphical `/quick` management.
+  - Inside Feishu chat: supports CardKit 2.0 typewriter streaming (auto-fallback to `patchCard`), message completion reaction (`DONE`), per-chat FIFO task queuing (`/queue`), quoted message context fetching, auto-reading shared `feishu.cn/docx/...` & `/wiki/...` URLs, `/doc`, `/git`, `/scopes`, `/effort`, `/timeout`, `/sessions` + `/desktop` (`/pc`) dual-option takeover (`🧵 新开话题接管` via `/topic` vs current-chat takeover, plus `/unlink` to stop auto-routing), `/handoff` (`/back`) mobile-to-desktop return handoff (clipboard + `feishu_list_mobile_sessions` / `feishu_read_mobile_session` MCP sync + origin drift detection), `/guard` (`PreToolUse` risky shell command Feishu card approval), turn diff/modified-file buttons, temporary full mode (`/mode full 30m`), desktop Stop-card reply preview + smart topic-thread return routing, retry buttons on failed/aborted cards, inbound/outbound media (`/send`), fuzzy `/cd <keyword>`, and `/` / `/skills` (`menu_commands`) + `/agy <raw>` passthrough.
 - **Send a test card** (after first user has bound or `--receive-id` is given):
   ```bash
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs test-send
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs test-send --panel
-  node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs test-send --quick
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs test-send --dirs
   ```
 

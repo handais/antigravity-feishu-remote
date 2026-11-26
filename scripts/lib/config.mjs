@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { writePrivateJsonAtomic } from './io-utils.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -89,24 +90,17 @@ export function getLogPaths() {
   };
 }
 
-export const DEFAULT_QUICK_PROMPTS = [
-  {
-    label: '📋 总结当前项目',
-    prompt: '请快速概览当前工作目录的项目结构、技术栈和近期重点文件，给出简洁清晰的中文总结。',
-  },
-  {
-    label: '🔍 Git 状态与变更',
-    prompt: '请检查当前目录的 git status、当前分支以及最近 5 条提交记录，如果有未提交修改请简要概括。',
-  },
-  {
-    label: '🧪 运行检查/测试',
-    prompt: '请识别当前项目的构建或测试命令，执行一次基础检查并汇报结果（如有失败请指出原因）。',
-  },
-  {
-    label: '🧹 代码审查建议',
-    prompt: '请检查当前目录中未提交的改动（或最近一次提交），从正确性、边界条件和可维护性角度给出简短审查建议。',
-  },
-];
+export function getApprovalsDir() {
+  return path.join(getConfigDir(), 'approvals');
+}
+
+export function getHandoffsDir() {
+  return path.join(getConfigDir(), 'handoffs');
+}
+
+export function resolveRiskyApprovalEnabled(config) {
+  return String(config?.security?.riskyCommandApproval || 'on').trim().toLowerCase() !== 'off';
+}
 
 export const VALID_NOTIFY_MODES = ['on', 'away', 'off'];
 
@@ -133,6 +127,9 @@ export const DEFAULT_CONFIG = {
     allowedOpenIds: [],
     autoBindFirstUser: true,
     groupPolicy: 'mention',
+    riskyCommandApproval: 'on',
+    approvalTimeoutSeconds: 120,
+    allowExternalMcpTargets: false,
   },
   agy: {
     bin: '',
@@ -141,7 +138,6 @@ export const DEFAULT_CONFIG = {
     defaultModel: '',
     defaultEffort: '',
     favoriteDirs: [],
-    quickPrompts: [],
     proxy: '',
     timeoutSeconds: 3600,
     maxConcurrentRuns: 4,
@@ -149,6 +145,7 @@ export const DEFAULT_CONFIG = {
   notifications: {
     defaultReceiveId: '',
     defaultReceiveIdType: 'open_id',
+    defaultTopicChatId: '',
     stopHookEnabled: true,
     stopNotifyMode: 'on',
     awayIdleSeconds: 120,
@@ -171,33 +168,7 @@ function mergeConfig(base, override) {
   if (!Array.isArray(out.agy.favoriteDirs)) {
     out.agy.favoriteDirs = [];
   }
-  if (!Array.isArray(out.agy.quickPrompts)) {
-    out.agy.quickPrompts = [];
-  } else {
-    out.agy.quickPrompts = out.agy.quickPrompts
-      .filter((item) => item && typeof item === 'object')
-      .map((item) => ({
-        label: String(item.label || '').trim(),
-        prompt: String(item.prompt || '').trim(),
-      }))
-      .filter((item) => item.label && item.prompt);
-  }
   return out;
-}
-
-export function getEffectiveQuickPrompts(config) {
-  const custom = Array.isArray(config?.agy?.quickPrompts) ? config.agy.quickPrompts : [];
-  const valid = custom
-    .filter((item) => item && typeof item === 'object')
-    .map((item) => ({
-      label: String(item.label || '').trim(),
-      prompt: String(item.prompt || '').trim(),
-    }))
-    .filter((item) => item.label && item.prompt);
-  if (valid.length > 0) {
-    return valid;
-  }
-  return DEFAULT_QUICK_PROMPTS.map((item) => ({ ...item }));
 }
 
 export function ensureConfigDir() {
@@ -209,19 +180,6 @@ export function ensureConfigDir() {
     // Ignore on filesystems that don't support chmod
   }
   return dir;
-}
-
-function writePrivateJsonAtomic(targetPath, data) {
-  ensureConfigDir();
-  const tmpPath = `${targetPath}.tmp.${process.pid}.${Date.now()}`;
-  const content = `${JSON.stringify(data, null, 2)}\n`;
-  fs.writeFileSync(tmpPath, content, { encoding: 'utf8', mode: 0o600 });
-  try {
-    fs.chmodSync(tmpPath, 0o600);
-  } catch {
-    // Ignore
-  }
-  fs.renameSync(tmpPath, targetPath);
 }
 
 export function loadConfig() {
@@ -246,12 +204,12 @@ export function saveConfig(cfg) {
 export function loadState() {
   const statePath = getStatePath();
   if (!fs.existsSync(statePath)) {
-    return { chats: {}, lastP2pChatByOpenId: {} };
+    return { chats: {}, lastP2pChatByOpenId: {}, lastTopicChatId: '', panelActionUsage: {} };
   }
   try {
     const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     if (!parsed || typeof parsed !== 'object') {
-      return { chats: {}, lastP2pChatByOpenId: {} };
+      return { chats: {}, lastP2pChatByOpenId: {}, lastTopicChatId: '', panelActionUsage: {} };
     }
     return {
       chats: parsed.chats && typeof parsed.chats === 'object' ? parsed.chats : {},
@@ -259,9 +217,14 @@ export function loadState() {
         parsed.lastP2pChatByOpenId && typeof parsed.lastP2pChatByOpenId === 'object'
           ? parsed.lastP2pChatByOpenId
           : {},
+      lastTopicChatId: String(parsed.lastTopicChatId || '').trim(),
+      panelActionUsage:
+        parsed.panelActionUsage && typeof parsed.panelActionUsage === 'object' && !Array.isArray(parsed.panelActionUsage)
+          ? parsed.panelActionUsage
+          : {},
     };
   } catch {
-    return { chats: {}, lastP2pChatByOpenId: {} };
+    return { chats: {}, lastP2pChatByOpenId: {}, lastTopicChatId: '', panelActionUsage: {} };
   }
 }
 
@@ -273,10 +236,26 @@ export function saveState(state) {
           state.lastP2pChatByOpenId && typeof state.lastP2pChatByOpenId === 'object'
             ? state.lastP2pChatByOpenId
             : {},
+        lastTopicChatId: String(state.lastTopicChatId || '').trim(),
+        panelActionUsage:
+          state.panelActionUsage && typeof state.panelActionUsage === 'object' && !Array.isArray(state.panelActionUsage)
+            ? state.panelActionUsage
+            : {},
       }
-    : { chats: {}, lastP2pChatByOpenId: {} };
+    : { chats: {}, lastP2pChatByOpenId: {}, lastTopicChatId: '', panelActionUsage: {} };
   writePrivateJsonAtomic(getStatePath(), normalized);
   return normalized;
+}
+
+/**
+ * Reload latest state from disk, apply `mutator(state)`, and atomically save back.
+ */
+export function updateState(mutator) {
+  const latest = loadState();
+  if (typeof mutator === 'function') {
+    mutator(latest);
+  }
+  return saveState(latest);
 }
 
 export function detectAgyBin() {

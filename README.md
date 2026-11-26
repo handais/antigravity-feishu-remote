@@ -66,7 +66,7 @@ https://github.com/handais/antigravity-feishu-remote
   4. 进入 **凭证与基础信息** 获取 `App ID` 与 `App Secret`（若点击查看需要验证码/人工复制，请让用户粘贴或仅在本机运行 `cli.mjs setup`，**绝不在对话回复里明文回显 `App Secret`**）。
   5. **先跑 Step 4 启动本地守护进程再保存长连接**：因为飞书后台开启「使用长连接接收事件/回调」时可能会校验当前应用是否已有在线长连接，建议先完成 Step 4 的 `cli.mjs setup` 与 `cli.mjs start`，确保长连接已连上。
   6. 回到网页 **事件与回调**：将「事件配置」和「回调配置」的订阅方式均设为 **使用长连接接收**，添加事件 `im.message.receive_v1`、`application.bot.menu_v6` 与回调 `card.action.trigger`。
-  7. （可选）进入 **机器人自定义菜单** 配置 `menu_panel` / `menu_quick` / `menu_dirs` / `menu_new` / `menu_stop`（响应动作选「推送事件」）。
+  7. （可选）进入 **机器人自定义菜单** 配置 `menu_panel` / `menu_commands` / `menu_new` / `menu_stop`（响应动作选「推送事件」）。
   8. 进入 **版本管理与发布** → 创建版本（可用范围保持仅自己或指定成员）并提交发布（遇到需人工确认/审核提示时由用户确认）。
 
 - **路径 B（纯命令行环境、无浏览器工具）**：
@@ -116,8 +116,9 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
    - **单群多话题并行（话题群模式）**：在飞书「话题群」中按 `chatId#threadRootId` 自动隔离会话，群内每开一个话题即一个独立并行会话（默认全局最多同时执行 4 个并发任务，可通过 `--max-concurrent` 调整），消息、流式卡片、分片与文件回传全部锁回原话题楼。
    - **安全白名单**：默认首次私聊发消息的账号自动绑定为唯一主人（`autoBindFirstUser`），其他陌生私聊直接拦截并提示其 `open_id`。
 2. **飞书常用指令与快捷方式**：
-   - **多页可视化控制面板 + 卡片交互按钮**：可在飞书开放平台开启「机器人自定义菜单」与 `card.action.trigger` 长连接回调，不用记命令直接点按钮操作；支持在主控制面板、目录浏览、快捷任务、最近会话和模型切换之间**原地翻页切换**（子页面均带 `⬅️ 返回面板`）。消息回复卡片内也自带「🆕 新对话」「⚙️ 控制面板」「⚡ 快捷任务」「🗂️ 最近会话」及执行中的「🛑 立即中止」按钮。
-   - `/panel`（或 `/menu`）：打开带快捷按钮的控制面板（一键切换快捷目录/模式/模型、**⚡ 临时全权30m**、**🌿 Git**、**🔐 权限**、目录浏览器、快捷任务、收藏目录、开新对话、**♻️ 安全重启** / **⏪ 快照回滚**）
+   - **多页可视化控制面板 + 卡片交互按钮**：可在飞书开放平台开启「机器人自定义菜单」与 `card.action.trigger` 长连接回调，不用记命令直接点按钮操作；支持在主控制面板、目录浏览、命令与技能、最近会话和模型切换之间**原地翻页切换**（子页面均带 `⬅️ 返回面板`）。消息回复卡片内也自带「🆕 新对话」「⚙️ 控制面板」「🗂️ 最近会话」及执行中的「🛑 立即中止」按钮。
+   - `/panel`（或 `/menu`）：打开带按钮的控制面板（一键切换常用目录/模式/模型、**⚡ 临时全权30m**、**🌿 Git**、**🔐 权限**、目录浏览器、收藏目录、开新对话、**♻️ 安全重启** / **⏪ 快照回滚**）
+   - `/` 或 `/skills`：查看 `agy` 内置命令与本机已安装 Skills 清单（支持一键 `/compact` 及 `/agy <原始命令>` 强制透传）
    - `/git`：零延迟查看当前工作目录 Git 分支、工作区改动及最近 5 条提交（不经大模型）
    - `/scopes`（或 `/perms`）：自检飞书应用各项能力权限授权状态，有待审权限时支持一键向管理员重发审批申请
    - `/queue`：查看和管理当前对话的排队任务列表（支持单条取消或清空）
@@ -128,12 +129,14 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
    - `/check`：仅执行插件脚本代码体检（`node --check` + 导入导出检查），不重启
    - `/snapshot` / `/rollback [快照ID]`：手动保存当前可用快照，或回滚到上一版快照（带确认按钮）
    - `/dirs`：打开交互式**目录浏览卡片**（支持进入子目录、返回上一级、`🏠 ~`、一键 `📌 收藏/取消收藏此目录`、以及点击 `🙈 显示隐藏` 或 `/dirs -a` 切换显示 `.` 开头隐藏目录）
-   - `/quick`：打开**一键快捷任务卡片**，点击按钮直接触发预设 Prompt；支持点击 `🗑️ 管理/删除` 按钮图形化管理，或用 `/quick add 名称 | 提示词`、`/quick del <序号>`、`/quick reset` 自定义或恢复默认
    - `/help`：查看全部命令
    - `/status`：查看当前工作目录、模式（含临时全权倒计时）、模型、队列条数、会话 ID 与运行状态
    - `/new`：开启新对话（清空当前上下文绑定）
    - `/sessions` / `/use <序号|ID>`：查看并切回最近飞书会话（顶部支持一键切换到 **`💻 电脑对话`**）
-   - `/desktop [关键词]`（别名 `/pc`）：只读扫描与全文检索本机 CLI / 桌面端历史对话，预览最近上下文并支持**双轨接管**（CLI 对话 `--conversation` 原生直连；桌面端独立会话自动挂载只读上下文接力，可选 `✅ 接管并切目录` 或 `👀 接管并总结进展`）
+   - `/desktop [关键词]`（别名 `/pc`）：只读扫描与全文检索本机 CLI / 桌面端历史对话，预览最近上下文并支持**双轨接管**（可选 **`🧵 新开话题接管`** 在话题群独立开楼隔离上下文，或 **`📱 当前对话接管`** / **`👀 接管并总结`**）
+   - `/topic [set|clear]` / `/unlink`：查看或绑定「🧵 新开话题接管」的默认话题群；`/unlink` 可结束当前话题楼与电脑端的自动回流追踪
+   - `/handoff [cli|desktop]`（别名 `/back`）：生成手机端回流电脑端的终端 `agy --conversation` 恢复命令与桌面交接提示词（自动写入系统剪贴板与交接快照，并支持桌面端通过 `feishu_read_mobile_session` 无感同步手机进度、自动检测原桌面端分叉）
+   - `/guard [on|off]`（别名 `/approval`）：开关 `PreToolUse` 高危命令飞书审批拦截（默认开启，对 `rm -rf`、`git push --force`、`git reset --hard`、`sudo` 等高危命令弹窗确认，超时 Fail-Closed 拒绝）
    - `/cd <路径或关键词>`（或 `/cwd`）：切换执行目录；支持模糊关键词匹配常用目录并弹出候选按钮
    - `/send <文件路径>`（或 `/sendfile <路径>`）：把本机图片或文件直接发回飞书（加 `--file` 强制按文件发送）
    - `/pin`：收藏 / 取消收藏当前目录到控制面板快捷目录
@@ -147,11 +150,14 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
    - **基础存储与性能治理**：`mcp-server.mjs` 按需懒加载飞书 SDK；守护进程默认 `warn` 级静音，启动及每 24 小时自动原地截断超 5 MB 的日志文件，并限制 `inbox/` 附件 7 天过期与 200 MB 总上限。
 3. **MCP 主动推送与文档/任务工具（`feishu-remote-tools`）**：
    - `feishu_send_message` / `feishu_send_card` / `feishu_send_file`：让桌面端 Antigravity 主动向你手机发汇报或回传本地图片/文件。
-   - `feishu_read_doc` / `feishu_write_doc`：读取飞书云文档/Wiki，或将 Markdown 分析报告直接新建/追加写入飞书云文档。
+   - `feishu_read_doc` / `feishu_write_doc`：读取飞书云文档/Wiki（含正文及划词/全文批注），或将 Markdown 分析报告直接新建/追加写入飞书云文档。
    - `feishu_list_tasks` / `feishu_create_task` / `feishu_complete_task`：查询个人/清单待办、创建或完成飞书 Task v2 任务（需先在飞书后台配置 `http://127.0.0.1:18923/callback` 并运行一次 `cli.mjs auth`）。
+   - `feishu_list_mobile_sessions` / `feishu_read_mobile_session`：在桌面端直接读取你在手机飞书上聊过的 CLI 会话记录、改动文件与最新结论，无需手动翻日志路径。
    - `feishu_bridge_status` / `feishu_manage_bridge`：直接查询或启停桥接后台服务。
-4. **任务完成提醒 & 电脑→手机接力 Hook（`Stop`）**：
-   - 当你在电脑端发起的任务执行结束时，自动给绑定的飞书账号发送完成卡片（带 **`📱 接管此对话`** 与 **`📂 切到此目录`** 按钮，点一下即可在手机飞书无缝续聊电脑端上下文；由飞书桥接拉起的子任务会自动跳过）。
+4. **任务完成提醒 & 电脑→手机接力 Hook（`Stop`） & 高危命令审批（`PreToolUse`）**：
+   - 当你在电脑端发起的任务执行结束时，若该对话已绑定过未关闭的话题楼，通知会自动**静默回流到原话题楼**（附带 `🔄 同步电脑最新进展` 与 `🔓 结束本楼追踪`）；否则发往私聊总收件箱，提供 **`🧵 新开话题接管`** 与 **`📱 当前私聊接管`** 双选项及**最新回复结果预览**。
+   - 当飞书桥接拉起的子任务尝试执行高危 Shell 命令时，`PreToolUse` Hook 自动向飞书推送审批卡片，确认后才放行。
+   - 飞书每轮任务结束后，若修改了本地文件，完成卡片会自动附带 **`🔍 看改动 Diff`**、**`📄 查看改动文件`** 与 **`📥 发到聊天`** 快捷按钮。
 
 ---
 
@@ -174,6 +180,8 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
       "im:message.reactions:read",
       "cardkit:card:write",
       "cardkit:card:read",
+      "docx:document",
+      "docs:permission.member:create",
       "docx:document:readonly",
       "docx:document:write_only",
       "docx:document.block:convert",
@@ -192,22 +200,21 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
      - `cardkit:card:write` / `cardkit:card:read`（CardKit 2.0 打字机流式更新）
      - `im:message.reactions:write_only` / `im:message.reactions:read`（消息表情状态反馈）
      - `im:message:readonly`（读取引用回复的历史消息与卡片内容）
-     - `docx:document:readonly` / `docx:document:write_only` / `docx:document.block:convert` / `wiki:node:read`（飞书云文档与 Wiki 读取/写入）
+     - `docx:document` / `docs:permission.member:create` / `docx:document:readonly` / `docx:document:write_only` / `docx:document.block:convert` / `wiki:node:read`（飞书云文档与 Wiki 读取/创建/写入及自动给主人开协作者权限）
      - `im:message.group_at_msg:readonly`（可选，如需在群里 `@机器人` 使用）
      - `im:message.group_msg`（可选，仅在配合 `--group-policy all` 实现单人话题群免 `@` 直接打字触发时需要）
 4. **事件与回调**：
    - **事件配置**：订阅方式选择 **「使用长连接接收事件」**，添加事件 **`im.message.receive_v1`**（接收消息 v2.0）和 **`application.bot.menu_v6`**（机器人自定义菜单事件，用于响应底部菜单点击）。
-   - **回调配置**：订阅方式选择 **「使用长连接接收回调」**，添加回调 **`card.action.trigger`**（用于响应控制面板、目录浏览、快捷任务、队列、权限、Git、重试等卡片按钮点击）。
+   - **回调配置**：订阅方式选择 **「使用长连接接收回调」**，添加回调 **`card.action.trigger`**（用于响应控制面板、目录浏览、队列、权限、Git、重试等卡片按钮点击）。
 5. **机器人自定义菜单（推荐，不用打字直接点）**：
    - 在 **应用能力 → 机器人 → 机器人自定义菜单** 中开启（推荐「悬浮菜单」或底部菜单）。
    - 每个菜单项推荐把「响应动作」设为 **「推送事件」**，Event Key 可设为：
      - `menu_panel`（打开控制面板）
-     - `menu_quick`（打开一键快捷任务）
-     - `menu_dirs`（打开目录浏览）
+     - `menu_commands`（查看 `agy` 内置命令与本机 Skills 清单，别名 `menu_skills`）
      - `menu_new`（开启新对话）
      - `menu_stop`（中止当前任务）
-     - （也支持 `menu_effort`、`menu_git`、`menu_scopes`、`menu_queue`、`menu_mode_temp_full`、`menu_ops`、`menu_reload`、`menu_sessions`、`menu_models`、`menu_mode_full`、`menu_help`）
-   - 若偏好「发送消息」模式，也可以把动作设为发送 `/panel`、`/quick`、`/dirs`、`/new`、`/stop`。
+     - （也支持 `menu_dirs`、`menu_effort`、`menu_git`、`menu_scopes`、`menu_queue`、`menu_mode_temp_full`、`menu_ops`、`menu_reload`、`menu_sessions`、`menu_models`、`menu_mode_full`、`menu_help`）
+   - 若偏好「发送消息」模式，也可以把动作设为发送 `/panel`、`/`、`/new`、`/stop`。
 6. **版本管理与发布**：创建版本并发布（如果只给自己用，可发布为仅自己/指定测试人员可见）。
 7. 在 **凭证与基础信息** 页面复制 **`App ID`** 和 **`App Secret`**。
 
@@ -263,13 +270,8 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs logs --lines 50
 # 发送测试卡片 / 直接推送控制面板 / 发送本机文件回飞书
 node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs test-send
 node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs test-send --panel
-node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs test-send --quick
 node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs test-send --dirs
 node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs send-file ~/Desktop/screenshot.png
-
-# 添加 / 重置自定义快捷任务按钮
-node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup --add-quick "🔍 查日志|请检查最近错误日志并定位原因"
-node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup --reset-quick
 
 # 代码体检 / 安全重启 / 快照与回滚
 node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs check

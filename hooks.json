@@ -4,7 +4,21 @@
       {
         "type": "command",
         "command": "node ./scripts/stop-notify.mjs",
-        "timeout": 10
+        "timeout": 15
+      }
+    ]
+  },
+  "feishu-risky-command-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/pre-tool-approval.mjs",
+            "timeout": 180
+          }
+        ]
       }
     ]
   }

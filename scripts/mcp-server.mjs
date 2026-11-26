@@ -1,5 +1,3 @@
-import os from 'node:os';
-import path from 'node:path';
 import {
   getPluginRoot,
   loadConfig,
@@ -7,6 +5,8 @@ import {
   maskSecret,
   stripProcessProxyEnv,
 } from './lib/config.mjs';
+import { expandHomePath } from './lib/io-utils.mjs';
+import { isSensitiveFilePath } from './lib/security.mjs';
 import {
   getDaemonStatus,
   readDaemonLogs,
@@ -18,6 +18,9 @@ import {
 let feishuApiPromise = null;
 let feishuDocsPromise = null;
 let feishuTasksPromise = null;
+let mobileHandoffPromise = null;
+let cachedClientKey = '';
+let cachedFeishuClient = null;
 
 function loadFeishuApi() {
   if (!feishuApiPromise) {
@@ -40,6 +43,13 @@ function loadFeishuTasks() {
   return feishuTasksPromise;
 }
 
+function loadMobileHandoff() {
+  if (!mobileHandoffPromise) {
+    mobileHandoffPromise = import('./lib/mobile-handoff.mjs');
+  }
+  return mobileHandoffPromise;
+}
+
 const VALID_CARD_COLORS = new Set([
   'blue',
   'wathet',
@@ -55,18 +65,109 @@ const VALID_CARD_COLORS = new Set([
   'grey',
 ]);
 
-function resolveTarget(args, config) {
-  const receiveId =
-    args?.receive_id ||
-    config.notifications.defaultReceiveId ||
-    config.security.allowedOpenIds?.[0] ||
-    '';
-  const receiveIdType = args?.receive_id_type || config.notifications.defaultReceiveIdType || 'open_id';
+function inferReceiveIdType(receiveId, fallback = 'open_id') {
+  const id = String(receiveId || '').trim();
+  if (id.startsWith('oc_')) return 'chat_id';
+  if (id.startsWith('ou_')) return 'open_id';
+  if (id.includes('@')) return 'email';
+  return fallback || 'open_id';
+}
+
+function collectAllowedTargets(config, state) {
+  const allowedOpenIds = new Set(
+    (Array.isArray(config?.security?.allowedOpenIds) ? config.security.allowedOpenIds : [])
+      .map((id) => String(id || '').trim())
+      .filter(Boolean),
+  );
+  const allowedChatIds = new Set();
+
+  const defaultId = String(config?.notifications?.defaultReceiveId || '').trim();
+  const defaultType = inferReceiveIdType(
+    defaultId,
+    config?.notifications?.defaultReceiveIdType || 'open_id',
+  );
+  if (defaultId) {
+    if (defaultType === 'chat_id') allowedChatIds.add(defaultId);
+    else if (defaultType === 'open_id') allowedOpenIds.add(defaultId);
+  }
+
+  const topicId = String(config?.notifications?.defaultTopicChatId || '').trim();
+  if (topicId) allowedChatIds.add(topicId);
+  if (state?.lastTopicChatId) allowedChatIds.add(String(state.lastTopicChatId).trim());
+
+  for (const chatId of Object.values(state?.lastP2pChatByOpenId || {})) {
+    const clean = String(chatId || '').trim();
+    if (clean) allowedChatIds.add(clean);
+  }
+  for (const key of Object.keys(state?.chats || {})) {
+    const base = String(key || '').split('#')[0].trim();
+    if (base.startsWith('oc_')) {
+      allowedChatIds.add(base);
+    } else if (base.startsWith('ou_') && allowedOpenIds.size > 0 && allowedOpenIds.has(base)) {
+      allowedOpenIds.add(base);
+    }
+  }
+  return { allowedOpenIds, allowedChatIds };
+}
+
+function assertTargetAuthorized(receiveId, receiveIdType, config, state) {
+  if (config?.security?.allowExternalMcpTargets === true) return;
+  const { allowedOpenIds, allowedChatIds } = collectAllowedTargets(config, state);
+  const cleanId = String(receiveId || '').trim();
+  if (receiveIdType === 'open_id' && allowedOpenIds.has(cleanId)) {
+    return;
+  }
+  if (receiveIdType === 'chat_id' && allowedChatIds.has(cleanId)) {
+    return;
+  }
+  const configuredDefault = String(config?.notifications?.defaultReceiveId || '').trim();
+  if (configuredDefault && cleanId === configuredDefault && receiveIdType === inferReceiveIdType(configuredDefault, config?.notifications?.defaultReceiveIdType || 'open_id')) {
+    return;
+  }
+  throw new Error(
+    `Target ${receiveIdType}:${cleanId} is outside authorized Feishu targets (allowedOpenIds / known chats). Set security.allowExternalMcpTargets=true to override.`,
+  );
+}
+
+async function getReusableClient(config) {
+  const { createFeishuClient } = await loadFeishuApi();
+  const key = [
+    config?.feishu?.appId || '',
+    config?.feishu?.appSecret || '',
+    config?.feishu?.domain || 'feishu',
+    config?.feishu?.proxy || '',
+  ].join('|');
+  if (!cachedFeishuClient || cachedClientKey !== key) {
+    cachedFeishuClient = createFeishuClient(config, { quiet: true });
+    cachedClientKey = key;
+  }
+  return cachedFeishuClient;
+}
+
+function resolveTarget(args, config, state = loadState()) {
+  const explicitId = String(args?.receive_id || '').trim();
+  const defaultId = String(config?.notifications?.defaultReceiveId || '').trim();
+  const fallbackOpenId = String(config?.security?.allowedOpenIds?.[0] || '').trim();
+
+  let receiveId = '';
+  let receiveIdType = 'open_id';
+  if (explicitId) {
+    receiveId = explicitId;
+    receiveIdType = String(args?.receive_id_type || '').trim() || inferReceiveIdType(explicitId, config.notifications.defaultReceiveIdType || 'open_id');
+  } else if (defaultId) {
+    receiveId = defaultId;
+    receiveIdType = String(args?.receive_id_type || '').trim() || config.notifications.defaultReceiveIdType || inferReceiveIdType(defaultId, 'open_id');
+  } else if (fallbackOpenId) {
+    receiveId = fallbackOpenId;
+    receiveIdType = String(args?.receive_id_type || '').trim() || 'open_id';
+  }
+
   if (!receiveId) {
     throw new Error(
       'No receive_id provided and no defaultReceiveId or bound allowedOpenIds configured yet.',
     );
   }
+  assertTargetAuthorized(receiveId, receiveIdType, config, state);
   return { receiveId, receiveIdType };
 }
 
@@ -167,6 +268,10 @@ function createMcpServer({ Server, CallToolRequestSchema, ListToolsRequestSchema
           max_chars: {
             type: 'number',
             description: 'Maximum characters to return (default 24000).',
+          },
+          include_comments: {
+            type: 'boolean',
+            description: 'Whether to include inline and document-level comments/annotations (default true).',
           },
         },
         required: ['url_or_token'],
@@ -278,6 +383,52 @@ function createMcpServer({ Server, CallToolRequestSchema, ListToolsRequestSchema
         required: ['action'],
       },
     },
+    {
+      name: 'feishu_list_mobile_sessions',
+      description: 'List recent mobile Feishu remote CLI sessions (strictly read-only), ranked by origin_desktop_id and workspace cwd.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          cwd: {
+            type: 'string',
+            description: 'Optional workspace directory path to prioritize matching mobile sessions.',
+          },
+          origin_desktop_id: {
+            type: 'string',
+            description: 'Optional original Desktop App conversation ID to match sessions handed off from desktop.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum sessions to return (1-30, default 10).',
+          },
+        },
+      },
+    },
+    {
+      name: 'feishu_read_mobile_session',
+      description: 'Read turns, latest assistant reply, modified local files, and desktop return prompt from a mobile Feishu remote session.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          conversation_id: {
+            type: 'string',
+            description: 'Optional mobile CLI conversation ID (full or prefix). If omitted, auto-picks the best match for cwd / origin_desktop_id.',
+          },
+          cwd: {
+            type: 'string',
+            description: 'Optional workspace directory path used to locate the latest mobile session.',
+          },
+          origin_desktop_id: {
+            type: 'string',
+            description: 'Optional original Desktop App conversation ID to match the mobile session.',
+          },
+          max_turns: {
+            type: 'number',
+            description: 'Maximum recent user/assistant turns to include (default 12).',
+          },
+        },
+      },
+    },
   ],
 }));
 
@@ -288,8 +439,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     stripProcessProxyEnv(config.feishu.proxy);
 
     if (name === 'feishu_send_message') {
-      const { createFeishuClient, sendText } = await loadFeishuApi();
-      const client = createFeishuClient(config, { quiet: true });
+      const { sendText } = await loadFeishuApi();
+      const client = await getReusableClient(config);
       const target = resolveTarget(args, config);
       const messageId = await sendText(client, {
         ...target,
@@ -299,8 +450,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === 'feishu_send_card') {
-      const { buildCard, createFeishuClient, sanitizeForFeishuMarkdown, sendCard } = await loadFeishuApi();
-      const client = createFeishuClient(config, { quiet: true });
+      const { buildCard, sanitizeForFeishuMarkdown, sendCard } = await loadFeishuApi();
+      const client = await getReusableClient(config);
       const target = resolveTarget(args, config);
       const template = VALID_CARD_COLORS.has(args.color) ? args.color : 'blue';
       const card = buildCard({
@@ -313,18 +464,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === 'feishu_send_file') {
-      const { createFeishuClient, sendLocalMedia } = await loadFeishuApi();
-      const client = createFeishuClient(config, { quiet: true });
-      const target = resolveTarget(args, config);
+      const { sendLocalMedia } = await loadFeishuApi();
       const rawPath = String(args.file_path || '').trim();
       if (!rawPath) {
         return toolResult('file_path is required.', true);
       }
-      const resolvedPath = rawPath === '~'
-        ? os.homedir()
-        : rawPath.startsWith('~/')
-          ? path.join(os.homedir(), rawPath.slice(2))
-          : path.resolve(rawPath);
+      const resolvedPath = expandHomePath(rawPath);
+      if (isSensitiveFilePath(resolvedPath)) {
+        return toolResult(`Refused to send sensitive file for security protection: ${resolvedPath}`, true);
+      }
+      const client = await getReusableClient(config);
+      const target = resolveTarget(args, config);
       const sent = await sendLocalMedia(client, {
         ...target,
         filePath: resolvedPath,
@@ -334,29 +484,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === 'feishu_read_doc') {
-      const [{ createFeishuClient }, { readFeishuDoc }] = await Promise.all([
-        loadFeishuApi(),
-        loadFeishuDocs(),
-      ]);
-      const client = createFeishuClient(config, { quiet: true });
+      const { readFeishuDoc } = await loadFeishuDocs();
+      const client = await getReusableClient(config);
       const target = String(args.url_or_token || '').trim();
       if (!target) {
         return toolResult('url_or_token is required.', true);
       }
       const maxChars = typeof args.max_chars === 'number' ? args.max_chars : 24000;
+      const includeComments = args.include_comments !== false;
       const doc = await readFeishuDoc(client, target, {
         maxChars,
         domain: config.feishu.domain,
+        includeComments,
       });
       return toolResult({ ok: true, ...doc });
     }
 
     if (name === 'feishu_write_doc') {
-      const [{ createFeishuClient }, { writeFeishuDoc }] = await Promise.all([
-        loadFeishuApi(),
-        loadFeishuDocs(),
-      ]);
-      const client = createFeishuClient(config, { quiet: true });
+      const { writeFeishuDoc } = await loadFeishuDocs();
+      const client = await getReusableClient(config);
       const markdown = String(args.markdown || '').trim();
       if (!markdown) {
         return toolResult('markdown is required.', true);
@@ -366,6 +512,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         config.notifications.defaultReceiveId ||
         config.security.allowedOpenIds?.[0] ||
         '';
+      if (grantOpenId) {
+        assertTargetAuthorized(grantOpenId, 'open_id', config, loadState());
+      }
       const doc = await writeFeishuDoc(client, {
         title: String(args.title || '').trim(),
         markdown,
@@ -451,6 +600,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === 'feishu_manage_bridge') {
       const action = args.action;
+      if (process.env.FEISHU_REMOTE_BRIDGE_CHILD === '1' && (action === 'stop' || action === 'restart')) {
+        return toolResult(
+          'Refused to stop/restart the Feishu bridge daemon from inside a bridge-spawned child session (doing so would terminate your own parent process). Ask the user to send `/reload` in Feishu instead.',
+          true,
+        );
+      }
       if (action === 'start') {
         return toolResult({ ok: true, result: startDaemon(), status: getDaemonStatus() });
       }
@@ -465,6 +620,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return toolResult({ ok: true, ...readDaemonLogs(lines) });
       }
       return toolResult(`Unsupported action: ${action}`, true);
+    }
+
+    if (name === 'feishu_list_mobile_sessions') {
+      const { listMobileSessions } = await loadMobileHandoff();
+      const sessions = listMobileSessions({
+        cwd: typeof args.cwd === 'string' ? args.cwd : '',
+        originDesktopId: typeof args.origin_desktop_id === 'string' ? args.origin_desktop_id : '',
+        limit: typeof args.limit === 'number' ? args.limit : 10,
+      });
+      return toolResult({ ok: true, count: sessions.length, sessions });
+    }
+
+    if (name === 'feishu_read_mobile_session') {
+      const { readMobileSession } = await loadMobileHandoff();
+      const detail = readMobileSession({
+        conversationId: typeof args.conversation_id === 'string' ? args.conversation_id : '',
+        cwd: typeof args.cwd === 'string' ? args.cwd : '',
+        originDesktopId: typeof args.origin_desktop_id === 'string' ? args.origin_desktop_id : '',
+        maxTurns: typeof args.max_turns === 'number' ? args.max_turns : 12,
+      });
+      return toolResult({ ok: Boolean(detail.found), ...detail }, !detail.found);
     }
 
     return toolResult(`Unknown tool: ${name}`, true);

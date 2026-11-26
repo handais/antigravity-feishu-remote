@@ -1,7 +1,13 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { VALID_EFFORTS, VALID_MODES } from './agy-runner.mjs';
+import { expandHomePath } from './io-utils.mjs';
+
+const execFileAsync = promisify(execFile);
+export { expandHomePath };
 import {
   buildCard,
   buildOpsCard,
@@ -19,9 +25,17 @@ export function normalizeTempMinutes(raw, fallback = 30) {
   return Math.max(1, Math.min(240, Math.round(n)));
 }
 
-export function stripMentions(text) {
-  return String(text || '')
-    .replace(/@_user_\d+/g, '')
+export function stripMentions(text, mentions = []) {
+  let out = String(text || '').replace(/@_user_\d+/g, '');
+  if (Array.isArray(mentions) && mentions.length > 0) {
+    for (const m of mentions) {
+      const name = String(m?.name || '').trim();
+      if (!name) continue;
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      out = out.replace(new RegExp(`@${escaped}(?=\\s|$)`, 'g'), '');
+    }
+  }
+  return out
     .replace(/\s+/g, (m) => (m.includes('\n') ? m : ' '))
     .trim();
 }
@@ -60,6 +74,9 @@ export function getOrCreateChatState(state, chatId, config) {
       effort: parentState?.effort !== undefined ? parentState.effort : (config.agy.defaultEffort || ''),
       recentConversations: [],
       pendingHandoff: null,
+      originDesktopSession: null,
+      lastTurnArtifacts: null,
+      topicClosed: false,
       fullExpiresAt: 0,
       fullRevertMode: baseMode,
       lastActiveAt: Date.now(),
@@ -77,9 +94,79 @@ export function getOrCreateChatState(state, chatId, config) {
     if (state.chats[chatId].pendingHandoff === undefined) {
       state.chats[chatId].pendingHandoff = null;
     }
+    if (state.chats[chatId].originDesktopSession === undefined) {
+      state.chats[chatId].originDesktopSession = null;
+    }
+    if (state.chats[chatId].lastTurnArtifacts === undefined) {
+      state.chats[chatId].lastTurnArtifacts = null;
+    }
+    if (state.chats[chatId].topicClosed === undefined) {
+      state.chats[chatId].topicClosed = false;
+    }
     state.chats[chatId].lastActiveAt = Date.now();
   }
   return state.chats[chatId];
+}
+
+export function resolveDefaultTopicChatId(state, config, currentChatId = '', isTopicThread = false) {
+  if (isTopicThread && currentChatId) {
+    return String(currentChatId).trim();
+  }
+  const configured = String(config?.notifications?.defaultTopicChatId || '').trim();
+  if (configured) {
+    return configured;
+  }
+  const remembered = String(state?.lastTopicChatId || '').trim();
+  if (remembered) {
+    return remembered;
+  }
+  let bestChatId = '';
+  let bestActiveAt = -1;
+  for (const [key, info] of Object.entries(state?.chats || {})) {
+    if (!key.includes('#')) continue;
+    const { chatId } = parseSessionKey(key);
+    if (!chatId) continue;
+    const activeAt = Number(info?.lastActiveAt || 0);
+    if (activeAt > bestActiveAt) {
+      bestActiveAt = activeAt;
+      bestChatId = chatId;
+    }
+  }
+  return bestChatId;
+}
+
+export function findBoundTopicForConversation(state, conversationId) {
+  const id = String(conversationId || '').trim();
+  if (!id) return null;
+
+  let best = null;
+  let bestActiveAt = -1;
+  for (const [key, info] of Object.entries(state?.chats || {})) {
+    if (!key.includes('#') || !info || info.topicClosed) continue;
+    const { chatId, threadRootId } = parseSessionKey(key);
+    if (!chatId || !threadRootId) continue;
+
+    let matchType = '';
+    if (info.conversationId === id) {
+      matchType = 'cli';
+    } else if (info.originDesktopSession?.id === id || info.pendingHandoff?.id === id) {
+      matchType = 'desktop';
+    }
+    if (!matchType) continue;
+
+    const activeAt = Number(info.lastActiveAt || 0);
+    if (!best || activeAt > bestActiveAt) {
+      bestActiveAt = activeAt;
+      best = {
+        sessionKey: key,
+        chatId,
+        threadRootId,
+        chatState: info,
+        matchType,
+      };
+    }
+  }
+  return best;
 }
 
 export function enforceTempFullExpiry(state, chatState) {
@@ -95,25 +182,29 @@ export function enforceTempFullExpiry(state, chatState) {
   return { expired: false, previousMode: chatState?.mode || '', revertedTo: chatState?.mode || '' };
 }
 
-export function recordRecentConversation(chatState, conversationId, prompt) {
+export function recordRecentConversation(chatState, conversationId, prompt, meta = {}) {
   if (!conversationId) return;
   const list = Array.isArray(chatState.recentConversations) ? chatState.recentConversations : [];
+  const existing = list.find((item) => item.id === conversationId);
   const summary = String(prompt || '').replace(/\s+/g, ' ').trim().slice(0, 48);
   const filtered = list.filter((item) => item.id !== conversationId);
-  filtered.unshift({
+  const entry = {
     id: conversationId,
     summary,
     updatedAt: new Date().toISOString(),
-  });
+  };
+  const resolvedCwd = meta.cwd || existing?.cwd || chatState?.cwd || '';
+  const originDesktopId = meta.originDesktopId !== undefined
+    ? meta.originDesktopId
+    : (existing?.originDesktopId || '');
+  const originDesktopTitle = meta.originDesktopTitle !== undefined
+    ? meta.originDesktopTitle
+    : (existing?.originDesktopTitle || '');
+  if (resolvedCwd) entry.cwd = resolvedCwd;
+  if (originDesktopId) entry.originDesktopId = originDesktopId;
+  if (originDesktopTitle) entry.originDesktopTitle = originDesktopTitle;
+  filtered.unshift(entry);
   chatState.recentConversations = filtered.slice(0, 10);
-}
-
-export function expandHomePath(inputPath, baseCwd) {
-  const trimmed = String(inputPath || '').trim();
-  if (!trimmed) return baseCwd;
-  if (trimmed === '~') return os.homedir();
-  if (trimmed.startsWith('~/')) return path.join(os.homedir(), trimmed.slice(2));
-  return path.resolve(baseCwd || os.homedir(), trimmed);
 }
 
 export function formatUptime(ms) {
@@ -219,6 +310,270 @@ export function collectGitInfo(cwd) {
   };
 }
 
+/**
+ * Collect git diff (or file metadata for non-git workspaces) for files touched in a turn.
+ */
+export function collectTurnDiff(cwd, files = [], { maxChars = 4200 } = {}) {
+  const baseCwd = cwd || process.cwd();
+  const normalizedFiles = [...new Set((Array.isArray(files) ? files : []).filter(Boolean))];
+  const existingFiles = [];
+  for (const f of normalizedFiles) {
+    try {
+      const abs = path.isAbsolute(f) ? f : path.resolve(baseCwd, f);
+      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+        const st = fs.statSync(abs);
+        existingFiles.push({
+          path: abs,
+          name: path.basename(abs),
+          sizeBytes: st.size,
+          mtimeIso: st.mtime.toISOString(),
+        });
+      }
+    } catch {
+      // Ignore inaccessible file
+    }
+  }
+
+  let isRepo = false;
+  try {
+    execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: baseCwd,
+      encoding: 'utf8',
+      timeout: 3000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    isRepo = true;
+  } catch {
+    isRepo = false;
+  }
+
+  if (!isRepo) {
+    return {
+      isRepo: false,
+      stat: '',
+      diff: '',
+      truncated: false,
+      untrackedFiles: [],
+      existingFiles,
+    };
+  }
+
+  const relTargets = [];
+  for (const f of normalizedFiles) {
+    const abs = path.isAbsolute(f) ? f : path.resolve(baseCwd, f);
+    const rel = path.relative(baseCwd, abs);
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+      relTargets.push(rel);
+    }
+  }
+  const pathArgs = relTargets.length > 0 ? ['--', ...relTargets] : [];
+
+  let stat = '';
+  let diff = '';
+  let untrackedFiles = [];
+  try {
+    stat = execFileSync('git', ['diff', '--stat', ...pathArgs], {
+      cwd: baseCwd,
+      encoding: 'utf8',
+      timeout: 4000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    stat = '';
+  }
+  try {
+    diff = execFileSync('git', ['diff', '--no-color', ...pathArgs], {
+      cwd: baseCwd,
+      encoding: 'utf8',
+      timeout: 4000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    diff = '';
+  }
+  try {
+    const statusOut = execFileSync('git', ['status', '--porcelain', ...pathArgs], {
+      cwd: baseCwd,
+      encoding: 'utf8',
+      timeout: 3000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    untrackedFiles = statusOut
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('?? '))
+      .map((line) => line.slice(3).trim())
+      .filter(Boolean);
+  } catch {
+    untrackedFiles = [];
+  }
+
+  const limit = Math.max(400, Number(maxChars) || 4200);
+  const truncated = diff.length > limit;
+  if (truncated) {
+    diff = `${diff.slice(0, limit)}\n...(diff 较长已截断，完整内容请回电脑查看)`;
+  }
+
+  return {
+    isRepo: true,
+    stat,
+    diff,
+    truncated,
+    untrackedFiles,
+    existingFiles,
+  };
+}
+
+/**
+ * Asynchronous git branch/status/log inspection for interactive daemon handlers.
+ */
+export async function collectGitInfoAsync(cwd) {
+  try {
+    await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd,
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+  } catch (err) {
+    return {
+      isRepo: false,
+      branch: '',
+      statusLines: [],
+      commits: [],
+      error: String(err?.stderr || err?.message || '当前目录不是 Git 仓库').trim(),
+    };
+  }
+
+  let statusRaw = '';
+  try {
+    const res = await execFileAsync('git', ['status', '--short', '--branch'], {
+      cwd,
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+    statusRaw = res.stdout || '';
+  } catch (err) {
+    return {
+      isRepo: true,
+      branch: '',
+      statusLines: [],
+      commits: [],
+      error: String(err?.stderr || err?.message || 'git status 失败').trim(),
+    };
+  }
+
+  let logRaw = '';
+  try {
+    const res = await execFileAsync('git', ['log', '-n', '5', '--oneline'], {
+      cwd,
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+    logRaw = res.stdout || '';
+  } catch {
+    logRaw = '';
+  }
+
+  const lines = statusRaw.split('\n').map((l) => l.trimEnd()).filter(Boolean);
+  const branchHeader = lines[0]?.startsWith('## ') ? lines[0].slice(3).trim() : '';
+  const statusLines = lines[0]?.startsWith('## ') ? lines.slice(1) : lines;
+  const commits = logRaw.split('\n').map((l) => l.trim()).filter(Boolean);
+
+  return {
+    isRepo: true,
+    branch: branchHeader,
+    statusLines,
+    commits,
+    error: '',
+  };
+}
+
+/**
+ * Asynchronous git diff collector for interactive card handlers.
+ */
+export async function collectTurnDiffAsync(cwd, files = [], { maxChars = 4200 } = {}) {
+  const baseCwd = cwd || process.cwd();
+  const normalizedFiles = [...new Set((Array.isArray(files) ? files : []).filter(Boolean))];
+  const existingFiles = [];
+  for (const f of normalizedFiles) {
+    try {
+      const abs = path.isAbsolute(f) ? f : path.resolve(baseCwd, f);
+      const st = await fs.promises.stat(abs);
+      if (st.isFile()) {
+        existingFiles.push({
+          path: abs,
+          name: path.basename(abs),
+          sizeBytes: st.size,
+          mtimeIso: st.mtime.toISOString(),
+        });
+      }
+    } catch {
+      // Ignore inaccessible file
+    }
+  }
+
+  let isRepo = false;
+  try {
+    await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: baseCwd,
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+    isRepo = true;
+  } catch {
+    isRepo = false;
+  }
+
+  if (!isRepo) {
+    return {
+      isRepo: false,
+      stat: '',
+      diff: '',
+      truncated: false,
+      untrackedFiles: [],
+      existingFiles,
+    };
+  }
+
+  const relTargets = [];
+  for (const f of normalizedFiles) {
+    const abs = path.isAbsolute(f) ? f : path.resolve(baseCwd, f);
+    const rel = path.relative(baseCwd, abs);
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+      relTargets.push(rel);
+    }
+  }
+  const pathArgs = relTargets.length > 0 ? ['--', ...relTargets] : [];
+
+  const [statRes, diffRes, statusRes] = await Promise.all([
+    execFileAsync('git', ['diff', '--stat', ...pathArgs], { cwd: baseCwd, encoding: 'utf8', timeout: 4000 }).catch(() => ({ stdout: '' })),
+    execFileAsync('git', ['diff', '--no-color', ...pathArgs], { cwd: baseCwd, encoding: 'utf8', timeout: 4000 }).catch(() => ({ stdout: '' })),
+    execFileAsync('git', ['status', '--porcelain', ...pathArgs], { cwd: baseCwd, encoding: 'utf8', timeout: 3000 }).catch(() => ({ stdout: '' })),
+  ]);
+
+  const stat = (statRes.stdout || '').trim();
+  let diff = (diffRes.stdout || '').trim();
+  const untrackedFiles = (statusRes.stdout || '')
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('?? '))
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean);
+
+  const limit = Math.max(400, Number(maxChars) || 4200);
+  const truncated = diff.length > limit;
+  if (truncated) {
+    diff = `${diff.slice(0, limit)}\n...(diff 较长已截断，完整内容请回电脑查看)`;
+  }
+
+  return {
+    isRepo: true,
+    stat,
+    diff,
+    truncated,
+    untrackedFiles,
+    existingFiles,
+  };
+}
+
 export function formatHelpMarkdown() {
   return [
     '直接发送任务描述（支持截图/文件/语音、引用历史消息回复、直接贴飞书文档/知识库链接）即可在 Mac 本机执行。',
@@ -233,9 +588,12 @@ export function formatHelpMarkdown() {
     '- `/ops`（或 `/backups`）：打开运维与自迭代面板（安全重启 / 代码体检 / 快照回滚）',
     '- `/reload` / `/check` / `/snapshot` / `/rollback [ID]`：代码检查、快照、安全重启与回滚',
     '- `/dirs` / `/cd <路径或关键词>` / `/pin`：浏览、模糊匹配或收藏工作目录',
-    '- `/quick`：打开一键快捷任务卡片（支持按钮管理、`/quick add`、`/quick del`、`/quick reset`）',
+    '- `/` 或 `/skills`（悬浮菜单 `menu_commands`）：查看 `agy` 内置命令与本机已安装 Skills 清单（支持一键 `/compact`、`/agy <原始命令>` 强制透传）',
     '- `/status` / `/new` / `/sessions` / `/use <序号|ID>` / `/help`',
     '- `/desktop [关键词]`（别名 `/pc`）：扫描或全文搜索电脑端历史对话并预览接管',
+    '- `/topic [set|clear]` / `/unlink`：查看/设置默认接管话题群，或结束当前话题楼与电脑端的自动回流追踪',
+    '- `/handoff [cli|desktop]`（别名 `/back`）：生成回电脑端继续的命令与交接提示词（自动复制剪贴板）',
+    '- `/guard [on|off]`（别名 `/approval`）：查看或开关高危命令（如 `rm -rf`、`git push --force`）飞书确认审批',
     '- `/send <文件路径>`（可加 `--file`）：上传并回传本机图片或文件到飞书',
     `- \`/mode [模式|full 30m]\`：切换权限模式（\`${VALID_MODES.join('` / `')}\`，支持 \`/mode full 30m\` 临时授权自动降权）`,
     '- `/timeout [分钟|0]`：查看或设置单轮任务超时时间（如 `/timeout 60`，`/timeout 0` 表示不限时）',

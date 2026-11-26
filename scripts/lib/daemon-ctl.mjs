@@ -21,6 +21,25 @@ export function getSystemdUnitPath() {
   return path.join(os.homedir(), '.config', 'systemd', 'user', SYSTEMD_SERVICE_NAME);
 }
 
+/**
+ * Resolve a stable symlinked Node binary path on macOS so Homebrew Cellar upgrades don't break launchd plists.
+ */
+export function resolveStableNodeBin(execPath = process.execPath, platform = process.platform) {
+  const raw = String(execPath || process.execPath).trim();
+  if (platform === 'darwin' && /\/Cellar\/node\//i.test(raw)) {
+    for (const candidate of ['/opt/homebrew/bin/node', '/usr/local/bin/node']) {
+      try {
+        if (fs.existsSync(candidate)) {
+          return candidate;
+        }
+      } catch {
+        // Try next candidate
+      }
+    }
+  }
+  return raw;
+}
+
 function escapeXml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -115,6 +134,7 @@ export function startDaemon() {
   ensureConfigDir();
   const { outLog, errLog, pidFile } = getLogPaths();
   const daemonScript = path.join(getPluginRoot(), 'scripts', 'bridge-daemon.mjs');
+  const nodeBin = resolveStableNodeBin(process.execPath, process.platform);
   const pathEnv = buildPathEnv();
 
   if (process.platform === 'darwin') {
@@ -123,7 +143,7 @@ export function startDaemon() {
     fs.writeFileSync(
       plistPath,
       buildLaunchdPlist({
-        nodeBin: process.execPath,
+        nodeBin,
         daemonScript,
         outLog,
         errLog,
@@ -154,7 +174,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${process.execPath} ${daemonScript}
+ExecStart="${nodeBin}" "${daemonScript}"
 Restart=always
 RestartSec=3
 StandardOutput=append:${outLog}

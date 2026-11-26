@@ -11,12 +11,15 @@ process.env.FEISHU_REMOTE_CONFIG_DIR = tempConfigDir;
 const {
   DEFAULT_CONFIG,
   clearUserAuth,
+  getApprovalsDir,
   getConfigPath,
+  getHandoffsDir,
   getPluginRoot,
   loadConfig,
   loadState,
   loadUserAuth,
   maskSecret,
+  resolveRiskyApprovalEnabled,
   resolveStopNotifyMode,
   saveConfig,
   saveState,
@@ -48,6 +51,7 @@ const {
 const {
   buildDesktopHandoffContext,
   extractLatestAssistantReply,
+  extractStopReplyPreview,
   extractTranscriptTurns,
   getDesktopSessionDetail,
   isSubagentConversation,
@@ -81,16 +85,43 @@ const {
   runPreflightCheck,
 } = await import('./lib/self-ops.mjs');
 const {
+  collectTurnDiff,
   getOrCreateChatState,
   makeSessionKey,
   parseSessionKey,
   parseTimeoutArg,
 } = await import('./lib/bridge-helpers.mjs');
 const {
+  extractModifiedFilePath,
   formatToolStatusMarkdown,
   formatUsageSummary,
   isTransientStartupRace,
+  resolvePromptWithHandoff,
+  shouldClearPendingHandoff,
 } = await import('./lib/task-runner.mjs');
+const {
+  buildCliResumeCommand,
+  buildDesktopReturnPrompt,
+  buildHandoffCard,
+  checkOriginDesktopDrift,
+  copyToSystemClipboard,
+  listMobileSessions,
+  readMobileSession,
+  writeHandoffSnapshot,
+} = await import('./lib/mobile-handoff.mjs');
+const {
+  buildApprovalCard,
+  classifyCommandRisk,
+  cleanupStaleApprovals,
+  createApprovalRequest,
+  readApprovalDecision,
+  readApprovalRequest,
+  waitForApprovalDecision,
+  writeApprovalDecision,
+} = await import('./lib/command-guard.mjs');
+const {
+  handleCardAction,
+} = await import('./lib/card-actions.mjs');
 
 const pluginRoot = getPluginRoot();
 
@@ -125,9 +156,9 @@ function stripNodeExperimentalWarnings(stderr = '') {
     .trim();
 }
 
-async function testMcpStdio() {
+async function testMcpStdio(extraEnv = {}) {
   const child = spawn(process.execPath, [path.join(pluginRoot, 'scripts', 'mcp-server.mjs')], {
-    env: { ...process.env, FEISHU_REMOTE_CONFIG_DIR: tempConfigDir },
+    env: { ...process.env, FEISHU_REMOTE_CONFIG_DIR: tempConfigDir, ...extraEnv },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stderr = '';
@@ -170,9 +201,11 @@ async function testMcpStdio() {
       'feishu_bridge_status',
       'feishu_complete_task',
       'feishu_create_task',
+      'feishu_list_mobile_sessions',
       'feishu_list_tasks',
       'feishu_manage_bridge',
       'feishu_read_doc',
+      'feishu_read_mobile_session',
       'feishu_send_card',
       'feishu_send_file',
       'feishu_send_message',
@@ -188,6 +221,25 @@ async function testMcpStdio() {
     assert.equal(parsed.configured, true);
     assert.ok(!text.includes('super_secret_token_987654'), 'Secret must never appear raw in MCP status');
     assert.equal(parsed.feishu.appSecret, 'sup***654');
+
+    const mobileListRes = await rpc(4, 'tools/call', {
+      name: 'feishu_list_mobile_sessions',
+      arguments: { origin_desktop_id: 'desk-1' },
+    });
+    const mobileListData = JSON.parse(mobileListRes.result.content[0].text);
+    assert.equal(mobileListData.ok, true);
+    assert.ok(mobileListData.count >= 1);
+    assert.equal(mobileListData.sessions[0].conversationId, 'cli-1');
+
+    const mobileReadRes = await rpc(5, 'tools/call', {
+      name: 'feishu_read_mobile_session',
+      arguments: { origin_desktop_id: 'desk-1' },
+    });
+    const mobileReadData = JSON.parse(mobileReadRes.result.content[0].text);
+    assert.equal(mobileReadData.ok, true);
+    assert.equal(mobileReadData.conversationId, 'cli-1');
+    assert.ok(mobileReadData.cliResumeCommand.includes('--conversation cli-1'));
+    assert.ok(mobileReadData.desktopHandoffPrompt.includes('[手机飞书端进展回流]'));
   } finally {
     rl.close();
     child.kill('SIGTERM');
@@ -431,8 +483,12 @@ try {
   // 4e. Self-ops preflight and snapshot
   const preflight = runPreflightCheck();
   assert.equal(preflight.ok, true);
-  assert.equal(preflight.checkedFiles.length, 19);
+  assert.equal(preflight.checkedFiles.length, 30);
   for (const rel of [
+    'scripts/pre-tool-approval.mjs',
+    'scripts/lib/io-utils.mjs',
+    'scripts/lib/security.mjs',
+    'scripts/lib/feishu-cards.mjs',
     'scripts/lib/cardkit-stream.mjs',
     'scripts/lib/feishu-docs.mjs',
     'scripts/lib/feishu-tasks.mjs',
@@ -441,6 +497,13 @@ try {
     'scripts/lib/slash-commands.mjs',
     'scripts/lib/card-actions.mjs',
     'scripts/lib/desktop-sessions.mjs',
+    'scripts/lib/mobile-handoff.mjs',
+    'scripts/lib/command-guard.mjs',
+    'scripts/lib/actions/desktop.mjs',
+    'scripts/lib/actions/artifacts.mjs',
+    'scripts/lib/actions/ops.mjs',
+    'scripts/lib/actions/tasks.mjs',
+    'scripts/lib/actions/workspace.mjs',
   ]) {
     assert.ok(preflight.checkedFiles.includes(rel), `Missing in preflight: ${rel}`);
   }
@@ -982,8 +1045,313 @@ try {
   assert.equal(childEnv.FEISHU_REMOTE_BRIDGE_CHILD, '1');
   assert.ok(childEnv.PATH.split(path.delimiter).length >= 1);
 
-  // 6. mcp-server.mjs stdio JSON-RPC handshake
-  await testMcpStdio();
+  // 6. P0 Mobile handoff, P1 artifacts/retry/stop-preview, P2 command guard & PreToolUse hook
+  fs.writeFileSync(
+    path.join(cliAppDir, 'brain', 'cli-1', '.system_generated', 'logs', 'transcript.jsonl'),
+    [
+      JSON.stringify({ step_index: 1, type: 'USER_INPUT', created_at: '2026-11-23T06:00:00Z', content: '<USER_REQUEST>\n在手机上继续优化插件\n</USER_REQUEST>' }),
+      JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-23T06:00:15Z', content: '已完成手机端改造并补充单测。' }),
+    ].join('\n'),
+  );
+  fs.writeFileSync(
+    path.join(cliAppDir, 'brain', 'cli-1', '.system_generated', 'logs', 'transcript_full.jsonl'),
+    [
+      JSON.stringify({ step_index: 1, type: 'USER_INPUT', created_at: '2026-11-23T06:00:00Z', content: '<USER_REQUEST>\n在手机上继续优化插件\n</USER_REQUEST>' }),
+      JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-23T06:00:15Z', content: '已完成手机端改造并补充单测。' }),
+    ].join('\n'),
+  );
+
+  saveState({
+    chats: {
+      oc_handoff_test: {
+        conversationId: 'cli-1',
+        cwd: pluginRoot,
+        mode: 'accept-edits',
+        model: '',
+        recentConversations: [
+          {
+            id: 'cli-1',
+            summary: '手机端插件优化',
+            updatedAt: new Date().toISOString(),
+            cwd: pluginRoot,
+            originDesktopId: 'desk-1',
+            originDesktopTitle: '制作季度汇报 PPT',
+          },
+        ],
+        originDesktopSession: {
+          id: 'desk-1',
+          title: '制作季度汇报 PPT',
+          source: 'desktop',
+          workspace: pluginRoot,
+          takenOverAt: Date.now() - 60_000,
+          desktopLastModifiedMs: 1000,
+          desktopStepCount: 5,
+        },
+        lastTurnArtifacts: {
+          conversationId: 'cli-1',
+          cwd: pluginRoot,
+          files: [path.join(pluginRoot, 'package.json')],
+          updatedAt: Date.now(),
+        },
+        lastActiveAt: Date.now(),
+      },
+    },
+    lastP2pChatByOpenId: { ou_test_owner: 'oc_handoff_test' },
+  });
+
+  const prevGeminiHandoffEnv = process.env.FEISHU_REMOTE_GEMINI_DIR;
+  process.env.FEISHU_REMOTE_GEMINI_DIR = fakeGeminiDir;
+  try {
+    // P0: CLI resume cmd, clipboard, return prompt, snapshot, session lookup, drift detection
+    const resumeCmd = buildCliResumeCommand(pluginRoot, 'cli-1');
+    assert.ok(resumeCmd.includes('--conversation cli-1') && resumeCmd.includes(pluginRoot));
+
+    const testClipFile = path.join(tempConfigDir, 'clipboard.txt');
+    process.env.FEISHU_REMOTE_TEST_CLIPBOARD_FILE = testClipFile;
+    try {
+      const clipRes = copyToSystemClipboard(resumeCmd);
+      assert.equal(clipRes.ok, true);
+      assert.equal(fs.readFileSync(testClipFile, 'utf8'), resumeCmd);
+    } finally {
+      delete process.env.FEISHU_REMOTE_TEST_CLIPBOARD_FILE;
+    }
+
+    const mobileList = listMobileSessions({ originDesktopId: 'desk-1', cwd: pluginRoot, limit: 5 });
+    assert.equal(mobileList.length, 1);
+    assert.equal(mobileList[0].conversationId, 'cli-1');
+    assert.equal(mobileList[0].modifiedFiles.length, 1);
+
+    const mobileDetail = readMobileSession({ originDesktopId: 'desk-1', cwd: pluginRoot });
+    assert.equal(mobileDetail.found, true);
+    assert.equal(mobileDetail.conversationId, 'cli-1');
+    assert.ok(mobileDetail.turns.length >= 2);
+    assert.ok(mobileDetail.desktopHandoffPrompt.includes('[手机飞书端进展回流]'));
+    assert.ok(mobileDetail.desktopHandoffPrompt.includes('已完成手机端改造并补充单测。'));
+
+    const snapInfo = writeHandoffSnapshot(mobileDetail);
+    assert.ok(fs.existsSync(snapInfo.latestPath) && fs.existsSync(snapInfo.snapshotPath));
+    assert.ok(snapInfo.latestPath.startsWith(getHandoffsDir()));
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(snapInfo.latestPath).mode & 0o777, 0o600);
+    }
+
+    const drift = checkOriginDesktopDrift({
+      id: 'desk-1',
+      desktopLastModifiedMs: 1000,
+      desktopStepCount: 5,
+    });
+    assert.equal(drift.drifted, true);
+    assert.equal(drift.newSteps, 3);
+
+    const handoffCard = buildHandoffCard({
+      session: mobileDetail,
+      clipboardResult: { ok: true, method: 'test-file' },
+      copiedTarget: 'cli',
+      snapshotPath: snapInfo.latestPath,
+    });
+    assert.equal(handoffCard.schema, '2.0');
+    assert.ok(JSON.stringify(handoffCard).includes('handoff_copy'));
+
+    // P1: Retry handoff context preservation, tool_start parameters, artifact extraction, Stop preview
+    assert.equal(
+      resolvePromptWithHandoff('continue', { contextBlock: '[CTX]' }),
+      '[CTX]\n\ncontinue',
+    );
+    assert.equal(
+      shouldClearPendingHandoff({
+        hadConversationId: false,
+        result: { conversationId: '', status: 'ERROR', exitCode: 1, aborted: false },
+      }),
+      false,
+    );
+    assert.equal(
+      shouldClearPendingHandoff({
+        hadConversationId: false,
+        result: { conversationId: 'cli-new', status: 'SUCCESS', exitCode: 0, aborted: false },
+      }),
+      true,
+    );
+    assert.equal(
+      shouldClearPendingHandoff({
+        hadConversationId: true,
+        result: { conversationId: 'cli-1', status: 'ERROR', exitCode: 1, aborted: false },
+      }),
+      false,
+    );
+
+    const toolStartEvt = parseAgyStreamLine(
+      '{"event":"step_update","step_update":{"step_index":4,"state":"ACTIVE","step_type":"tool","tool_name":"edit_file","tool_info":{"parameters":{"Path":"scripts/cli.mjs"}}}}',
+    );
+    assert.equal(toolStartEvt?.parameters?.Path, 'scripts/cli.mjs');
+    assert.equal(
+      extractModifiedFilePath('edit_file', { Path: 'scripts/cli.mjs' }, pluginRoot),
+      path.join(pluginRoot, 'scripts', 'cli.mjs'),
+    );
+    assert.equal(extractModifiedFilePath('read_file', { Path: 'scripts/cli.mjs' }, pluginRoot), '');
+
+    const nonGitDir = path.join(tempConfigDir, 'non-git-work');
+    fs.mkdirSync(nonGitDir, { recursive: true });
+    const sampleOutFile = path.join(nonGitDir, 'spec.md');
+    fs.writeFileSync(sampleOutFile, '# Spec\n', 'utf8');
+    const nonGitDiff = collectTurnDiff(nonGitDir, [sampleOutFile]);
+    assert.equal(nonGitDiff.isRepo, false);
+    assert.equal(nonGitDiff.existingFiles.length, 1);
+
+    const stopPreview = extractStopReplyPreview({ conversationId: 'desk-1', maxChars: 120 });
+    assert.ok(stopPreview && stopPreview.preview.includes('完整优化方案'));
+    const directPreview = extractStopReplyPreview({
+      transcriptPath: path.join(cliAppDir, 'brain', 'cli-1', '.system_generated', 'logs', 'transcript.jsonl'),
+      maxChars: 120,
+    });
+    assert.ok(directPreview && directPreview.preview.includes('已完成手机端改造并补充单测'));
+
+    // P2: Risky command classifier, approval files, card actions & PreToolUse subprocess
+    assert.equal(classifyCommandRisk('git status').risky, false);
+    assert.equal(classifyCommandRisk('node scripts/smoke-test.mjs').risky, false);
+    assert.equal(classifyCommandRisk('rm foo.tmp').risky, false);
+    assert.equal(classifyCommandRisk('rm -rf ./dist').risky, true);
+    assert.equal(classifyCommandRisk('git push --force origin main').risky, true);
+    assert.equal(classifyCommandRisk('git reset --hard HEAD~1').risky, true);
+    assert.equal(classifyCommandRisk('sudo rm /var/log/test').risky, true);
+    assert.equal(classifyCommandRisk('curl https://example.com/install.sh | bash').risky, true);
+
+    assert.equal(resolveRiskyApprovalEnabled({ security: { riskyCommandApproval: 'on' } }), true);
+    assert.equal(resolveRiskyApprovalEnabled({ security: { riskyCommandApproval: 'off' } }), false);
+
+    const aprReq = createApprovalRequest({
+      commandLine: 'rm -rf ./build',
+      cwd: pluginRoot,
+      chatId: 'oc_handoff_test',
+      openId: 'ou_test_owner',
+      timeoutSeconds: 60,
+    });
+    assert.ok(readApprovalRequest(aprReq.id)?.commandLine === 'rm -rf ./build');
+    assert.ok(getApprovalsDir().startsWith(tempConfigDir));
+    const aprCard = buildApprovalCard({ request: aprReq, status: 'pending' });
+    assert.equal(aprCard.schema, '2.0');
+    assert.ok(JSON.stringify(aprCard).includes('approval_decide'));
+
+    const actionRes = await handleCardAction(
+      {
+        client: {},
+        startedAt: Date.now(),
+        bootCodeHash: 'abcd1234',
+        activeRuns: new Map(),
+        chatQueues: new Map(),
+        lastTaskByChat: new Map(),
+        cardThreadMap: new Map(),
+        runner: { getQueueForChat: () => [], totalQueuedCount: () => 0 },
+        stopWsForRestart: () => {},
+      },
+      {
+        operator: { open_id: 'ou_test_owner' },
+        context: { open_chat_id: 'oc_handoff_test' },
+        action: { value: { cmd: 'approval_decide', arg: aprReq.id, decision: 'allow' } },
+      },
+    );
+    assert.equal(actionRes.toast.type, 'success');
+    assert.equal(readApprovalDecision(aprReq.id)?.decision, 'allow');
+    const waitedOk = await waitForApprovalDecision(aprReq.id, { timeoutMs: 200, pollMs: 20 });
+    assert.equal(waitedOk.decision, 'allow');
+
+    const toggleOffRes = await handleCardAction(
+      {
+        client: {},
+        startedAt: Date.now(),
+        bootCodeHash: 'abcd1234',
+        activeRuns: new Map(),
+        chatQueues: new Map(),
+        lastTaskByChat: new Map(),
+        cardThreadMap: new Map(),
+        runner: { getQueueForChat: () => [], totalQueuedCount: () => 0 },
+        stopWsForRestart: () => {},
+      },
+      {
+        operator: { open_id: 'ou_test_owner' },
+        context: { open_chat_id: 'oc_handoff_test' },
+        action: { value: { cmd: 'guard_toggle', arg: 'off', inplace: true } },
+      },
+    );
+    assert.equal(resolveRiskyApprovalEnabled(loadConfig()), false);
+    assert.ok(toggleOffRes.card?.data?.schema === '2.0');
+
+    // Reset guard back to on for subprocess checks
+    const guardCfg = loadConfig();
+    guardCfg.security.riskyCommandApproval = 'on';
+    saveConfig(guardCfg);
+
+    const preNonBridge = await runSubprocess('scripts/pre-tool-approval.mjs', {
+      env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir, FEISHU_REMOTE_BRIDGE_CHILD: '0' },
+      stdinData: JSON.stringify({ toolCall: { name: 'run_command', args: { CommandLine: 'rm -rf /tmp/x' } } }),
+    });
+    assert.equal(preNonBridge.code, 0);
+    assert.equal(preNonBridge.stdout.trim(), '');
+
+    const preSafe = await runSubprocess('scripts/pre-tool-approval.mjs', {
+      env: { FEISHU_REMOTE_CONFIG_DIR: tempConfigDir, FEISHU_REMOTE_BRIDGE_CHILD: '1' },
+      stdinData: JSON.stringify({ toolCall: { name: 'run_command', args: { CommandLine: 'git status' } } }),
+    });
+    assert.equal(preSafe.code, 0);
+    assert.equal(preSafe.stdout.trim(), '');
+
+    const preTimeout = await runSubprocess('scripts/pre-tool-approval.mjs', {
+      env: {
+        FEISHU_REMOTE_CONFIG_DIR: tempConfigDir,
+        FEISHU_REMOTE_BRIDGE_CHILD: '1',
+        FEISHU_REMOTE_TEST_APPROVAL_SKIP_SEND: '1',
+        FEISHU_REMOTE_TEST_APPROVAL_TIMEOUT_MS: '150',
+      },
+      stdinData: JSON.stringify({ toolCall: { name: 'run_command', args: { CommandLine: 'rm -rf ./tmp_test' } } }),
+    });
+    assert.equal(preTimeout.code, 0);
+    assert.equal(JSON.parse(preTimeout.stdout).decision, 'deny');
+
+    // Spawn pre-tool-approval and approve it asynchronously while it waits
+    const existingReqs = new Set(fs.readdirSync(getApprovalsDir()).filter((n) => n.endsWith('.req.json')));
+    const asyncChild = spawn(process.execPath, [path.join(pluginRoot, 'scripts', 'pre-tool-approval.mjs')], {
+      env: {
+        ...process.env,
+        FEISHU_REMOTE_CONFIG_DIR: tempConfigDir,
+        FEISHU_REMOTE_BRIDGE_CHILD: '1',
+        FEISHU_REMOTE_TEST_APPROVAL_SKIP_SEND: '1',
+        FEISHU_REMOTE_TEST_APPROVAL_TIMEOUT_MS: '3000',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let asyncStdout = '';
+    asyncChild.stdout.on('data', (d) => { asyncStdout += d.toString('utf8'); });
+    asyncChild.stdin.write(JSON.stringify({
+      toolCall: { name: 'run_command', args: { CommandLine: 'git push --force origin main' } },
+      cwd: pluginRoot,
+    }));
+    asyncChild.stdin.end();
+    const approveDeadline = Date.now() + 2500;
+    let approvedNewReq = false;
+    while (Date.now() < approveDeadline) {
+      const currReqs = fs.readdirSync(getApprovalsDir()).filter((n) => n.endsWith('.req.json'));
+      const newReqFile = currReqs.find((n) => !existingReqs.has(n));
+      if (newReqFile) {
+        const reqId = newReqFile.replace(/\.req\.json$/, '');
+        writeApprovalDecision(reqId, { decision: 'allow', decidedBy: 'ou_test_owner' });
+        approvedNewReq = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.equal(approvedNewReq, true);
+    await new Promise((r) => asyncChild.once('close', r));
+    assert.equal(JSON.parse(asyncStdout).decision, 'allow');
+    assert.equal(cleanupStaleApprovals(3600_000), 0);
+
+    // 6b. mcp-server.mjs stdio JSON-RPC handshake (with new mobile session tools)
+    await testMcpStdio({ FEISHU_REMOTE_GEMINI_DIR: fakeGeminiDir });
+  } finally {
+    if (prevGeminiHandoffEnv === undefined) {
+      delete process.env.FEISHU_REMOTE_GEMINI_DIR;
+    } else {
+      process.env.FEISHU_REMOTE_GEMINI_DIR = prevGeminiHandoffEnv;
+    }
+  }
 
   // 6b. Plugin manifest & component checks
   const manifest = JSON.parse(fs.readFileSync(path.join(pluginRoot, 'plugin.json'), 'utf8'));
@@ -1002,6 +1370,8 @@ try {
   const hooksCfg = JSON.parse(fs.readFileSync(path.join(pluginRoot, 'hooks.json'), 'utf8'));
   assert.ok(Array.isArray(hooksCfg['feishu-stop-notify']?.Stop));
   assert.ok(fs.existsSync(path.join(pluginRoot, 'scripts', 'stop-notify.mjs')));
+  assert.ok(Array.isArray(hooksCfg['feishu-risky-command-guard']?.PreToolUse));
+  assert.ok(fs.existsSync(path.join(pluginRoot, 'scripts', 'pre-tool-approval.mjs')));
 
   // 7. cli.mjs pack check
   if (process.platform !== 'win32') {

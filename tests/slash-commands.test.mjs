@@ -1,0 +1,236 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { after, before, describe, it } from 'node:test';
+import {
+  createBridgeContext,
+  createMockFeishuClient,
+  createTestEnv,
+  seedDefaultTestConfig,
+  seedFakeGeminiStores,
+} from './helpers.mjs';
+
+const env = createTestEnv('feishu-slash-cmds-');
+let config;
+
+const { loadConfig, resolveRiskyApprovalEnabled, saveState } = await import('../scripts/lib/config.mjs');
+const { handleSlashCommand } = await import('../scripts/lib/slash-commands.mjs');
+
+describe('slash-commands coverage', () => {
+  before(() => {
+    config = seedDefaultTestConfig(env.workDir);
+    fs.mkdirSync(path.join(env.workDir, 'sub-alpha'), { recursive: true });
+    fs.mkdirSync(path.join(env.workDir, '.hidden-dir'), { recursive: true });
+    seedFakeGeminiStores(env.geminiDir, {
+      cliRows: [
+        {
+          id: 'cli-slash-1',
+          title: 'Slash 测试会话',
+          preview: 'done',
+          stepCount: 3,
+          modified: '2026-11-26T03:00:00Z',
+          workspaces: JSON.stringify([`file://${env.workDir}`]),
+        },
+      ],
+      transcripts: {
+        'cli-slash-1': {
+          source: 'cli',
+          compact: [
+            { step_index: 1, type: 'USER_INPUT', created_at: '2026-11-26T03:00:00Z', content: '测试' },
+            { step_index: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-26T03:00:10Z', content: '完成' },
+          ],
+          full: [
+            { step_index: 1, type: 'USER_INPUT', created_at: '2026-11-26T03:00:00Z', content: '测试' },
+            { step_index: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-26T03:00:10Z', content: '完成' },
+          ],
+        },
+      },
+    });
+
+    saveState({
+      chats: {
+        oc_slash: {
+          conversationId: 'cli-slash-1',
+          cwd: env.workDir,
+          mode: 'accept-edits',
+          model: '',
+          effort: '',
+          recentConversations: [{ id: 'cli-slash-1', summary: 'Slash 测试会话', updatedAt: new Date().toISOString() }],
+          originDesktopSession: { id: 'desk-0', title: 'Origin Doc' },
+          lastTurnArtifacts: { conversationId: 'cli-slash-1', cwd: env.workDir, files: [] },
+          pendingHandoff: null,
+        },
+      },
+      lastP2pChatByOpenId: { ou_test_owner: 'oc_slash' },
+    });
+  });
+
+  after(() => {
+    env.cleanup();
+  });
+
+  async function runCmd(text, ctxOverrides = {}) {
+    const { client, calls } = createMockFeishuClient();
+    const ctx = createBridgeContext({ client, ...ctxOverrides });
+    const handled = await handleSlashCommand(ctx, {
+      text,
+      chatId: 'oc_slash',
+      openId: 'ou_test_owner',
+      messageId: 'om_cmd_1',
+      sessionKey: 'oc_slash',
+      config: loadConfig(),
+    });
+    return { handled, calls };
+  }
+
+  it('handles /help, /status, /panel, and unknown commands', async () => {
+    const help = await runCmd('/help');
+    assert.equal(help.handled, true);
+    assert.ok(JSON.stringify(help.calls.repliedCards[0].card).includes('/handoff'));
+    assert.ok(JSON.stringify(help.calls.repliedCards[0].card).includes('/guard'));
+
+    const status = await runCmd('/status');
+    assert.equal(status.handled, true);
+    const statusJson = JSON.stringify(status.calls.repliedCards[0].card);
+    assert.ok(statusJson.includes('Origin Doc'));
+    assert.ok(statusJson.includes('高危命令审批'));
+
+    const panel = await runCmd('/panel');
+    assert.equal(panel.handled, true);
+    assert.ok(JSON.stringify(panel.calls.repliedCards[0].card).includes('交回电脑'));
+
+    const unknown = await runCmd('/not_a_real_command');
+    assert.equal(unknown.handled, false);
+  });
+
+  it('handles /handoff cli, /handoff desktop, and /guard on|off', async () => {
+    const hCli = await runCmd('/handoff');
+    assert.equal(hCli.handled, true);
+    assert.ok(fs.readFileSync(env.clipboardFile, 'utf8').includes('--conversation cli-slash-1'));
+
+    const hDesk = await runCmd('/back desktop');
+    assert.equal(hDesk.handled, true);
+    assert.ok(fs.readFileSync(env.clipboardFile, 'utf8').includes('[手机飞书端进展回流]'));
+
+    const gOff = await runCmd('/guard off');
+    assert.equal(gOff.handled, true);
+    assert.equal(resolveRiskyApprovalEnabled(loadConfig()), false);
+
+    const gOn = await runCmd('/approval on');
+    assert.equal(gOn.handled, true);
+    assert.equal(resolveRiskyApprovalEnabled(loadConfig()), true);
+  });
+
+  it('handles /cd, /dirs, /mode, /timeout, /effort, /notify, /new, and /use', async () => {
+    const cdOk = await runCmd('/cd sub-alpha');
+    assert.equal(cdOk.handled, true);
+    assert.ok(JSON.stringify(cdOk.calls.repliedCards[0].card).includes('sub-alpha'));
+
+    const cdBack = await runCmd(`/cd ${env.workDir}`);
+    assert.equal(cdBack.handled, true);
+
+    const cdMissing = await runCmd('/cd non-existent-folder-xyz');
+    assert.equal(cdMissing.handled, true);
+    assert.ok(JSON.stringify(cdMissing.calls.repliedCards[0].card).includes('未找到匹配目录'));
+
+    const dirsShow = await runCmd('/dirs -a');
+    assert.equal(dirsShow.handled, true);
+    assert.ok(JSON.stringify(dirsShow.calls.repliedCards[0].card).includes('.hidden-dir'));
+
+    const modeTemp = await runCmd('/mode full 15m');
+    assert.equal(modeTemp.handled, true);
+    assert.ok(JSON.stringify(modeTemp.calls.repliedCards[0].card).includes('临时 15 分钟'));
+
+    const timeoutRes = await runCmd('/timeout 2h');
+    assert.equal(timeoutRes.handled, true);
+    assert.equal(loadConfig().agy.timeoutSeconds, 7200);
+
+    const effortRes = await runCmd('/effort high');
+    assert.equal(effortRes.handled, true);
+    assert.ok(JSON.stringify(effortRes.calls.repliedCards[0].card).includes('high'));
+
+    const muteRes = await runCmd('/mute');
+    assert.equal(muteRes.handled, true);
+    assert.equal(loadConfig().notifications.stopNotifyMode, 'off');
+
+    const unmuteRes = await runCmd('/notify away 5');
+    assert.equal(unmuteRes.handled, true);
+    assert.equal(loadConfig().notifications.stopNotifyMode, 'away');
+    assert.equal(loadConfig().notifications.awayIdleSeconds, 300);
+
+    const quickUnknown = await runCmd('/quick');
+    assert.equal(quickUnknown.handled, false);
+
+    const useRes = await runCmd('/use 1');
+    assert.equal(useRes.handled, true);
+    const newRes = await runCmd('/new');
+    assert.equal(newRes.handled, true);
+    assert.ok(JSON.stringify(newRes.calls.repliedCards[0].card).includes('已开启新对话'));
+  });
+
+  it('handles /topic set|clear and /unlink', async () => {
+    const { client: c1, calls: calls1 } = createMockFeishuClient();
+    const ctx1 = createBridgeContext({ client: c1 });
+    // /topic set outside topic thread warns
+    const warnSet = await handleSlashCommand(ctx1, {
+      text: '/topic set',
+      chatId: 'oc_slash',
+      openId: 'ou_test_owner',
+      messageId: 'om_t0',
+      sessionKey: 'oc_slash',
+      replyInThread: false,
+      config: loadConfig(),
+    });
+    assert.equal(warnSet, true);
+    assert.ok(JSON.stringify(calls1.repliedCards[0].card).includes('请在话题群内使用'));
+
+    // /topic set inside topic thread binds defaultTopicChatId
+    const { client: c2, calls: calls2 } = createMockFeishuClient();
+    const ctx2 = createBridgeContext({ client: c2 });
+    await handleSlashCommand(ctx2, {
+      text: '/topic set',
+      chatId: 'oc_topic_bound',
+      openId: 'ou_test_owner',
+      messageId: 'om_t1',
+      sessionKey: 'oc_topic_bound#om_root_t1',
+      threadRootId: 'om_root_t1',
+      replyInThread: true,
+      config: loadConfig(),
+    });
+    assert.equal(loadConfig().notifications.defaultTopicChatId, 'oc_topic_bound');
+    assert.ok(JSON.stringify(calls2.repliedCards[0].card).includes('已绑定默认接管话题群'));
+
+    const statusTopic = await runCmd('/topic');
+    assert.ok(JSON.stringify(statusTopic.calls.repliedCards[0].card).includes('oc_topic_bound'));
+
+    await runCmd('/topic clear');
+    assert.equal(loadConfig().notifications.defaultTopicChatId, '');
+
+    const unlinkRes = await runCmd('/unlink');
+    assert.equal(unlinkRes.handled, true);
+    assert.ok(JSON.stringify(unlinkRes.calls.repliedCards[0].card).includes('已结束当前对话的电脑端自动回流追踪'));
+  });
+
+  it('handles /, /skills, and /agy <raw> passthrough', async () => {
+    const slashMenu = await runCmd('/');
+    assert.equal(slashMenu.handled, true);
+    assert.equal(slashMenu.calls.repliedCards[0]?.card?.header?.title?.content, '🧩 agy 命令与本机技能');
+
+    const skillsCmd = await runCmd('/skills');
+    assert.equal(skillsCmd.handled, true);
+    assert.equal(skillsCmd.calls.repliedCards[0]?.card?.header?.title?.content, '🧩 agy 命令与本机技能');
+
+    const enqueued = [];
+    const agyPassthrough = await runCmd('/agy /help', {
+      runner: {
+        getQueueForChat: () => [],
+        totalQueuedCount: () => 0,
+        enqueueOrExecutePrompt: async (p) => { enqueued.push(p); },
+        executePrompt: async () => {},
+      },
+    });
+    assert.equal(agyPassthrough.handled, true);
+    assert.equal(enqueued.length, 1);
+    assert.equal(enqueued[0].text, '/help');
+  });
+});

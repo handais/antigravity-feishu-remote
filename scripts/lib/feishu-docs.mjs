@@ -73,12 +73,106 @@ async function resolveDocxIdFromTarget(client, parsed) {
   return node.obj_token;
 }
 
-export async function readFeishuDoc(client, target, { maxChars = 24000, domain = 'feishu' } = {}) {
+export function extractCommentReplyText(elements) {
+  if (!Array.isArray(elements)) return '';
+  return elements
+    .map((el) => {
+      if (!el || typeof el !== 'object') return '';
+      if (el.text_run?.text) return String(el.text_run.text);
+      if (el.docs_link?.url) return String(el.docs_link.url);
+      if (el.person?.user_id) return `@${el.person.user_id}`;
+      return '';
+    })
+    .join('')
+    .trim();
+}
+
+function normalizeCommentItem(raw, defaultWhole = false) {
+  const repliesRaw = Array.isArray(raw?.reply_list?.replies) ? raw.reply_list.replies : [];
+  const replies = repliesRaw
+    .map((r) => ({
+      replyId: String(r?.reply_id || ''),
+      text: extractCommentReplyText(r?.content?.elements),
+      createTime: Number(r?.create_time || 0),
+    }))
+    .filter((r) => r.text);
+  return {
+    commentId: String(raw?.comment_id || ''),
+    isWhole: Boolean(raw?.is_whole ?? defaultWhole),
+    isSolved: Boolean(raw?.is_solved),
+    quote: String(raw?.quote || '').trim(),
+    replies,
+    updateTime: Number(raw?.update_time || raw?.create_time || 0),
+  };
+}
+
+/**
+ * Fetch inline and document-level comments/annotations for a Feishu docx token.
+ */
+export async function fetchFeishuDocComments(client, documentId) {
+  const listFn = client?.drive?.v1?.fileComment?.list;
+  if (typeof listFn !== 'function' || !documentId) {
+    return { comments: [], commentsWarning: '' };
+  }
+  const comments = [];
+  const seenIds = new Set();
+  const warnings = [];
+  for (const isWhole of [false, true]) {
+    try {
+      const res = await listFn({
+        path: { file_token: documentId },
+        params: { file_type: 'docx', is_whole: isWhole, page_size: 100 },
+      });
+      assertLarkOk(res, 'drive.fileComment.list');
+      const items = Array.isArray(res?.data?.items) ? res.data.items : [];
+      for (const item of items) {
+        const norm = normalizeCommentItem(item, isWhole);
+        if (norm.commentId && seenIds.has(norm.commentId)) continue;
+        if (norm.commentId) seenIds.add(norm.commentId);
+        comments.push(norm);
+      }
+    } catch (err) {
+      const unwrapped = unwrapLarkError(err, 'drive.fileComment.list');
+      warnings.push(unwrapped.message);
+    }
+  }
+  comments.sort((a, b) => (a.updateTime || 0) - (b.updateTime || 0));
+  return {
+    comments,
+    commentsWarning: comments.length === 0 && warnings.length > 0 ? warnings[0] : '',
+  };
+}
+
+function formatCommentsSection(comments) {
+  if (!Array.isArray(comments) || comments.length === 0) return '';
+  const lines = [`---`, `【文档批注与评论（共 ${comments.length} 条）】`];
+  comments.forEach((c, idx) => {
+    const scopeLabel = c.isWhole ? '全文评论' : '划词批注';
+    const stateLabel = c.isSolved ? '已解决' : '未解决';
+    const quotePart = c.quote ? `引用「${c.quote.replace(/\s+/g, ' ').slice(0, 120)}」` : '';
+    lines.push(`${idx + 1}. [${scopeLabel} · ${stateLabel}] ${quotePart}`.trim());
+    if (c.replies.length > 0) {
+      for (const r of c.replies) {
+        lines.push(`   - ${r.text.replace(/\s+/g, ' ')}`);
+      }
+    }
+  });
+  return lines.join('\n');
+}
+
+export async function readFeishuDoc(
+  client,
+  target,
+  { maxChars = 24000, domain = 'feishu', includeComments = true } = {},
+) {
   const parsed = parseDocTarget(target, domain);
   const documentId = await resolveDocxIdFromTarget(client, parsed);
 
   let metaRes;
   let contentRes;
+  const commentsPromise = includeComments
+    ? fetchFeishuDocComments(client, documentId)
+    : Promise.resolve({ comments: [], commentsWarning: '' });
   try {
     [metaRes, contentRes] = await Promise.all([
       client.docx.v1.document.get({ path: { document_id: documentId } }),
@@ -89,13 +183,24 @@ export async function readFeishuDoc(client, target, { maxChars = 24000, domain =
   }
   assertLarkOk(metaRes, 'docx.get');
   assertLarkOk(contentRes, 'docx.rawContent');
+  const { comments, commentsWarning } = await commentsPromise;
 
   const docMeta = metaRes?.data?.document || {};
   const rawText = String(contentRes?.data?.content || '').trim();
-  const totalChars = rawText.length;
+  const commentsSection = formatCommentsSection(comments);
+  const combined = commentsSection ? `${rawText}\n\n${commentsSection}`.trim() : rawText;
+  const totalChars = combined.length;
   const limit = Math.max(200, Number(maxChars) || 24000);
   const truncated = totalChars > limit;
-  const content = truncated ? `${rawText.slice(0, limit)}\n\n...(已截断，全文共 ${totalChars} 字符)` : rawText;
+  let content;
+  if (!truncated) {
+    content = combined;
+  } else if (commentsSection && commentsSection.length < Math.floor(limit * 0.45)) {
+    const bodyBudget = Math.max(100, limit - commentsSection.length - 48);
+    content = `${rawText.slice(0, bodyBudget)}\n\n...(正文已截断，全文含批注共 ${totalChars} 字符)\n\n${commentsSection}`;
+  } else {
+    content = `${combined.slice(0, limit)}\n\n...(已截断，全文共 ${totalChars} 字符)`;
+  }
 
   return {
     documentId,
@@ -105,6 +210,8 @@ export async function readFeishuDoc(client, target, { maxChars = 24000, domain =
     truncated,
     totalChars,
     url: `https://${parsed.host}/docx/${documentId}`,
+    comments,
+    ...(commentsWarning ? { commentsWarning } : {}),
   };
 }
 

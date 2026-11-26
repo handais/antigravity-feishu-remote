@@ -5,6 +5,12 @@
   "author": "handais",
   "homepage": "https://github.com/handais/antigravity-feishu-remote#readme",
   "type": "module",
+  "scripts": {
+    "check": "node scripts/cli.mjs check",
+    "test:smoke": "node scripts/smoke-test.mjs",
+    "test:suite": "node --test tests/*.test.mjs",
+    "test": "npm run check && npm run test:smoke && npm run test:suite"
+  },
   "description": "Feishu WebSocket remote control bridge, MCP server, and completion hook for Antigravity",
   "engines": {
     "node": ">=22.5.0"

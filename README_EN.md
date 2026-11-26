@@ -81,6 +81,8 @@ Follow README_EN.md: install into ~/.gemini/config/plugins/feishu-remote, run np
          "im:message.reactions:read",
          "cardkit:card:write",
          "cardkit:card:read",
+         "docx:document",
+         "docs:permission.member:create",
          "docx:document:readonly",
          "docx:document:write_only",
          "docx:document.block:convert",
@@ -107,7 +109,7 @@ Follow README_EN.md: install into ~/.gemini/config/plugins/feishu-remote, run np
 5. Under **Events & Callbacks**:
    - **Events**: Select **Receive events via persistent connection (WebSocket)** and subscribe to `im.message.receive_v1` and `application.bot.menu_v6`.
    - **Callbacks**: Select **Receive callbacks via persistent connection (WebSocket)** and subscribe to `card.action.trigger`.
-6. *(Optional)* Under **Bot Custom Menu**, add menu buttons pushing event keys `menu_panel`, `menu_quick`, `menu_dirs`, `menu_new`, `menu_stop` (also supports `menu_effort`, `menu_git`, `menu_scopes`, `menu_queue`, `menu_mode_temp_full`, `menu_ops`, `menu_reload`, `menu_sessions`, `menu_models`, `menu_mode_full`, `menu_help`).
+6. *(Optional)* Under **Bot Custom Menu**, add menu buttons pushing event keys `menu_panel`, `menu_commands`, `menu_new`, `menu_stop` (also supports `menu_skills`, `menu_dirs`, `menu_effort`, `menu_git`, `menu_scopes`, `menu_queue`, `menu_mode_temp_full`, `menu_ops`, `menu_reload`, `menu_sessions`, `menu_models`, `menu_mode_full`, `menu_help`).
 7. Under **Version Management & Release**, create and publish a version (can be scoped to yourself or test users).
 8. Message your bot once in private chat (e.g. `hi` or `/help`) to auto-bind your `open_id` and receive the welcome card.
 
@@ -117,18 +119,18 @@ Follow README_EN.md: install into ~/.gemini/config/plugins/feishu-remote, run np
 
 | Command | Description |
 | :--- | :--- |
-| `setup` | Save Feishu/Lark credentials, proxy, default cwd/mode/model/effort, notify mode, and quick prompts to `~/.config/antigravity-feishu/config.json` |
+| `setup` | Save Feishu/Lark credentials, proxy, default cwd/mode/model/effort, and notify mode to `~/.config/antigravity-feishu/config.json` |
 | `start` / `stop` / `restart` | Manage background daemon (`launchd` / `systemd --user` / Windows PID) |
 | `check` | Two-stage syntax (`node --check`) and ESM import/export verification |
 | `safe-restart` | Run `check`, save a snapshot, and restart only if validation passes |
 | `snapshot` / `backups` / `rollback` | Manage deduplicated code snapshots in `~/.config/antigravity-feishu/backups/` (max 5) |
 | `status` / `logs [--lines N]` | Inspect daemon status, masked config, and stdout/stderr logs |
-| `test-send [--panel\|--quick\|--dirs]` | Send a test or interactive control card to the bound user |
+| `test-send [--panel\|--dirs]` | Send a test or interactive control card to the bound user |
 | `send-file <path> [--as-file]` | Upload and send a local image or file to Feishu/Lark |
 | `scopes` | Query Feishu Open Platform scope grant status |
-| `read-doc` / `write-doc` | Read or create/append Feishu Docx/Wiki documents |
+| `read-doc` / `write-doc` | Read (including comments) or create/append Feishu Docx/Wiki documents |
 | `desktop [--query kw]` | Read-only scan & FTS5 search of local CLI and Desktop conversations |
-| `pack [--out path.zip]` | Build a clean shareable `.zip` (excludes `node_modules`, `.git`, and all user credentials) |
+| `pack [--out path.zip]` | Build a clean shareable `.zip` (excludes `node_modules`, `.git`, logs/envs/zips, and all user credentials) |
 
 Run verification locally at any time:
 
@@ -141,7 +143,7 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/smoke-test.mjs
 
 ## Feishu Chat Commands
 
-- **Control & Navigation**: `/panel` (interactive control panel), `/dirs [-a]` (browse/pin directories, toggle hidden dot-directories), `/cd <path|keyword>`, `/pin`, `/quick` (one-tap preset prompts), `/status`, `/help`
+- **Control & Navigation**: `/panel` (interactive control panel), `/dirs [-a]` (browse/pin directories, toggle hidden dot-directories), `/cd <path|keyword>`, `/pin`, `/` or `/skills` (built-in `agy` commands & local skills), `/status`, `/help`
 - **Execution Controls**: `/mode [accept-edits|plan|auto|full|default|full 30m]`, `/model [id|default]`, `/effort [low|medium|high|xhigh|max|default]`, `/timeout [minutes|0]`, `/queue`, `/stop`
 - **Sessions & Handoff**: `/new`, `/sessions`, `/use <index|id>`, `/desktop [keyword]` (`/pc` — preview & take over local CLI/Desktop sessions)
 - **Files, Docs & Ops**: `/send <path> [--file]`, `/doc ...`, `/tasks` (`/todo` — list, create, complete, or run Feishu Task v2 tasks via User OAuth), `/git`, `/scopes`, `/notify [on|away [min]|off]`, `/ops`, `/check`, `/reload`, `/snapshot`, `/rollback`
@@ -154,7 +156,7 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/smoke-test.mjs
   - `feishu_send_message` — send text to Feishu/Lark
   - `feishu_send_card` — send interactive markdown cards
   - `feishu_send_file` — upload and send local images/files
-  - `feishu_read_doc` / `feishu_write_doc` — read or create/append Docx & Wiki pages
+  - `feishu_read_doc` / `feishu_write_doc` — read (including inline/whole comments) or create/append Docx & Wiki pages
   - `feishu_list_tasks` / `feishu_create_task` / `feishu_complete_task` — list, create, and complete Feishu Task v2 tasks via User OAuth (`cli.mjs auth`)
   - `feishu_bridge_status` / `feishu_manage_bridge` — inspect masked config and start/stop/restart/read daemon logs
 - **Lifecycle Hook (`hooks.json` -> `feishu-stop-notify`)**:
