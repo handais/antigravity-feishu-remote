@@ -70,7 +70,7 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
       markdown: formatHelpMarkdown(),
       buttonRows: [[
         { label: '📘 面板按钮说明', type: 'primary', value: { cmd: 'help', inplace: true } },
-        { label: '🧩 命令与技能', value: { cmd: 'skills_menu', inplace: true } },
+        { label: '🧩 命令', value: { cmd: 'skills_menu', inplace: true } },
         { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
       ]],
       footer: '所有指令均可在私聊或话题群直接发送',

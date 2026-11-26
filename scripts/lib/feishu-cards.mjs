@@ -455,7 +455,7 @@ export function buildFrequentPanelButtons({
     git: { label: '🌿 Git', value: { cmd: 'git', inplace: true } },
     models: { label: '🧠 模型', value: { cmd: 'models', inplace: true } },
     effort_menu: { label: '🎛️ 强度', value: { cmd: 'effort_menu', inplace: true } },
-    skills_menu: { label: '🧩 命令与技能', value: { cmd: 'skills_menu', inplace: true } },
+    skills_menu: { label: '🧩 命令', value: { cmd: 'skills_menu', inplace: true } },
     mode_temp_full: {
       label: isTempFull ? `⚡ 临时全权(${remainingMin}m)` : '⚡ 临时全权30m',
       type: isTempFull ? 'primary' : 'default',
@@ -747,7 +747,7 @@ export function buildPanelHelpCard() {
     markdown,
     buttonRows: [[
       { label: '📖 查看全部斜杠指令', type: 'primary', value: { cmd: 'help_commands', inplace: true } },
-      { label: '🧩 命令与技能', value: { cmd: 'skills_menu', inplace: true } },
+      { label: '🧩 命令', value: { cmd: 'skills_menu', inplace: true } },
       { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
     ]],
     footer: '提示：直接发 /help 或点上方按钮查看全部文字指令 · 话题群发 /topic set 可绑定默认接管群',

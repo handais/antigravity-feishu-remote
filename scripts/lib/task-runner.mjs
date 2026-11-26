@@ -571,7 +571,7 @@ export function createTaskRunner({
         { label: '🔄 重试', type: 'primary', value: { cmd: 'retry' } },
         { label: '🆕 新对话', value: { cmd: 'new' } },
         { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
-        { label: '🧩 命令与技能', value: { cmd: 'skills_menu' } },
+        { label: '🧩 命令', value: { cmd: 'skills_menu' } },
       ], 2);
       const errFooter = `目录 ${path.basename(chatState.cwd) || chatState.cwd}`;
       if (streamSession) {

@@ -282,7 +282,7 @@ export async function handleSlashCommand(
       markdown: formatHelpMarkdown(),
       buttonRows: [[
         { label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel' } },
-        { label: '🧩 命令与技能', value: { cmd: 'skills_menu' } },
+        { label: '🧩 命令', value: { cmd: 'skills_menu' } },
       ]],
     });
     return true;
@@ -329,7 +329,7 @@ export async function handleSlashCommand(
       markdown: lines.join('\n'),
       buttonRows: [[
         { label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel' } },
-        { label: '🧩 命令与技能', value: { cmd: 'skills_menu' } },
+        { label: '🧩 命令', value: { cmd: 'skills_menu' } },
         { label: '📋 查看队列', value: { cmd: 'queue_list' } },
       ]],
     });

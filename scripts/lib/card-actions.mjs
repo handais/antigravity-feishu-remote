@@ -441,7 +441,7 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
       markdown: `下条消息将在 \`${chatState.cwd}\` 下开启全新上下文。`,
       buttonRows: [[
         { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
-        { label: '🧩 命令与技能', value: { cmd: 'skills_menu' } },
+        { label: '🧩 命令', value: { cmd: 'skills_menu' } },
       ]],
     }));
     return;
@@ -529,7 +529,7 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
       markdown: formatHelpMarkdown(),
       buttonRows: [[
         { label: '⚙️ 打开控制面板', type: 'primary', value: { cmd: 'panel' } },
-        { label: '🧩 命令与技能', value: { cmd: 'skills_menu' } },
+        { label: '🧩 命令', value: { cmd: 'skills_menu' } },
       ]],
     }));
     return;

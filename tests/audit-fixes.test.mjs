@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import {
@@ -304,6 +305,15 @@ describe('Comprehensive security, concurrency, perf & UX audit fixes', () => {
     assert.equal(rbRes.ok, false);
     assert.equal(rbRes.restoredPreviousOnFailure, true);
     assert.equal(fs.readFileSync(path.join(miniPlugin, 'scripts', 'bridge-daemon.mjs'), 'utf8'), 'export const ok = 42;\n');
+
+    // Preflight dependency resolution works even when invoked outside pluginRoot (e.g. launchd cwd=/)
+    const outsideCheckRaw = execFileSync(process.execPath, [path.join(pluginRoot, 'scripts', 'cli.mjs'), 'check'], {
+      cwd: os.tmpdir(),
+      encoding: 'utf8',
+    });
+    const outsideCheck = JSON.parse(outsideCheckRaw);
+    assert.equal(outsideCheck.ok, true);
+    assert.equal(outsideCheck.errors.length, 0);
   });
 
   it('P1 #8 part 2: handleCardAction group click leaves lastP2pChatByOpenId untouched', async () => {

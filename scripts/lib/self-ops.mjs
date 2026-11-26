@@ -142,11 +142,22 @@ const IMPORT_VERIFIER_CODE = [
   '    }',
   '  }',
   '}',
-  'for (const dep of [\'@larksuiteoapi/node-sdk\', \'@modelcontextprotocol/sdk/server/index.js\']) {',
+  "const pkgPath = path.join(root, 'package.json');",
+  'let declaredDeps = {};',
+  'if (fs.existsSync(pkgPath)) {',
   '  try {',
-  '    await import(dep);',
+  "    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));",
+  "    declaredDeps = pkg?.dependencies && typeof pkg.dependencies === 'object' ? pkg.dependencies : {};",
   '  } catch (err) {',
-  "    errors.push({ file: 'package.json', stage: 'imports', error: `Dependency check failed (${dep}): ${err?.message || err}` });",
+  "    errors.push({ file: 'package.json', stage: 'imports', error: `Invalid package.json: ${err?.message || err}` });",
+  '  }',
+  '}',
+  "for (const [pkgName, entry] of [['@larksuiteoapi/node-sdk', '@larksuiteoapi/node-sdk'], ['@modelcontextprotocol/sdk', '@modelcontextprotocol/sdk/server/index.js']]) {",
+  '  if (!Object.prototype.hasOwnProperty.call(declaredDeps, pkgName)) continue;',
+  '  try {',
+  '    await import(entry);',
+  '  } catch (err) {',
+  "    errors.push({ file: 'package.json', stage: 'imports', error: `Dependency check failed (${entry}): ${err?.message || err}` });",
   '  }',
   '}',
   'if (errors.length > 0) {',
@@ -209,6 +220,7 @@ export function runPreflightCheck(pluginRoot = getPluginRoot()) {
   if (errors.length === 0) {
     try {
       execFileSync(process.execPath, ['--input-type=module', '-e', IMPORT_VERIFIER_CODE], {
+        cwd: pluginRoot,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 10000,
@@ -257,6 +269,7 @@ export async function runPreflightCheckAsync(pluginRoot = getPluginRoot()) {
   if (errors.length === 0) {
     try {
       await execFileAsync(process.execPath, ['--input-type=module', '-e', IMPORT_VERIFIER_CODE], {
+        cwd: pluginRoot,
         encoding: 'utf8',
         timeout: 10000,
         env: { ...process.env, FEISHU_PREFLIGHT_ROOT: pluginRoot },
