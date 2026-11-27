@@ -14,10 +14,12 @@ import {
 import {
   buildModelsCard,
   buildSessionsCard,
+  collectFeishuSessions,
   expandHomePath,
   formatHelpMarkdown,
   getOrCreateChatState,
   normalizeTempMinutes,
+  parseSessionKey,
   toastCardResponse,
 } from '../bridge-helpers.mjs';
 
@@ -291,16 +293,31 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
     if (!arg) {
       return toastCardResponse('error', '缺少会话 ID');
     }
-    chatState.conversationId = arg;
+    const scope = String(value?.scope || chatState.lastSessionsScope || 'all').trim().toLowerCase() === 'current'
+      ? 'current'
+      : 'all';
+    const allSessions = collectFeishuSessions(state, runKey, { scope: 'all', limit: 50 });
+    const matched = allSessions.find((s) => s.id === arg || s.id.startsWith(arg)) || null;
+    const resolvedId = matched?.id || arg;
+    chatState.conversationId = resolvedId;
     chatState.pendingHandoff = null;
     chatState.originDesktopSession = null;
     chatState.lastTurnArtifacts = null;
     chatState.topicClosed = false;
+    if (matched && matched.sourceKind !== 'current' && matched.cwd) {
+      try {
+        if (fs.existsSync(matched.cwd) && fs.statSync(matched.cwd).isDirectory()) {
+          chatState.cwd = matched.cwd;
+        }
+      } catch {
+        // Ignore inaccessible cwd
+      }
+    }
     saveState(state);
     return toastCardResponse(
       'success',
-      `已切换到会话 ${arg.slice(0, 8)}`,
-      inplace ? buildSessionsCard(chatState) : null,
+      `已切换到会话 ${resolvedId.slice(0, 8)}`,
+      inplace ? buildSessionsCard(chatState, { state, sessionKey: runKey, scope }) : null,
     );
   }
 
@@ -315,14 +332,19 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
   }
 
   if (cmd === 'sessions') {
-    const card = buildSessionsCard(chatState);
+    const scope = String(value?.scope || 'all').trim().toLowerCase() === 'current' ? 'current' : 'all';
+    chatState.lastSessionsScope = scope;
+    saveState(state);
+    const card = buildSessionsCard(chatState, { state, sessionKey: runKey, scope });
+    const isTopic = Boolean(parseSessionKey(runKey).threadRootId);
+    const scopeLabel = scope === 'current' ? (isTopic ? '本话题会话' : '本窗口会话') : '全部飞书会话';
     if (inplace) {
-      return toastCardResponse('info', '最近会话', card);
+      return toastCardResponse('info', scopeLabel, card);
     }
     void sendToTarget(card).catch((err) => {
       console.error('[feishu-remote] send sessions card error:', err.message);
     });
-    return toastCardResponse('info', '已打开最近会话');
+    return toastCardResponse('info', `已打开${scopeLabel}`);
   }
 
   if (cmd === 'models') {

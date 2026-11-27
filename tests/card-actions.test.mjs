@@ -377,7 +377,7 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
     const helpCard = helpRes.card?.data;
     assert.equal(helpCard?.header?.title?.content, '❓ 控制面板功能说明');
     const helpJson = JSON.stringify(helpCard);
-    for (const expected of ['会话与跨端', '任务与工作区', '权限与配置', '临时全权30m', '系统与设置', '"cmd":"help_commands"', '"cmd":"panel"']) {
+    for (const expected of ['会话与跨端', '任务与工作区', '权限与配置', '30m全权', '设置', '"cmd":"help_commands"', '"cmd":"panel"']) {
       assert.ok(helpJson.includes(expected), `Missing ${expected} in panel help card`);
     }
 
@@ -391,7 +391,7 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
 
     const sysRes = await handleCardAction(ctx, makeEvent({ cmd: 'system_menu', inplace: true }, 'ou_test_owner', 'oc_act_1'));
     const sysCard = sysRes.card?.data;
-    assert.equal(sysCard.header.title.content, '🛠️ 系统与设置');
+    assert.equal(sysCard.header.title.content, '🛠️ 设置');
     const sysJson = JSON.stringify(sysCard);
     for (const cmdName of ['guard_toggle', 'notify_menu', 'scopes', 'safe_restart', 'ops', 'panel']) {
       assert.ok(sysJson.includes(`"cmd":"${cmdName}"`), `Missing ${cmdName} in system settings card`);
@@ -401,7 +401,7 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
       ctx,
       makeEvent({ cmd: 'guard_toggle', inplace: true, fromSystem: true }, 'ou_test_owner', 'oc_act_1'),
     );
-    assert.equal(toggleFromSys.card?.data?.header?.title?.content, '🛠️ 系统与设置');
+    assert.equal(toggleFromSys.card?.data?.header?.title?.content, '🛠️ 设置');
     assert.equal(resolveRiskyApprovalEnabled(loadConfig()), false);
     // Restore guard back to on
     await handleCardAction(
@@ -550,7 +550,7 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
       makeEvent({ cmd: 'reset_frequent_actions', inplace: true }, 'ou_test_owner', 'oc_freq_p2p'),
     );
     assert.equal(resetRes.toast.type, 'success');
-    assert.equal(resetRes.card?.data?.header?.title?.content, '🛠️ 系统与设置');
+    assert.equal(resetRes.card?.data?.header?.title?.content, '🛠️ 设置');
     assert.deepEqual(loadState().panelActionUsage, {});
 
     const afterResetRes = await handleCardAction(ctx, makeEvent({ cmd: 'panel', inplace: true }, 'ou_test_owner', 'oc_freq_p2p'));
@@ -761,5 +761,99 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
     const badCmdRes = await handleCardAction(ctx, makeEvent({ cmd: 'run_agy_cmd', arg: '/evil' }, 'ou_test_owner', 'oc_act_1'));
     assert.equal(badCmdRes.toast.type, 'error');
     assert.equal(enqueued.length, 1);
+  });
+
+  it('aggregates Feishu sessions across topics/p2p with scope switching, dedup, and cross-chat cwd sync', async () => {
+    const p2pDir = path.join(env.workDir, 'p2p-proj');
+    fs.mkdirSync(p2pDir, { recursive: true });
+
+    const st = loadState();
+    st.lastP2pChatByOpenId = { ...st.lastP2pChatByOpenId, ou_test_owner: 'oc_p2p_sess' };
+    st.chats.oc_p2p_sess = {
+      conversationId: 'conv-p2p-1',
+      cwd: p2pDir,
+      mode: 'accept-edits',
+      recentConversations: [
+        { id: 'conv-p2p-1', summary: '私聊历史任务', updatedAt: '2026-11-26T10:00:00Z', cwd: p2pDir },
+        { id: 'conv-dup-1', summary: '旧版重复摘要', updatedAt: '2026-11-26T08:00:00Z', cwd: env.workDir },
+      ],
+    };
+    st.chats['oc_topic_grp#om_other_root'] = {
+      conversationId: 'conv-other-topic',
+      cwd: env.workDir,
+      mode: 'accept-edits',
+      recentConversations: [
+        { id: 'conv-other-topic', summary: '同群其他话题任务', updatedAt: '2026-11-26T09:00:00Z', cwd: env.workDir },
+      ],
+    };
+    st.chats['oc_topic_grp#om_cur_root'] = {
+      conversationId: 'conv-cur-1',
+      cwd: env.workDir,
+      mode: 'accept-edits',
+      recentConversations: [
+        { id: 'conv-cur-1', summary: '本话题任务', updatedAt: '2026-11-26T11:00:00Z', cwd: env.workDir },
+        { id: 'conv-dup-1', summary: '本话题重复摘要', updatedAt: '2026-11-26T09:30:00Z', cwd: env.workDir },
+      ],
+    };
+    st.chats['oc_topic_grp#om_empty_root'] = {
+      conversationId: '',
+      cwd: env.workDir,
+      mode: 'accept-edits',
+      recentConversations: [],
+    };
+    saveState(st);
+
+    const { client } = createMockFeishuClient();
+    const ctx = createBridgeContext({ client });
+    ctx.cardThreadMap.set('om_topic_card_1', {
+      sessionKey: 'oc_topic_grp#om_cur_root',
+      threadRootId: 'om_cur_root',
+      chatId: 'oc_topic_grp',
+    });
+    ctx.cardThreadMap.set('om_empty_card_1', {
+      sessionKey: 'oc_topic_grp#om_empty_root',
+      threadRootId: 'om_empty_root',
+      chatId: 'oc_topic_grp',
+    });
+
+    const makeTopicEvent = (value, msgId = 'om_topic_card_1') => ({
+      operator: { open_id: 'ou_test_owner' },
+      context: { open_chat_id: 'oc_topic_grp', open_message_id: msgId },
+      action: { value },
+    });
+
+    // 1. Default 'all' view shows aggregated Feishu sessions with source tags and deduplication
+    const allRes = await handleCardAction(ctx, makeTopicEvent({ cmd: 'sessions', inplace: true }));
+    assert.ok(allRes.card?.data?.header?.title?.content.includes('全部飞书'));
+    const allMd = allRes.card?.data?.body?.elements?.find((e) => e.tag === 'markdown')?.content || '';
+    assert.ok(allMd.includes('[本话题]'));
+    assert.ok(allMd.includes('[私聊]'));
+    assert.ok(allMd.includes('[同群话题]'));
+    assert.ok(allMd.includes('本话题重复摘要'));
+    assert.ok(!allMd.includes('旧版重复摘要'));
+    assert.equal(allMd.split('conv-dup').length - 1, 1);
+
+    // 2. Switching to 'current' view only shows current topic sessions
+    const curRes = await handleCardAction(ctx, makeTopicEvent({ cmd: 'sessions', scope: 'current', inplace: true }));
+    assert.ok(curRes.card?.data?.header?.title?.content.includes('本话题'));
+    const curMd = curRes.card?.data?.body?.elements?.find((e) => e.tag === 'markdown')?.content || '';
+    assert.ok(curMd.includes('本话题任务'));
+    assert.ok(!curMd.includes('私聊历史任务'));
+    assert.ok(!curMd.includes('同群其他话题任务'));
+
+    // 3. Empty current topic shows prompt with '全部飞书' tab
+    const emptyRes = await handleCardAction(ctx, makeTopicEvent({ cmd: 'sessions', scope: 'current', inplace: true }, 'om_empty_card_1'));
+    assert.equal(emptyRes.card?.data?.header?.title?.content, '🗂️ 最近会话 · 本话题');
+    const emptyJson = JSON.stringify(emptyRes.card?.data);
+    assert.ok(emptyJson.includes('📱 全部飞书'));
+
+    // 4. Switching to a cross-chat session updates conversationId, syncs valid cwd, and keeps scope='all'
+    const useRes = await handleCardAction(ctx, makeTopicEvent({ cmd: 'use', arg: 'conv-p2p-1', scope: 'all', inplace: true }));
+    assert.equal(useRes.toast.type, 'success');
+    assert.ok(useRes.card?.data?.header?.title?.content.includes('全部飞书'));
+    const afterSt = loadState();
+    assert.equal(afterSt.chats['oc_topic_grp#om_cur_root'].conversationId, 'conv-p2p-1');
+    assert.equal(afterSt.chats['oc_topic_grp#om_cur_root'].cwd, p2pDir);
+    assert.equal(afterSt.chats.oc_topic_grp?.cwd, undefined);
   });
 });

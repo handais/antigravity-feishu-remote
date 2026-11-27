@@ -51,6 +51,7 @@ import {
   buildCurrentOpsCard,
   buildModelsCard,
   buildSessionsCard,
+  collectFeishuSessions,
   collectGitInfoAsync,
   enforceTempFullExpiry,
   expandHomePath,
@@ -491,9 +492,15 @@ export async function handleSlashCommand(
   }
 
   if (cmd === '/sessions') {
+    const sub = arg.trim().toLowerCase();
+    const scope = ['current', 'here', 'local', 'topic', 'this', '本话题', '本窗口', '当前'].includes(sub)
+      ? 'current'
+      : 'all';
+    chatState.lastSessionsScope = scope;
+    saveState(state);
     await replyCard(client, {
       messageId,
-      card: buildSessionsCard(chatState),
+      card: buildSessionsCard(chatState, { state, sessionKey: runKey, scope }),
     });
     return true;
   }
@@ -523,14 +530,20 @@ export async function handleSlashCommand(
       });
       return true;
     }
-    const list = chatState.recentConversations || [];
+    const preferredScope = chatState.lastSessionsScope === 'current' ? 'current' : 'all';
+    let matched = null;
     let targetId = '';
     if (/^\d+$/.test(arg)) {
+      const visibleList = collectFeishuSessions(state, runKey, { scope: preferredScope, limit: 10 });
       const idx = Number(arg) - 1;
-      if (idx >= 0 && idx < list.length) targetId = list[idx].id;
+      if (idx >= 0 && idx < visibleList.length) {
+        matched = visibleList[idx];
+        targetId = matched.id;
+      }
     } else {
-      const match = list.find((item) => item.id === arg || item.id.startsWith(arg));
-      targetId = match ? match.id : arg;
+      const allList = collectFeishuSessions(state, runKey, { scope: 'all', limit: 50 });
+      matched = allList.find((item) => item.id === arg || item.id.startsWith(arg)) || null;
+      targetId = matched ? matched.id : arg;
     }
     if (!targetId) {
       await replySimple({
@@ -546,11 +559,26 @@ export async function handleSlashCommand(
     chatState.originDesktopSession = null;
     chatState.lastTurnArtifacts = null;
     chatState.topicClosed = false;
+    let cwdSynced = '';
+    if (matched && matched.sourceKind !== 'current' && matched.cwd) {
+      try {
+        if (fs.existsSync(matched.cwd) && fs.statSync(matched.cwd).isDirectory()) {
+          chatState.cwd = matched.cwd;
+          cwdSynced = matched.cwd;
+        }
+      } catch {
+        // Ignore inaccessible cwd
+      }
+    }
     saveState(state);
+    const mdLines = [`当前对话已绑定到 \`${targetId}\`。`];
+    if (cwdSynced) {
+      mdLines.push(`- **已同步工作目录**：\`${cwdSynced}\``);
+    }
     await replySimple({
       title: '🔁 已切换会话',
       template: 'green',
-      markdown: `当前对话已绑定到 \`${targetId}\`。`,
+      markdown: mdLines.join('\n'),
       buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
     });
     return true;

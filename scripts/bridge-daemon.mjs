@@ -25,7 +25,7 @@ import {
   consumePendingRestartNotice,
   createBackupSnapshot,
 } from './lib/self-ops.mjs';
-import { maskIdentifier } from './lib/io-utils.mjs';
+import { installTimestampedConsole, maskIdentifier } from './lib/io-utils.mjs';
 import {
   enforceTempFullExpiry,
   formatHelpMarkdown,
@@ -40,6 +40,7 @@ import { createTaskRunner } from './lib/task-runner.mjs';
 import { handleSlashCommand } from './lib/slash-commands.mjs';
 import { handleBotMenuEvent, handleCardAction } from './lib/card-actions.mjs';
 
+installTimestampedConsole();
 const startedAt = Date.now();
 const bootCodeHash = computePluginCodeHash();
 const initialConfig = loadConfig();
@@ -439,7 +440,10 @@ async function handleIncomingMessage(rawEvent) {
   });
 }
 
-const dispatcher = new Lark.EventDispatcher({ loggerLevel: Lark.LoggerLevel.warn }).register({
+const dispatcher = new Lark.EventDispatcher({
+  logger: createStderrLogger('lark-event'),
+  loggerLevel: Lark.LoggerLevel.warn,
+}).register({
   'im.message.receive_v1': async (data) => {
     void handleIncomingMessage(data).catch((err) => {
       console.error('[feishu-remote] Unhandled message worker error:', err);

@@ -50,12 +50,12 @@ export async function handleOpsAction(actionCtx) {
       uptimeText: formatUptime(Date.now() - (startedAt || Date.now())),
     });
     if (inplace) {
-      return toastCardResponse('info', '系统与设置', card);
+      return toastCardResponse('info', '设置', card);
     }
     void sendToTarget(card).catch((err) => {
       console.error('[feishu-remote] send system settings card error:', err.message);
     });
-    return toastCardResponse('info', '已打开系统与设置');
+    return toastCardResponse('info', '已打开设置');
   }
 
   if (cmd === 'reset_frequent_actions') {

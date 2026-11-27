@@ -135,3 +135,63 @@ export function maskIdentifier(id) {
   if (raw.length <= 8) return '***';
   return `${raw.slice(0, 6)}***${raw.slice(-4)}`;
 }
+
+const TIMESTAMPED_CONSOLE_SYM = Symbol.for('antigravity.feishuRemote.timestampedConsole');
+
+function pad2(num) {
+  return String(num).padStart(2, '0');
+}
+
+function pad3(num) {
+  return String(num).padStart(3, '0');
+}
+
+/**
+ * Format a Date (or timestamp) as local wall-clock time `YYYY-MM-DD HH:mm:ss.SSS±HH:MM`.
+ */
+export function formatLocalTimestamp(input = new Date()) {
+  const d = input instanceof Date ? input : new Date(input);
+  const safe = Number.isNaN(d.getTime()) ? new Date() : d;
+  const year = safe.getFullYear();
+  const month = pad2(safe.getMonth() + 1);
+  const day = pad2(safe.getDate());
+  const hours = pad2(safe.getHours());
+  const minutes = pad2(safe.getMinutes());
+  const seconds = pad2(safe.getSeconds());
+  const millis = pad3(safe.getMilliseconds());
+  const offsetMin = -safe.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? '+' : '-';
+  const absOffset = Math.abs(offsetMin);
+  const offsetHours = pad2(Math.floor(absOffset / 60));
+  const offsetMins = pad2(absOffset % 60);
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${millis}${sign}${offsetHours}:${offsetMins}`;
+}
+
+/**
+ * Idempotently prefix `console.log`/`info`/`warn`/`error` with local timestamps.
+ */
+export function installTimestampedConsole(targetConsole = console, { now = () => new Date() } = {}) {
+  if (!targetConsole || targetConsole[TIMESTAMPED_CONSOLE_SYM]) {
+    return targetConsole;
+  }
+  for (const method of ['log', 'info', 'warn', 'error']) {
+    const original = targetConsole[method];
+    if (typeof original !== 'function') continue;
+    targetConsole[method] = (...args) => {
+      const prefix = `[${formatLocalTimestamp(now())}]`;
+      if (args.length === 0) {
+        return original.call(targetConsole, prefix);
+      }
+      if (typeof args[0] === 'string') {
+        return original.call(targetConsole, `${prefix} ${args[0]}`, ...args.slice(1));
+      }
+      return original.call(targetConsole, prefix, ...args);
+    };
+  }
+  Object.defineProperty(targetConsole, TIMESTAMPED_CONSOLE_SYM, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return targetConsole;
+}

@@ -604,43 +604,209 @@ export function formatHelpMarkdown() {
   ].join('\n');
 }
 
-export function buildSessionsCard(chatState) {
-  const list = chatState.recentConversations || [];
+/**
+ * Collect Feishu session history for the current chat/thread or aggregated across all Feishu windows.
+ */
+export function collectFeishuSessions(state, currentSessionKey = '', { scope = 'all', limit = 10 } = {}) {
+  const normalizedScope = scope === 'current' ? 'current' : 'all';
+  const normalizedLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
+  const { chatId: curChatId, threadRootId: curThreadRootId } = parseSessionKey(currentSessionKey);
+  const p2pChatIds = new Set(Object.values(state?.lastP2pChatByOpenId || {}).filter(Boolean));
+
+  const classifySource = (chatKey) => {
+    if (chatKey === currentSessionKey) {
+      return { sourceKind: 'current', sourceLabel: curThreadRootId ? '本话题' : '本窗口' };
+    }
+    if (chatKey.includes('#')) {
+      const { chatId: keyChatId } = parseSessionKey(chatKey);
+      if (curChatId && keyChatId === curChatId) {
+        return { sourceKind: 'same_group_topic', sourceLabel: '同群话题' };
+      }
+      return { sourceKind: 'other_topic', sourceLabel: '话题' };
+    }
+    if (p2pChatIds.has(chatKey) || chatKey.startsWith('ou_')) {
+      return { sourceKind: 'p2p', sourceLabel: '私聊' };
+    }
+    return { sourceKind: 'other_chat', sourceLabel: '其他群' };
+  };
+
+  if (normalizedScope === 'current') {
+    const curState = state?.chats?.[currentSessionKey];
+    const recent = Array.isArray(curState?.recentConversations) ? curState.recentConversations : [];
+    const src = classifySource(currentSessionKey);
+    return recent
+      .filter((item) => item?.id)
+      .slice(0, normalizedLimit)
+      .map((item) => ({
+        id: String(item.id),
+        summary: String(item.summary || ''),
+        updatedAt: String(item.updatedAt || ''),
+        updatedAtMs: Date.parse(item.updatedAt || '') || 0,
+        cwd: String(item.cwd || curState?.cwd || ''),
+        chatKey: currentSessionKey,
+        ...src,
+      }));
+  }
+
+  const byId = new Map();
+  for (const [chatKey, info] of Object.entries(state?.chats || {})) {
+    if (!info || typeof info !== 'object') continue;
+    const src = classifySource(chatKey);
+    const recent = Array.isArray(info.recentConversations) ? info.recentConversations : [];
+    for (const item of recent) {
+      const id = String(item?.id || '').trim();
+      if (!id) continue;
+      const updatedAt = String(item.updatedAt || '');
+      const updatedAtMs = Date.parse(updatedAt) || 0;
+      const summary = String(item.summary || '');
+      const cwd = String(item.cwd || info.cwd || '');
+      const prev = byId.get(id);
+      if (!prev) {
+        byId.set(id, {
+          id,
+          summary,
+          updatedAt,
+          updatedAtMs,
+          cwd,
+          chatKey,
+          ...src,
+        });
+        continue;
+      }
+
+      const isNewer = updatedAtMs > prev.updatedAtMs;
+      let chosenSource = isNewer ? { chatKey, ...src } : { chatKey: prev.chatKey, sourceKind: prev.sourceKind, sourceLabel: prev.sourceLabel };
+      if (src.sourceKind === 'current') {
+        chosenSource = { chatKey, ...src };
+      } else if (prev.sourceKind === 'current') {
+        chosenSource = { chatKey: prev.chatKey, sourceKind: prev.sourceKind, sourceLabel: prev.sourceLabel };
+      }
+
+      byId.set(id, {
+        id,
+        summary: isNewer ? (summary || prev.summary) : (prev.summary || summary),
+        updatedAt: isNewer ? (updatedAt || prev.updatedAt) : (prev.updatedAt || updatedAt),
+        updatedAtMs: Math.max(updatedAtMs, prev.updatedAtMs),
+        cwd: isNewer ? (cwd || prev.cwd) : (prev.cwd || cwd),
+        ...chosenSource,
+      });
+    }
+
+    const activeId = String(info.conversationId || '').trim();
+    if (activeId && !byId.has(activeId)) {
+      const activeMs = Number(info.lastActiveAt || 0);
+      byId.set(activeId, {
+        id: activeId,
+        summary: '',
+        updatedAt: activeMs ? new Date(activeMs).toISOString() : '',
+        updatedAtMs: activeMs,
+        cwd: String(info.cwd || ''),
+        chatKey,
+        ...src,
+      });
+    }
+  }
+
+  return [...byId.values()]
+    .sort((a, b) => (
+      (b.updatedAtMs - a.updatedAtMs) ||
+      ((b.sourceKind === 'current' ? 1 : 0) - (a.sourceKind === 'current' ? 1 : 0))
+    ))
+    .slice(0, normalizedLimit);
+}
+
+export function buildSessionsCard(chatState, { state = null, sessionKey = '', scope = 'all' } = {}) {
+  const normalizedScope = scope === 'current' ? 'current' : 'all';
+  const isTopic = Boolean(parseSessionKey(sessionKey).threadRootId);
+  const currentTabLabel = isTopic ? '🧵 本话题' : '💬 本窗口';
+  const list = state && sessionKey
+    ? collectFeishuSessions(state, sessionKey, { scope: normalizedScope, limit: 10 })
+    : (Array.isArray(chatState?.recentConversations) ? chatState.recentConversations.slice(0, 10) : []);
+
+  const tabRow = [
+    {
+      label: '📱 全部飞书',
+      type: normalizedScope === 'all' ? 'primary' : 'default',
+      value: { cmd: 'sessions', scope: 'all', inplace: true },
+    },
+    {
+      label: currentTabLabel,
+      type: normalizedScope === 'current' ? 'primary' : 'default',
+      value: { cmd: 'sessions', scope: 'current', inplace: true },
+    },
+    {
+      label: '💻 电脑对话',
+      value: { cmd: 'desktop_list', filter: 'all', inplace: true },
+    },
+  ];
+
   if (list.length === 0) {
+    const hasAnyGlobal = normalizedScope === 'current' &&
+      state &&
+      collectFeishuSessions(state, sessionKey, { scope: 'all', limit: 1 }).length > 0;
+
+    if (hasAnyGlobal) {
+      return buildCard({
+        title: isTopic ? '🗂️ 最近会话 · 本话题' : '🗂️ 最近会话 · 本窗口',
+        template: 'grey',
+        markdown: isTopic
+          ? '当前话题楼还没有飞书历史会话记录，可点击 **📱 全部飞书** 查看其他话题/私聊会话，或点 **💻 电脑对话** 扫描本机历史对话。'
+          : '当前窗口还没有飞书历史会话记录，可点击 **📱 全部飞书** 查看其他话题/私聊会话，或点 **💻 电脑对话** 扫描本机历史对话。',
+        buttonRows: [
+          tabRow,
+          [
+            { label: '🆕 新对话', value: { cmd: 'new', inplace: true } },
+            { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
+          ],
+        ],
+      });
+    }
+
     return buildCard({
       title: '🗂️ 最近会话',
       template: 'grey',
       markdown: '当前聊天还没有飞书历史会话记录，可点击下方按钮扫描电脑端历史对话。',
-      buttonRows: [[
-        { label: '💻 电脑对话', type: 'primary', value: { cmd: 'desktop_list', filter: 'all', inplace: true } },
-        { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
-      ]],
+      buttonRows: [
+        tabRow,
+        [{ label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } }],
+      ],
     });
   }
-  const lines = list.map((item, idx) => {
-    const currentMark = item.id === chatState.conversationId ? ' ✅(当前)' : '';
-    return `${idx + 1}. \`${item.id.slice(0, 8)}\`${currentMark} — ${item.summary || '(无摘要)'}`;
-  });
-  lines.push('', '点击下方按钮直接切换，或点 **💻 电脑对话** 扫描并接管本机 CLI / 桌面端会话。');
 
-  const buttons = list.slice(0, 5).map((item, idx) => {
+  const lines = list.map((item, idx) => {
+    const sourceTag = normalizedScope === 'all' && item.sourceLabel ? ` [${item.sourceLabel}]` : '';
+    const currentMark = item.id === chatState?.conversationId ? ' ✅(当前)' : '';
+    const summaryText = sanitizeForFeishuMarkdown(item.summary || '(无摘要)');
+    return `${idx + 1}. \`${item.id.slice(0, 8)}\`${sourceTag}${currentMark} — ${summaryText}`;
+  });
+  lines.push(
+    '',
+    normalizedScope === 'all'
+      ? '点击下方按钮直接切换（或发送 `/use 序号`），点 **💻 电脑对话** 可扫描并接管本机 CLI / 桌面端会话。'
+      : '点击下方按钮直接切换（或发送 `/use 序号`），点 **📱 全部飞书** 可查看跨话题/私聊会话。',
+  );
+
+  const buttons = list.slice(0, 6).map((item, idx) => {
     const labelText = (item.summary || item.id.slice(0, 8)).slice(0, 10);
     return {
       label: `${idx + 1}. ${labelText}`,
-      type: item.id === chatState.conversationId ? 'primary' : 'default',
-      value: { cmd: 'use', arg: item.id, inplace: true },
+      type: item.id === chatState?.conversationId ? 'primary' : 'default',
+      value: { cmd: 'use', arg: item.id, scope: normalizedScope, inplace: true },
     };
   });
 
+  const title = normalizedScope === 'all'
+    ? '🗂️ 最近会话 · 全部飞书（最多 10 条）'
+    : isTopic
+      ? '🗂️ 最近会话 · 本话题（最多 10 条）'
+      : '🗂️ 最近会话 · 本窗口（最多 10 条）';
+
   return buildCard({
-    title: '🗂️ 最近会话（最多 10 条）',
+    title,
     template: 'blue',
     markdown: lines.join('\n'),
     buttonRows: [
-      [
-        { label: '📱 飞书会话', type: 'primary', value: { cmd: 'sessions', inplace: true } },
-        { label: '💻 电脑对话', value: { cmd: 'desktop_list', filter: 'all', inplace: true } },
-      ],
+      tabRow,
       ...chunkButtons(buttons, 3),
       [
         { label: '🆕 新对话', value: { cmd: 'new', inplace: true } },

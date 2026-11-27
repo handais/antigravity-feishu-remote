@@ -460,7 +460,9 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
   }
 
   if (key === 'sessions') {
-    await sendToTarget(buildSessionsCard(chatState));
+    chatState.lastSessionsScope = 'all';
+    saveState(state);
+    await sendToTarget(buildSessionsCard(chatState, { state, sessionKey: stateKey, scope: 'all' }));
     return;
   }
 

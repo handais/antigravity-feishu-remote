@@ -13,7 +13,7 @@ import {
 const env = createTestEnv('feishu-slash-cmds-');
 let config;
 
-const { loadConfig, resolveRiskyApprovalEnabled, saveState } = await import('../scripts/lib/config.mjs');
+const { loadConfig, loadState, resolveRiskyApprovalEnabled, saveState } = await import('../scripts/lib/config.mjs');
 const { handleSlashCommand } = await import('../scripts/lib/slash-commands.mjs');
 
 describe('slash-commands coverage', () => {
@@ -232,5 +232,82 @@ describe('slash-commands coverage', () => {
     assert.equal(agyPassthrough.handled, true);
     assert.equal(enqueued.length, 1);
     assert.equal(enqueued[0].text, '/help');
+  });
+
+  it('handles /sessions scope switching and cross-chat /use inside a topic thread', async () => {
+    const otherDir = path.join(env.workDir, 'topic-other-dir');
+    fs.mkdirSync(otherDir, { recursive: true });
+
+    const st = loadState();
+    const now = Date.now();
+    st.lastP2pChatByOpenId = { ...st.lastP2pChatByOpenId, ou_test_owner: 'oc_p2p_chat' };
+    st.chats.oc_p2p_chat = {
+      conversationId: 'p2p-topic-cross-1',
+      cwd: otherDir,
+      mode: 'accept-edits',
+      recentConversations: [
+        { id: 'p2p-topic-cross-1', summary: '来自私聊的跨端会话', updatedAt: new Date(now + 60_000).toISOString(), cwd: otherDir },
+      ],
+    };
+    st.chats['oc_grp_t#om_root_x'] = {
+      conversationId: 'topic-cur-1',
+      cwd: env.workDir,
+      mode: 'accept-edits',
+      recentConversations: [
+        { id: 'topic-cur-1', summary: '当前话题会话', updatedAt: new Date(now + 120_000).toISOString(), cwd: env.workDir },
+      ],
+    };
+    saveState(st);
+
+    async function runTopicCmd(text) {
+      const { client, calls } = createMockFeishuClient();
+      const ctx = createBridgeContext({ client });
+      const handled = await handleSlashCommand(ctx, {
+        text,
+        chatId: 'oc_grp_t',
+        openId: 'ou_test_owner',
+        messageId: 'om_topic_msg',
+        sessionKey: 'oc_grp_t#om_root_x',
+        threadRootId: 'om_root_x',
+        replyInThread: true,
+        config: loadConfig(),
+      });
+      return { handled, calls };
+    }
+
+    // 1. Default /sessions renders '全部飞书' including [本话题] and [私聊]
+    const allSess = await runTopicCmd('/sessions');
+    assert.equal(allSess.handled, true);
+    const allCard = allSess.calls.repliedCards[0].card;
+    assert.ok(allCard.header.title.content.includes('全部飞书'));
+    const allJson = JSON.stringify(allCard);
+    assert.ok(allJson.includes('[本话题]'));
+    assert.ok(allJson.includes('[私聊]'));
+    assert.ok(allJson.includes('p2p-topi'));
+
+    // 2. /use 2 matches index 2 in 'all' view (p2p-topic-cross-1) and syncs cwd
+    const useIdx2 = await runTopicCmd('/use 2');
+    assert.equal(useIdx2.handled, true);
+    assert.ok(JSON.stringify(useIdx2.calls.repliedCards[0].card).includes('p2p-topic-cross-1'));
+    assert.ok(JSON.stringify(useIdx2.calls.repliedCards[0].card).includes('已同步工作目录'));
+    assert.equal(loadState().chats['oc_grp_t#om_root_x'].conversationId, 'p2p-topic-cross-1');
+    assert.equal(loadState().chats['oc_grp_t#om_root_x'].cwd, otherDir);
+
+    // 3. /sessions here switches to 'current' view and updates lastSessionsScope
+    const curSess = await runTopicCmd('/sessions here');
+    assert.equal(curSess.handled, true);
+    const curCard = curSess.calls.repliedCards[0].card;
+    assert.ok(curCard.header.title.content.includes('本话题'));
+    assert.ok(!JSON.stringify(curCard).includes('p2p-topi'));
+
+    // 4. /use 1 now resolves against 'current' view (topic-cur-1)
+    const useIdx1 = await runTopicCmd('/use 1');
+    assert.equal(useIdx1.handled, true);
+    assert.equal(loadState().chats['oc_grp_t#om_root_x'].conversationId, 'topic-cur-1');
+
+    // 5. /use <prefix> resolves cross-chat sessions even when lastSessionsScope is 'current'
+    const usePrefix = await runTopicCmd('/use p2p-topic');
+    assert.equal(usePrefix.handled, true);
+    assert.equal(loadState().chats['oc_grp_t#om_root_x'].conversationId, 'p2p-topic-cross-1');
   });
 });

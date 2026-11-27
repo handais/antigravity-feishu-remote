@@ -457,7 +457,7 @@ export function buildFrequentPanelButtons({
     effort_menu: { label: '🎛️ 强度', value: { cmd: 'effort_menu', inplace: true } },
     skills_menu: { label: '🧩 命令', value: { cmd: 'skills_menu', inplace: true } },
     mode_temp_full: {
-      label: isTempFull ? `⚡ 临时全权(${remainingMin}m)` : '⚡ 临时全权30m',
+      label: isTempFull ? `⚡ 全权剩${remainingMin}m` : '⚡ 30m全权',
       type: isTempFull ? 'primary' : 'default',
       value: { cmd: 'mode_temp_full', arg: '30', inplace: true },
     },
@@ -615,7 +615,7 @@ export function buildControlPanelCard({
       value: { cmd: 'mode', arg: 'plan', inplace: true },
     },
     {
-      label: isTempFull ? `⚡ 临时全权(${remainingMin}m)` : '⚡ 临时全权30m',
+      label: isTempFull ? `⚡ 全权剩${remainingMin}m` : '⚡ 30m全权',
       type: isTempFull ? 'primary' : 'default',
       value: { cmd: 'mode_temp_full', arg: '30', inplace: true },
     },
@@ -629,7 +629,7 @@ export function buildControlPanelCard({
   const configRow = [
     { label: '🧠 模型', value: { cmd: 'models', inplace: true } },
     { label: '🎛️ 强度', value: { cmd: 'effort_menu', inplace: true } },
-    { label: '🛠️ 系统与设置', value: { cmd: 'system_menu', inplace: true } },
+    { label: '🛠️ 设置', value: { cmd: 'system_menu', inplace: true } },
     { label: '🔄 刷新', value: { cmd: 'panel', inplace: true } },
     { label: '❓ 帮助', value: { cmd: 'help', inplace: true } },
   ];
@@ -661,7 +661,7 @@ export function buildControlPanelCard({
     template: isRunning ? 'wathet' : 'blue',
     markdown: lines.join('\n'),
     sections,
-    footer: '安全提示：按需点「⚡ 临时全权30m」· 通知/高危审批/重启在「🛠️ 系统与设置」',
+    footer: '安全提示：按需点「⚡ 30m全权」· 通知/高危审批/重启在「🛠️ 设置」',
   });
 }
 
@@ -685,7 +685,7 @@ export function buildSystemSettingsCard({ config, isRunning = false, uptimeText 
   ];
 
   return buildSectionedCard({
-    title: '🛠️ 系统与设置',
+    title: '🛠️ 设置',
     template: 'blue',
     markdown: lines.join('\n'),
     sections: [
@@ -719,7 +719,7 @@ export function buildSystemSettingsCard({ config, isRunning = false, uptimeText 
 
 export function buildPanelHelpCard() {
   const markdown = [
-    '- `⭐ 常用操作`：自动按点击频次与最近使用动态置顶前 4 个高频按钮（含系统二级页快捷入口），可在「🛠️ 系统与设置 → 🧹 重置常用」清空',
+    '- `⭐ 常用操作`：自动按点击频次与最近使用动态置顶前 4 个高频按钮（含系统二级页快捷入口），可在「🛠️ 设置 → 🧹 重置常用」清空',
     '',
     '**💬 会话与跨端**',
     '- `🆕 新对话`：清空当前上下文，下条消息开启全新会话',
@@ -735,9 +735,9 @@ export function buildPanelHelpCard() {
     '',
     '**🛡️ 权限与配置**',
     '- `🤖 自动` / `📖 只读`：智能平衡自动执行，或只分析规划不改任何文件',
-    '- `⚡ 临时全权30m` / `⚡ 常驻全权`：放开 Shell / MCP 执行权限（临时全权 30 分钟后自动降权）',
+    '- `⚡ 30m全权` / `⚡ 常驻全权`：放开 Shell / MCP 执行权限（30m全权到期后自动降权）',
     '- `🧠 模型` / `🎛️ 强度`：切换当前会话使用的模型与推理深度',
-    '- `🛠️ 系统与设置`：集中管理高危命令审批、桌面完成提醒、应用权限自检、安全重启与快照回滚',
+    '- `🛠️ 设置`：集中管理高危命令审批、桌面完成提醒、应用权限自检、安全重启与快照回滚',
     '- `🔄 刷新`：立即同步最新运行状态、目录与队列计数',
   ].join('\n');
 
@@ -869,7 +869,7 @@ export function buildAgySkillsCard({ skills = null, homeDir = os.homedir() } = {
 
   lines.push(
     '',
-    '💡 用法：直接用自然语言点名技能（如「用 `mac-control` 截个图」）或发 `/技能名` 即可；需跑命令/MCP 的技能建议先点控制面板「⚡ 临时全权30m」。',
+    '💡 用法：直接用自然语言点名技能（如「用 `mac-control` 截个图」）或发 `/技能名` 即可；需跑命令/MCP 的技能建议先点控制面板「⚡ 30m全权」。',
   );
 
   return buildCard({

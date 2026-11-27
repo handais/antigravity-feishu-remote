@@ -353,7 +353,7 @@ try {
   for (const el of panelCard.body.elements.filter((item) => item.tag === 'column_set')) {
     assert.ok(el.columns.length <= 5, `Panel button row too wide (${el.columns.length} cols)`);
   }
-  assert.ok(JSON.stringify(panelCard).includes('临时全权'));
+  assert.ok(JSON.stringify(panelCard).includes('全权剩'));
   assert.ok(JSON.stringify(panelCard).includes('队列(2)'));
 
   const queuedCard = buildQueuedCard({ position: 2, queueId: 'q-1', promptPreview: 'run tests', runningPreview: 'build' });
