@@ -106,6 +106,9 @@ Friend installation steps:
 4. Run `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs start`
 5. Message their Feishu bot once in private chat to auto-bind their `open_id`.
 
+GitHub Release notes convention:
+- Always put the **AI-first install/upgrade** workflow at the top of the Install & Upgrade section (tell users to send `https://github.com/handais/antigravity-feishu-remote` directly to Antigravity so the AI installs/upgrades automatically without manual zip extraction), followed by `git pull && npm install --omit=dev` for existing clones, and manual zip extraction (`~/.gemini/config/plugins/`, avoiding double-nested `feishu-remote/feishu-remote/`) as the offline/no-Git fallback.
+
 ## 5. Troubleshooting Quick Notes
 
 - **Proxy isolation**: Feishu WS/REST calls strip `http_proxy` / `https_proxy` / `all_proxy` by default so local `socks5://` proxies do not break Feishu WebSocket connections, while spawned `agy` subprocesses receive `config.agy.proxy`.
