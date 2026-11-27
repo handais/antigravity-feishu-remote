@@ -21,6 +21,7 @@ import {
   buildScopesCard,
   buildTasksCard,
   canonicalizeDirPath,
+  getActivePendingCommand,
   replyCard as sendReplyCard,
   searchDirsFuzzy,
   sendLocalMedia,
@@ -115,7 +116,7 @@ export async function handleSlashCommand(
   if (cmd === '/' || cmd === '/skills' || cmd === '/commands') {
     await replyCard(client, {
       messageId,
-      card: buildAgySkillsCard(),
+      card: buildAgySkillsCard({ pendingCommand: getActivePendingCommand(chatState) }),
     });
     return true;
   }
@@ -124,7 +125,7 @@ export async function handleSlashCommand(
     if (!arg) {
       await replyCard(client, {
         messageId,
-        card: buildAgySkillsCard(),
+        card: buildAgySkillsCard({ pendingCommand: getActivePendingCommand(chatState) }),
       });
       return true;
     }
@@ -303,6 +304,7 @@ export async function handleSlashCommand(
       : notifyMode === 'away'
         ? `🧠 仅离开电脑时（空闲 ≥ ${awayMin}m）`
         : '🔕 已关闭';
+    const activePending = getActivePendingCommand(chatState);
     const lines = [
       threadRootId ? `- **所属话题**：\`${threadRootId.slice(0, 12)}\`（独立并行会话）` : '',
       `- **工作目录**：\`${chatState.cwd}\``,
@@ -318,6 +320,9 @@ export async function handleSlashCommand(
         : '',
       chatState.pendingHandoff
         ? `- **待注入电脑端上下文**：\`${chatState.pendingHandoff.id?.slice(0, 8) || '-'}\` · ${chatState.pendingHandoff.title || '(无标题)'}`
+        : '',
+      activePending
+        ? `- **已预选命令**：\`${activePending.prefix}\`（下条消息自动拼接，发 \`/cancel\` 可取消）`
         : '',
       `- **运行中任务**：${running ? `是（已运行 ${Math.round((Date.now() - running.startedAt) / 1000)}s）` : '空闲'}`,
       activeRuns.size > 0 ? `- **全局并行运行**：\`${activeRuns.size}/${config.agy.maxConcurrentRuns || 4}\`` : '',
@@ -340,6 +345,7 @@ export async function handleSlashCommand(
   if (cmd === '/new') {
     chatState.conversationId = '';
     chatState.pendingHandoff = null;
+    chatState.pendingCommand = null;
     chatState.originDesktopSession = null;
     chatState.lastTurnArtifacts = null;
     chatState.topicClosed = false;
@@ -556,6 +562,7 @@ export async function handleSlashCommand(
     }
     chatState.conversationId = targetId;
     chatState.pendingHandoff = null;
+    chatState.pendingCommand = null;
     chatState.originDesktopSession = null;
     chatState.lastTurnArtifacts = null;
     chatState.topicClosed = false;
@@ -1246,6 +1253,21 @@ export async function handleSlashCommand(
   if (cmd === '/stop' || cmd === '/cancel') {
     const running = activeRuns.get(runKey);
     if (!running) {
+      const activePending = getActivePendingCommand(chatState);
+      if (activePending) {
+        chatState.pendingCommand = null;
+        saveState(state);
+        await replySimple({
+          title: '✅ 已取消预选命令',
+          template: 'green',
+          markdown: `已取消待拼接的命令前缀 \`${activePending.prefix}\`，下条消息将按普通对话发送。`,
+          buttonRows: [[
+            { label: '🧩 重新选择命令', value: { cmd: 'skills_menu' } },
+            { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
+          ]],
+        });
+        return true;
+      }
       await replySimple({
         title: 'ℹ️ 当前无运行中任务',
         template: 'grey',

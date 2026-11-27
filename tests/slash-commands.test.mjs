@@ -310,4 +310,27 @@ describe('slash-commands coverage', () => {
     assert.equal(usePrefix.handled, true);
     assert.equal(loadState().chats['oc_grp_t#om_root_x'].conversationId, 'p2p-topic-cross-1');
   });
+
+  it('displays pendingCommand in /status and clears it on /cancel or /new when idle', async () => {
+    const st = loadState();
+    st.chats.oc_slash.pendingCommand = { prefix: '/plan', kind: 'builtin', armedAt: Date.now() };
+    saveState(st);
+
+    const statusRes = await runCmd('/status');
+    assert.equal(statusRes.handled, true);
+    assert.ok(JSON.stringify(statusRes.calls.repliedCards[0].card).includes('/plan'));
+
+    const cancelRes = await runCmd('/cancel');
+    assert.equal(cancelRes.handled, true);
+    assert.ok(JSON.stringify(cancelRes.calls.repliedCards[0].card).includes('已取消预选命令'));
+    assert.equal(loadState().chats.oc_slash.pendingCommand, null);
+
+    const st2 = loadState();
+    st2.chats.oc_slash.pendingCommand = { prefix: '/boost', kind: 'builtin', armedAt: Date.now() };
+    saveState(st2);
+
+    const newRes = await runCmd('/new');
+    assert.equal(newRes.handled, true);
+    assert.equal(loadState().chats.oc_slash.pendingCommand, null);
+  });
 });

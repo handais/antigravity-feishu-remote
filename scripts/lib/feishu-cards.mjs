@@ -503,6 +503,70 @@ export function buildFrequentPanelButtons({
     .map((item) => catalog[item.key]);
 }
 
+export const PENDING_COMMAND_TTL_MS = 30 * 60 * 1000;
+
+export const AGY_PRESET_COMMANDS = [
+  { prefix: '/plan', icon: '🧭' },
+  { prefix: '/boost', icon: '🚀' },
+  { prefix: '/goal', icon: '🎯' },
+  { prefix: '/browser', icon: '🌐' },
+  { prefix: '/learn', icon: '📝' },
+  { prefix: '/teamwork', icon: '🤝' },
+  { prefix: '/swarm', icon: '🐝' },
+];
+
+/**
+ * Validate a slash command or skill prefix before arming or rendering it.
+ */
+export function isValidCommandPrefix(raw) {
+  const s = String(raw || '').trim();
+  if (!s || s.includes('..')) return false;
+  return /^\/[\p{L}\p{N}][\p{L}\p{N}._-]{0,63}$/u.test(s);
+}
+
+/**
+ * Return the active non-expired pending command prefix for a chat state, or null.
+ */
+export function getActivePendingCommand(chatState, now = Date.now()) {
+  const pending = chatState?.pendingCommand;
+  if (!pending || typeof pending !== 'object') return null;
+  const prefix = String(pending.prefix || '').trim();
+  if (!isValidCommandPrefix(prefix)) return null;
+  const armedAt = Number(pending.armedAt || 0);
+  if (armedAt > 0 && now - armedAt > PENDING_COMMAND_TTL_MS) {
+    return null;
+  }
+  return {
+    prefix,
+    kind: pending.kind === 'skill' ? 'skill' : 'builtin',
+    armedAt,
+  };
+}
+
+/**
+ * Consume a chat's armed one-shot command prefix for an incoming user message.
+ */
+export function consumePendingCommand(chatState, rawText, { hasAttachments = false, now = Date.now() } = {}) {
+  const original = chatState?.pendingCommand;
+  if (!original) {
+    return { applied: false, expired: false, superseded: false, stateChanged: false, prefix: '' };
+  }
+  const active = getActivePendingCommand(chatState, now);
+  chatState.pendingCommand = null;
+  if (!active) {
+    return { applied: false, expired: true, superseded: false, stateChanged: true, prefix: '' };
+  }
+  const trimmed = String(rawText || '').trim();
+  if (trimmed.startsWith('/')) {
+    return { applied: false, expired: false, superseded: true, stateChanged: true, prefix: '' };
+  }
+  if (!trimmed && !hasAttachments) {
+    chatState.pendingCommand = original;
+    return { applied: false, expired: false, superseded: false, stateChanged: false, prefix: '' };
+  }
+  return { applied: true, expired: false, superseded: false, stateChanged: true, prefix: active.prefix };
+}
+
 export function buildControlPanelCard({
   chatState,
   config,
@@ -538,6 +602,7 @@ export function buildControlPanelCard({
   const queueSuffix = queueLength > 0 ? `（排队 ${queueLength} 条）` : '';
   const parallelSuffix = activeParallelCount > 1 ? ` · 全局并行 ${activeParallelCount}/${maxConcurrentRuns}` : '';
   const pendingHandoff = chatState.pendingHandoff;
+  const activePendingCmd = getActivePendingCommand(chatState);
   const notifyMode = resolveStopNotifyMode(config);
   const awayMin = Math.max(1, Math.round(Number(config?.notifications?.awayIdleSeconds || 120) / 60));
   const notifyLabel = notifyMode === 'on'
@@ -561,6 +626,9 @@ export function buildControlPanelCard({
     pendingHandoff
       ? `- **待注入上下文**：已挂接电脑端「${(pendingHandoff.title || '').slice(0, 24)}」（下条消息自动注入）`
       : '',
+    activePendingCmd
+      ? `- **已预选命令**：\`${activePendingCmd.prefix}\`（下条消息自动拼接）`
+      : '',
     `- **运行状态**：${isRunning ? `⏳ 正在执行任务${queueSuffix}${parallelSuffix}` : `🟢 空闲${queueSuffix}${parallelSuffix}`}`,
   ].filter(Boolean);
   if (uptimeText) {
@@ -573,6 +641,12 @@ export function buildControlPanelCard({
   }
   if (queueLength > 0) {
     activeRow.push({ label: `📋 队列(${queueLength})`, value: { cmd: 'queue_list', inplace: true } });
+  }
+  if (activePendingCmd) {
+    const shortPrefix = activePendingCmd.prefix.length > 10
+      ? `${activePendingCmd.prefix.slice(0, 8)}…`
+      : activePendingCmd.prefix;
+    activeRow.push({ label: `❌ 取消 ${shortPrefix}`, type: 'danger', value: { cmd: 'clear_pending_cmd', inplace: true } });
   }
 
   const sessionRow = [
@@ -842,11 +916,37 @@ export function discoverLocalSkills({ homeDir = os.homedir(), maxSkills = 20 } =
     .slice(0, Math.max(1, Math.min(40, Number(maxSkills) || 20)));
 }
 
-export function buildAgySkillsCard({ skills = null, homeDir = os.homedir() } = {}) {
+export function buildAgySkillsCard({
+  skills = null,
+  homeDir = os.homedir(),
+  pendingCommand = null,
+  skillPage = 0,
+  skillPageSize = 9,
+} = {}) {
   const resolvedSkills = Array.isArray(skills) ? skills : discoverLocalSkills({ homeDir });
-  const lines = [
-    '**⚡ agy 常用内置命令（直接发送即可透传）：**',
-    '- `/compact`：压缩当前对话上下文（长对话提速省 token，可点下方按钮一键执行）',
+  const activePending = pendingCommand && typeof pendingCommand === 'object'
+    ? getActivePendingCommand({ pendingCommand })
+    : null;
+  const activePrefix = activePending ? activePending.prefix : '';
+
+  const perPage = Math.max(3, Math.min(12, Number(skillPageSize) || 9));
+  const totalPages = Math.max(1, Math.ceil(resolvedSkills.length / perPage));
+  const safePage = Math.max(0, Math.min(totalPages - 1, Math.floor(Number(skillPage) || 0)));
+  const startIdx = safePage * perPage;
+  const visibleSkills = resolvedSkills.slice(startIdx, startIdx + perPage);
+
+  const lines = [];
+  if (activePrefix) {
+    lines.push(
+      `🎯 **已预选命令前缀**：\`${sanitizeForFeishuMarkdown(activePrefix)}\``,
+      `> 直接发文字、语音、截图或引用消息，插件会自动拼成 \`${sanitizeForFeishuMarkdown(activePrefix)} <你的内容>\` 执行；再点一次按钮或点「❌ 取消预选」可取消。`,
+      '',
+    );
+  }
+
+  lines.push(
+    '**⚡ agy 常用内置命令（点击下方按钮直接预选前缀，免复制）：**',
+    '- `/compact`：压缩当前对话上下文（长对话提速省 token，点击立即执行）',
     '- `/plan <任务>`：先只读调研规划再动手执行',
     '- `/boost <复杂任务>`：深度思考、多角度规划与严格校验',
     '- `/goal <长耗时任务>`：持续推进直到目标达成（建议先 `/timeout 0`）',
@@ -856,36 +956,106 @@ export function buildAgySkillsCard({ skills = null, homeDir = os.homedir() } = {
     '- `/agy /<命令>`：强制透传与飞书插件重名的 `agy` 原始命令（如 `/agy /help`）',
     '',
     `**🧩 本机已安装技能（Skills，共 ${resolvedSkills.length} 个）：**`,
-  ];
+  );
 
   if (resolvedSkills.length === 0) {
     lines.push('- _（暂未扫描到本地 SKILL.md，可检查 `~/.gemini/config/skills/` 或 `~/.agents/skills/`）_');
   } else {
     for (const s of resolvedSkills) {
       const desc = s.description ? `：${sanitizeForFeishuMarkdown(s.description)}` : '';
-      lines.push(`- \`${sanitizeForFeishuMarkdown(s.name)}\`${desc}`);
+      lines.push(`- \`/${sanitizeForFeishuMarkdown(s.name)}\`${desc}`);
     }
   }
 
   lines.push(
     '',
-    '💡 用法：直接用自然语言点名技能（如「用 `mac-control` 截个图」）或发 `/技能名` 即可；需跑命令/MCP 的技能建议先点控制面板「⚡ 30m全权」。',
+    '💡 用法：点下方任意命令/技能按钮即可预选前缀，然后直接发送任务内容（支持文字、语音、截图）；需跑命令/MCP 的技能建议先点控制面板「⚡ 30m全权」。',
   );
 
-  return buildCard({
+  const builtinButtons = [
+    {
+      label: '🗜️ /compact',
+      type: activePrefix ? 'default' : 'primary',
+      value: { cmd: 'run_agy_cmd', arg: '/compact' },
+    },
+    ...AGY_PRESET_COMMANDS.map((item) => {
+      const isSelected = activePrefix === item.prefix;
+      return {
+        label: isSelected ? `✅ ${item.prefix}` : `${item.icon} ${item.prefix}`,
+        type: isSelected ? 'primary' : 'default',
+        value: { cmd: 'arm_cmd', arg: item.prefix, kind: 'builtin', skillPage: safePage, inplace: true },
+      };
+    }),
+  ];
+
+  const sections = [
+    {
+      title: '⚡ 常用命令（点选预填前缀，/compact 直接执行）',
+      divider: true,
+      rows: chunkButtons(builtinButtons, 4),
+    },
+  ];
+
+  if (visibleSkills.length > 0) {
+    const skillButtons = visibleSkills.map((s) => {
+      const prefix = `/${s.name}`;
+      const shortName = s.name.length > 14 ? `${s.name.slice(0, 12)}…` : s.name;
+      const isSelected = activePrefix === prefix;
+      return {
+        label: isSelected ? `✅ ${shortName}` : `🧩 ${shortName}`,
+        type: isSelected ? 'primary' : 'default',
+        value: { cmd: 'arm_cmd', arg: prefix, kind: 'skill', skillPage: safePage, inplace: true },
+      };
+    });
+    const skillRows = chunkButtons(skillButtons, 3);
+    if (totalPages > 1) {
+      const pagerRow = [];
+      if (safePage > 0) {
+        pagerRow.push({
+          label: `◀️ 上一页 (${safePage}/${totalPages})`,
+          value: { cmd: 'skills_menu', skillPage: safePage - 1, inplace: true },
+        });
+      }
+      if (safePage < totalPages - 1) {
+        pagerRow.push({
+          label: `▶️ 下一页 (${safePage + 2}/${totalPages})`,
+          type: 'primary',
+          value: { cmd: 'skills_menu', skillPage: safePage + 1, inplace: true },
+        });
+      }
+      if (pagerRow.length > 0) {
+        skillRows.push(pagerRow);
+      }
+    }
+    sections.push({
+      title: totalPages > 1
+        ? `🧩 本机技能（点选预填 · 第 ${safePage + 1}/${totalPages} 页）`
+        : '🧩 本机技能（点选预填 /技能名）',
+      divider: true,
+      rows: skillRows,
+    });
+  }
+
+  const navRow = [];
+  if (activePrefix) {
+    navRow.push({
+      label: '❌ 取消预选',
+      type: 'danger',
+      value: { cmd: 'clear_pending_cmd', fromSkills: true, skillPage: safePage, inplace: true },
+    });
+  }
+  navRow.push(
+    { label: '📖 插件指令', value: { cmd: 'help_commands', inplace: true } },
+    { label: '📘 面板说明', value: { cmd: 'help', inplace: true } },
+    { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
+  );
+  sections.push({ divider: true, rows: [navRow] });
+
+  return buildSectionedCard({
     title: '🧩 agy 命令与本机技能',
-    template: 'blue',
+    template: activePrefix ? 'wathet' : 'blue',
     markdown: lines.join('\n'),
-    buttonRows: [
-      [
-        { label: '🗜️ 一键 /compact', type: 'primary', value: { cmd: 'run_agy_cmd', arg: '/compact' } },
-        { label: '📖 飞书插件指令', value: { cmd: 'help_commands', inplace: true } },
-      ],
-      [
-        { label: '📘 面板按钮说明', value: { cmd: 'help', inplace: true } },
-        { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
-      ],
-    ],
+    sections,
     footer: '发 / 或 /skills 可随时唤出 · 可在飞书机器人悬浮菜单配置 event_key: menu_commands',
   });
 }

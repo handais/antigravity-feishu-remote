@@ -8,6 +8,7 @@ import {
 } from './lib/config.mjs';
 import {
   buildCard,
+  consumePendingCommand,
   createFeishuClient,
   createStderrLogger,
   resolveLarkDomain,
@@ -29,6 +30,7 @@ import { installTimestampedConsole, maskIdentifier } from './lib/io-utils.mjs';
 import {
   enforceTempFullExpiry,
   formatHelpMarkdown,
+  getOrCreateChatState,
   makeSessionKey,
   parseSessionKey,
   replySimpleCard,
@@ -389,21 +391,37 @@ async function handleIncomingMessage(rawEvent) {
     }
   }
 
+  const pendingState = loadState();
+  const pendingChatState = getOrCreateChatState(pendingState, runKey, config);
+  const pendingResult = consumePendingCommand(pendingChatState, text, {
+    hasAttachments: attachments.length > 0 || downloaded.length > 0,
+  });
+  if (pendingResult.stateChanged) {
+    saveState(pendingState);
+  }
+  const appliedPrefix = pendingResult.applied ? pendingResult.prefix : '';
+
   const hasContext = Boolean(
     downloaded.length > 0 ||
     failed.length > 0 ||
     (quoted && (quoted.text || quoted.downloaded?.length > 0)) ||
     docs.length > 0,
   );
-  const finalPrompt = hasContext
+  const basePrompt = hasContext
     ? buildMultimodalPrompt({ text, downloaded, failed, quoted, docs })
     : text;
+  const finalPrompt = appliedPrefix
+    ? (basePrompt ? `${appliedPrefix} ${basePrompt}` : appliedPrefix)
+    : basePrompt;
 
   const allFiles = [...downloaded, ...(quoted?.downloaded || [])];
   const kindLabels = [...new Set(allFiles.map((d) => (
     d.kind === 'image' ? '图片' : d.kind === 'audio' ? '语音' : d.kind === 'media' ? '视频' : '文件'
   )))];
   const noteParts = [];
+  if (appliedPrefix) {
+    noteParts.push(`🧩 已自动附加前缀 \`${appliedPrefix}\``);
+  }
   if (quoted && (quoted.text || quoted.downloaded?.length > 0)) {
     noteParts.push('↩️ 已带入引用消息');
   }
@@ -418,13 +436,14 @@ async function handleIncomingMessage(rawEvent) {
   }
 
   const tag = kindLabels.length > 0 ? `[${kindLabels.join('/')}]` : docs.length > 0 ? '[云文档]' : quoted ? '[引用]' : '';
-  const displayPreview = text
+  const rawDisplayPreview = text
     ? (tag ? `${tag} ${text}` : text)
     : allFiles[0]?.fileName
       ? `${tag} ${allFiles[0].fileName}`
       : docs[0]?.title
         ? `[云文档] ${docs[0].title}`
         : '多模态上下文分析';
+  const displayPreview = appliedPrefix ? `${appliedPrefix} ${rawDisplayPreview}` : rawDisplayPreview;
 
   await runner.enqueueOrExecutePrompt({
     text: finalPrompt,

@@ -15,7 +15,14 @@ let config;
 
 const { getConfigDir, getHandoffsDir, loadConfig, loadState, resolveRiskyApprovalEnabled, saveState } = await import('../scripts/lib/config.mjs');
 const { classifyCommandRisk, createApprovalRequest, readApprovalDecision } = await import('../scripts/lib/command-guard.mjs');
-const { computePanelActionScore, discoverLocalSkills, discoverQuickDirs } = await import('../scripts/lib/feishu-api.mjs');
+const {
+  PENDING_COMMAND_TTL_MS,
+  buildAgySkillsCard,
+  computePanelActionScore,
+  consumePendingCommand,
+  discoverLocalSkills,
+  discoverQuickDirs,
+} = await import('../scripts/lib/feishu-api.mjs');
 const { isSensitiveFilePath } = await import('../scripts/lib/actions/artifacts.mjs');
 const { buildHandoffCard, readMobileSession, writeHandoffSnapshot } = await import('../scripts/lib/mobile-handoff.mjs');
 const { createBackupSnapshot, getBackupsDir, runPreflightCheckAsync } = await import('../scripts/lib/self-ops.mjs');
@@ -855,5 +862,133 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
     assert.equal(afterSt.chats['oc_topic_grp#om_cur_root'].conversationId, 'conv-p2p-1');
     assert.equal(afterSt.chats['oc_topic_grp#om_cur_root'].cwd, p2pDir);
     assert.equal(afterSt.chats.oc_topic_grp?.cwd, undefined);
+  });
+
+  it('arms, toggles, clears, paginates, and consumes one-shot command prefixes in skills menu & panel', async () => {
+    const { client } = createMockFeishuClient();
+    const ctx = createBridgeContext({ client });
+
+    const st = loadState();
+    st.lastP2pChatByOpenId.ou_test_owner = 'oc_arm_p2p';
+    st.chats.oc_arm_p2p = {
+      conversationId: 'conv-arm-1',
+      cwd: env.workDir,
+      mode: 'accept-edits',
+      recentConversations: [],
+    };
+    saveState(st);
+
+    // 1. Arm builtin /plan prefix in-place
+    const armPlan = await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'arm_cmd', arg: '/plan', kind: 'builtin', skillPage: 0, inplace: true }, 'ou_test_owner', 'oc_arm_p2p'),
+    );
+    assert.equal(armPlan.toast.type, 'success');
+    assert.equal(loadState().chats.oc_arm_p2p.pendingCommand?.prefix, '/plan');
+    const armCard = armPlan.card?.data;
+    assert.equal(armCard.header.template, 'wathet');
+    const armButtons = armCard.body.elements
+      .filter((el) => el.tag === 'column_set')
+      .flatMap((el) => el.columns.flatMap((c) => c.elements))
+      .filter((btn) => btn.tag === 'button');
+    const planBtn = armButtons.find((b) => b.text?.content === '✅ /plan');
+    assert.ok(planBtn && planBtn.type === 'primary');
+    assert.ok(armButtons.some((b) => b.text?.content === '❌ 取消预选'));
+    for (const el of armCard.body.elements) {
+      if (el.tag === 'column_set') {
+        assert.ok(el.columns.length <= 5, `column_set exceeded 5 columns: ${el.columns.length}`);
+      }
+    }
+
+    // 2. Control panel reflects active pendingCommand and supports clear_pending_cmd
+    const panelWithPending = await handleCardAction(ctx, makeEvent({ cmd: 'panel', inplace: true }, 'ou_test_owner', 'oc_arm_p2p'));
+    const panelJson = JSON.stringify(panelWithPending.card?.data);
+    assert.ok(panelJson.includes('已预选命令'));
+    assert.ok(panelJson.includes('❌ 取消 /plan'));
+
+    const clearedFromPanel = await handleCardAction(ctx, makeEvent({ cmd: 'clear_pending_cmd', inplace: true }, 'ou_test_owner', 'oc_arm_p2p'));
+    assert.equal(clearedFromPanel.toast.type, 'info');
+    assert.equal(loadState().chats.oc_arm_p2p.pendingCommand, null);
+    assert.ok(!JSON.stringify(clearedFromPanel.card?.data).includes('已预选命令'));
+
+    // 3. Arming a local skill and clicking it again toggles off
+    const armSkill = await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'arm_cmd', arg: '/demo-skill', kind: 'skill', skillPage: 0, inplace: true }, 'ou_test_owner', 'oc_arm_p2p'),
+    );
+    assert.equal(armSkill.toast.type, 'success');
+    assert.equal(loadState().chats.oc_arm_p2p.pendingCommand?.prefix, '/demo-skill');
+    assert.equal(loadState().chats.oc_arm_p2p.pendingCommand?.kind, 'skill');
+
+    const toggleOff = await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'arm_cmd', arg: '/demo-skill', kind: 'skill', skillPage: 0, inplace: true }, 'ou_test_owner', 'oc_arm_p2p'),
+    );
+    assert.equal(toggleOff.toast.type, 'info');
+    assert.equal(loadState().chats.oc_arm_p2p.pendingCommand, null);
+
+    // 4. Clear via fromSkills stays on skills card
+    await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'arm_cmd', arg: '/boost', kind: 'builtin', skillPage: 0, inplace: true }, 'ou_test_owner', 'oc_arm_p2p'),
+    );
+    const clearedFromSkills = await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'clear_pending_cmd', fromSkills: true, skillPage: 0, inplace: true }, 'ou_test_owner', 'oc_arm_p2p'),
+    );
+    assert.equal(clearedFromSkills.card?.data?.header?.title?.content, '🧩 agy 命令与本机技能');
+    assert.equal(loadState().chats.oc_arm_p2p.pendingCommand, null);
+
+    // 5. Invalid command prefix is rejected
+    const badPrefix = await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'arm_cmd', arg: '/bad cmd; rm -rf', inplace: true }, 'ou_test_owner', 'oc_arm_p2p'),
+    );
+    assert.equal(badPrefix.toast.type, 'error');
+
+    // 6. Skills pagination & column_set <= 5 check with > 9 skills
+    const manySkills = Array.from({ length: 12 }, (_, idx) => ({
+      name: `skill-${idx + 1}`,
+      description: `Description ${idx + 1}`,
+      source: 'config',
+    }));
+    const page1Card = buildAgySkillsCard({
+      skills: manySkills,
+      pendingCommand: { prefix: '/skill-10', kind: 'skill', armedAt: Date.now() },
+      skillPage: 1,
+      skillPageSize: 9,
+    });
+    const page1Json = JSON.stringify(page1Card);
+    assert.ok(page1Json.includes('第 2/2 页'));
+    assert.ok(page1Json.includes('✅ skill-10'));
+    assert.ok(page1Json.includes('◀️ 上一页'));
+    for (const el of page1Card.body.elements) {
+      if (el.tag === 'column_set') {
+        assert.ok(el.columns.length <= 5, `column_set exceeded 5 columns: ${el.columns.length}`);
+      }
+    }
+
+    // 7. consumePendingCommand handles normal text, attachment-only, explicit slash override, and TTL expiry
+    const now = Date.now();
+    const cs1 = { pendingCommand: { prefix: '/plan', kind: 'builtin', armedAt: now } };
+    const r1 = consumePendingCommand(cs1, '梳理一下登录模块', { hasAttachments: false, now: now + 1000 });
+    assert.deepEqual(r1, { applied: true, expired: false, superseded: false, stateChanged: true, prefix: '/plan' });
+    assert.equal(cs1.pendingCommand, null);
+
+    const cs2 = { pendingCommand: { prefix: '/demo-skill', kind: 'skill', armedAt: now } };
+    const r2 = consumePendingCommand(cs2, '', { hasAttachments: true, now: now + 1000 });
+    assert.equal(r2.applied, true);
+    assert.equal(r2.prefix, '/demo-skill');
+    assert.equal(cs2.pendingCommand, null);
+
+    const cs3 = { pendingCommand: { prefix: '/plan', kind: 'builtin', armedAt: now } };
+    const r3 = consumePendingCommand(cs3, '/boost 紧急修复', { hasAttachments: false, now: now + 1000 });
+    assert.deepEqual(r3, { applied: false, expired: false, superseded: true, stateChanged: true, prefix: '' });
+    assert.equal(cs3.pendingCommand, null);
+
+    const cs4 = { pendingCommand: { prefix: '/plan', kind: 'builtin', armedAt: now } };
+    const r4 = consumePendingCommand(cs4, '过期的消息', { hasAttachments: false, now: now + PENDING_COMMAND_TTL_MS + 1000 });
+    assert.deepEqual(r4, { applied: false, expired: true, superseded: false, stateChanged: true, prefix: '' });
+    assert.equal(cs4.pendingCommand, null);
   });
 });

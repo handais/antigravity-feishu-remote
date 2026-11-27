@@ -9,6 +9,8 @@ import {
   buildEffortCard,
   buildPanelHelpCard,
   canonicalizeDirPath,
+  getActivePendingCommand,
+  isValidCommandPrefix,
   patchCard,
 } from '../feishu-api.mjs';
 import {
@@ -87,7 +89,13 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
   }
 
   if (cmd === 'skills_menu') {
-    const card = buildAgySkillsCard();
+    const activePending = getActivePendingCommand(chatState);
+    if (!activePending && chatState.pendingCommand) {
+      chatState.pendingCommand = null;
+      saveState(state);
+    }
+    const skillPage = Math.max(0, Math.floor(Number(value?.skillPage || 0)));
+    const card = buildAgySkillsCard({ pendingCommand: activePending, skillPage });
     if (inplace) {
       return toastCardResponse('info', 'agy 命令与本机技能', card);
     }
@@ -95,6 +103,49 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
       console.error('[feishu-remote] send skills card error:', err.message);
     });
     return toastCardResponse('info', '已打开命令与技能菜单');
+  }
+
+  if (cmd === 'arm_cmd') {
+    const prefix = String(arg || '').trim();
+    if (!isValidCommandPrefix(prefix)) {
+      return toastCardResponse('error', '不支持的命令前缀');
+    }
+    const skillPage = Math.max(0, Math.floor(Number(value?.skillPage || 0)));
+    const current = getActivePendingCommand(chatState);
+    if (current && current.prefix === prefix) {
+      chatState.pendingCommand = null;
+      saveState(state);
+      const card = buildAgySkillsCard({ pendingCommand: null, skillPage });
+      return toastCardResponse('info', `已取消预选：${prefix}`, inplace ? card : null);
+    }
+    chatState.pendingCommand = {
+      prefix,
+      kind: value?.kind === 'skill' ? 'skill' : 'builtin',
+      armedAt: Date.now(),
+    };
+    saveState(state);
+    const card = buildAgySkillsCard({ pendingCommand: chatState.pendingCommand, skillPage });
+    return toastCardResponse('success', `✅ 已预选 ${prefix}，直接发送任务内容即可`, inplace ? card : null);
+  }
+
+  if (cmd === 'clear_pending_cmd') {
+    const prev = getActivePendingCommand(chatState);
+    chatState.pendingCommand = null;
+    saveState(state);
+    if (value?.fromSkills) {
+      const skillPage = Math.max(0, Math.floor(Number(value?.skillPage || 0)));
+      const card = buildAgySkillsCard({ pendingCommand: null, skillPage });
+      return toastCardResponse(
+        'info',
+        prev ? `已取消预选：${prev.prefix}` : '当前无预选命令',
+        inplace ? card : null,
+      );
+    }
+    return toastCardResponse(
+      'info',
+      prev ? `已取消预选：${prev.prefix}` : '当前无预选命令',
+      inplace ? renderPanel() : null,
+    );
   }
 
   if (cmd === 'run_agy_cmd') {
@@ -127,6 +178,7 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
   if (cmd === 'new') {
     chatState.conversationId = '';
     chatState.pendingHandoff = null;
+    chatState.pendingCommand = null;
     chatState.originDesktopSession = null;
     chatState.lastTurnArtifacts = null;
     chatState.topicClosed = false;
@@ -301,6 +353,7 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
     const resolvedId = matched?.id || arg;
     chatState.conversationId = resolvedId;
     chatState.pendingHandoff = null;
+    chatState.pendingCommand = null;
     chatState.originDesktopSession = null;
     chatState.lastTurnArtifacts = null;
     chatState.topicClosed = false;

@@ -18,6 +18,7 @@ import {
   buildQueueListCard,
   buildScopesCard,
   buildTasksCard,
+  getActivePendingCommand,
   recordPanelActionUsage,
 } from './feishu-api.mjs';
 import { listDesktopSessions } from './desktop-sessions.mjs';
@@ -432,6 +433,7 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
   if (key === 'new') {
     chatState.conversationId = '';
     chatState.pendingHandoff = null;
+    chatState.pendingCommand = null;
     chatState.originDesktopSession = null;
     chatState.lastTurnArtifacts = null;
     saveState(state);
@@ -520,7 +522,7 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
   }
 
   if (key === 'commands' || key === 'skills' || key === 'agy' || key === 'slash') {
-    await sendToTarget(buildAgySkillsCard());
+    await sendToTarget(buildAgySkillsCard({ pendingCommand: getActivePendingCommand(chatState) }));
     return;
   }
 

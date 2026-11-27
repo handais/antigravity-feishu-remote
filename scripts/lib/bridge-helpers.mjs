@@ -74,6 +74,7 @@ export function getOrCreateChatState(state, chatId, config) {
       effort: parentState?.effort !== undefined ? parentState.effort : (config.agy.defaultEffort || ''),
       recentConversations: [],
       pendingHandoff: null,
+      pendingCommand: null,
       originDesktopSession: null,
       lastTurnArtifacts: null,
       topicClosed: false,
@@ -93,6 +94,9 @@ export function getOrCreateChatState(state, chatId, config) {
     }
     if (state.chats[chatId].pendingHandoff === undefined) {
       state.chats[chatId].pendingHandoff = null;
+    }
+    if (state.chats[chatId].pendingCommand === undefined) {
+      state.chats[chatId].pendingCommand = null;
     }
     if (state.chats[chatId].originDesktopSession === undefined) {
       state.chats[chatId].originDesktopSession = null;
@@ -588,7 +592,7 @@ export function formatHelpMarkdown() {
     '- `/ops`（或 `/backups`）：打开运维与自迭代面板（安全重启 / 代码体检 / 快照回滚）',
     '- `/reload` / `/check` / `/snapshot` / `/rollback [ID]`：代码检查、快照、安全重启与回滚',
     '- `/dirs` / `/cd <路径或关键词>` / `/pin`：浏览、模糊匹配或收藏工作目录',
-    '- `/` 或 `/skills`（悬浮菜单 `menu_commands`）：查看 `agy` 内置命令与本机已安装 Skills 清单（支持一键 `/compact`、`/agy <原始命令>` 强制透传）',
+    '- `/` 或 `/skills`（悬浮菜单 `menu_commands`）：查看 `agy` 内置命令与本机已安装 Skills 清单（支持点选一键预选命令前缀、一键 `/compact`、`/agy <原始命令>` 强制透传）',
     '- `/status` / `/new` / `/sessions` / `/use <序号|ID>` / `/help`',
     '- `/desktop [关键词]`（别名 `/pc`）：扫描或全文搜索电脑端历史对话并预览接管',
     '- `/topic [set|clear]` / `/unlink`：查看/设置默认接管话题群，或结束当前话题楼与电脑端的自动回流追踪',
