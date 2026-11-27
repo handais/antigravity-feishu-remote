@@ -13,7 +13,7 @@ Control your local **Antigravity** CLI / IDE directly from **Feishu** or **Lark*
 
 ## Security & Privacy Model
 
-- **Strict Secret Isolation**: Personal `appId`, `appSecret`, `allowedOpenIds`, and runtime state are stored exclusively outside the plugin directory at `~/.config/antigravity-feishu/` (`0700` directory mode, `0600` file mode). The plugin repository and packaged `.zip` never contain credentials or personal identifiers.
+- **Strict Secret Isolation**: Personal `appId`, `appSecret`, `allowedOpenIds`, and runtime state are stored exclusively outside the plugin directory at `~/.config/antigravity-feishu/` (Windows: `%USERPROFILE%\.config\antigravity-feishu\`; POSIX mode `0700` dir / `0600` files). The plugin repository and packaged `.zip` never contain credentials or personal identifiers.
 - **Owner Allowlist**: By default, `autoBindFirstUser` locks the bot to the very first private-chat sender's `open_id` (or you can pre-bind via `--allow-open-id`). Unauthorized users are blocked immediately.
 - **Secret Masking**: `cli.mjs status`, `cli.mjs setup`, and the `feishu_bridge_status` MCP tool always mask `appSecret` before output.
 - **Scoped Permissions & Auto-Revert**: Supports `accept-edits`, `plan`, `auto`, `default`, and `full` execution modes, plus temporary full-permission grants (`/mode full 30m`) that automatically revert to a safe mode upon expiry.
@@ -29,6 +29,12 @@ Control your local **Antigravity** CLI / IDE directly from **Feishu** or **Lark*
 - **Node.js `>= 22.5.0`** (required for built-in `node:sqlite` used by `/desktop` session indexing)
 - **Antigravity CLI (`agy`)** installed and authenticated
 - **OS Support**: macOS (`launchd`), Linux (`systemd --user`), native Windows (detached PID daemon + `GetLastInputInfo` idle probe), and WSL2
+- **Plugin Directory**: `~/.gemini/config/plugins/feishu-remote` on macOS/Linux, or `%USERPROFILE%\.gemini\config\plugins\feishu-remote` (`$HOME\.gemini\config\plugins\feishu-remote` in PowerShell) on Windows
+
+> [!NOTE]
+> **Platform Support Status**
+> - **macOS (Primary / Daily-Driven)**: Actively developed and end-to-end verified on real macOS hardware (`launchd` persistence, `/desktop` takeover, and idle detection).
+> - **Linux / Native Windows (Experimental)**: Cross-platform adapted and verified in GitHub Actions CI across `ubuntu-latest`, `windows-latest`, and `macos-latest`, **not yet end-to-end verified by the author on physical Linux or Windows machines**. Issues and PRs with `cli.mjs status` / `cli.mjs logs` output are very welcome.
 
 ### Option A — Install via Antigravity CLI (Recommended)
 
@@ -36,28 +42,40 @@ Control your local **Antigravity** CLI / IDE directly from **Feishu** or **Lark*
 agy plugin install https://github.com/handais/antigravity-feishu-remote
 ```
 
-Then install runtime Node dependencies inside the installed plugin folder (default `~/.gemini/config/plugins/feishu-remote/`, or your workspace `.agents/plugins/` folder):
+Then install runtime Node dependencies inside the installed plugin folder (`~/.gemini/config/plugins/feishu-remote/` on macOS/Linux, `$HOME\.gemini\config\plugins\feishu-remote\` on Windows PowerShell, or your workspace `.agents/plugins/` folder):
 
 ```bash
+# macOS / Linux
 cd ~/.gemini/config/plugins/feishu-remote && npm install --omit=dev
+```
+```powershell
+# Windows (PowerShell)
+Set-Location "$HOME\.gemini\config\plugins\feishu-remote"; npm install --omit=dev
 ```
 
 ### Option B — Manual Git Clone
 
 ```bash
+# macOS / Linux
 mkdir -p ~/.gemini/config/plugins
 git clone https://github.com/handais/antigravity-feishu-remote.git ~/.gemini/config/plugins/feishu-remote
 cd ~/.gemini/config/plugins/feishu-remote && npm install --omit=dev
 ```
+```powershell
+# Windows (PowerShell)
+New-Item -ItemType Directory -Force "$HOME\.gemini\config\plugins" | Out-Null
+git clone https://github.com/handais/antigravity-feishu-remote.git "$HOME\.gemini\config\plugins\feishu-remote"
+Set-Location "$HOME\.gemini\config\plugins\feishu-remote"; npm install --omit=dev
+```
 
 ### Option C — Agent Quickstart
 
-Paste this prompt into Antigravity (or another coding agent with terminal/browser access):
+Paste this prompt into Antigravity (or another coding agent with terminal/browser access; note that runtime execution requires `agy` CLI installed and logged in locally):
 
 ```text
 Please install and set up the Feishu Remote plugin from:
 https://github.com/handais/antigravity-feishu-remote
-Follow README_EN.md: install into ~/.gemini/config/plugins/feishu-remote, run npm install --omit=dev, run scripts/cli.mjs check and scripts/smoke-test.mjs, then help me configure the Feishu/Lark bot credentials via scripts/cli.mjs setup and start the daemon. Never write appSecret inside the plugin directory or echo it in replies.
+Follow README_EN.md: install into the global Antigravity plugin directory (~/.gemini/config/plugins/feishu-remote on macOS/Linux, or %USERPROFILE%\.gemini\config\plugins\feishu-remote on Windows—use PowerShell syntax on Windows and never pass unexpanded ~ or `mkdir -p` in Windows shells). Run npm install --omit=dev, scripts/cli.mjs check, and scripts/smoke-test.mjs, then help me configure Feishu/Lark credentials via scripts/cli.mjs setup (--cwd ~) and start the daemon before configuring WebSocket events/callbacks. Run scripts/cli.mjs scopes only after publishing the Feishu app version, never write appSecret inside the plugin directory or echo it in replies, and remind Windows users to re-run cli.mjs start after reboot (detached PID mode).
 ```
 
 ---

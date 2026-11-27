@@ -12,20 +12,25 @@
 通过飞书 **WebSocket 长连接**，让你在手机（安卓 / iOS）飞书里直接向本机 Antigravity 发任务、实时看流式卡片进度、继续多轮上下文，并支持本地目录切换、模型/权限模式切换、MCP 主动推送和任务完成通知。
 
 > **免公网 IP / 免内网穿透 / 分享不泄密**
-> 个人 `App Secret` 和授权用户白名单统一保存在本机 `~/.config/antigravity-feishu/config.json`（`0600` 权限），插件目录内不含任何个人密钥，打包即可分享给朋友。
+> 个人 `App Secret` 和授权用户白名单统一保存在本机 `~/.config/antigravity-feishu/config.json`（Windows 为 `%USERPROFILE%\.config\antigravity-feishu\config.json`，`0600` 权限），插件目录内不含任何个人密钥，打包即可分享给朋友。
+
+> [!NOTE]
+> **平台实测说明**
+> - **macOS（主力验证）**：作者日常开发环境，已完整实机跑通长连接、`launchd` 开机常驻、`/desktop` 接管与离开感应。
+> - **Linux / 原生 Windows（实验性支持）**：已完成跨平台代码适配并通过 GitHub Actions 三平台 CI（`ubuntu-latest` / `windows-latest` / `macos-latest`）自动化冒烟测试，但**作者暂未在真实 Linux / Windows 机器上做过完整端到端实测**；遇到平台兼容问题欢迎附上 `cli.mjs status` / `cli.mjs logs` 提 Issue 或 PR。
 
 ---
 
 ## 🤖 交给 AI 一键自动部署（Agent Quickstart）
 
-如果你正在使用 **Antigravity / Claude Code / OpenClaw** 等具备终端能力的 AI 助手，**不需要自己手动敲命令**，直接把仓库链接交给它即可完成本地部署。
+如果你正在使用 **Antigravity / Claude Code / OpenClaw** 等具备终端能力的 AI 助手，**不需要自己手动敲命令**，直接把仓库链接交给它即可完成本地部署（提示：部署代理可以是 Claude Code / OpenClaw 等任意终端 AI，但运行时远程控制依赖本机已安装并登录 **Antigravity CLI (`agy`)**）。
 
 ### 1. 给用户：复制这句话发给你的 AI 助手
 
 ```text
 请帮我按这个仓库的 README 自动部署飞书远程控制插件：
 https://github.com/handais/antigravity-feishu-remote
-安装到 ~/.gemini/config/plugins/feishu-remote。如果当前环境支持浏览器操作，也请直接打开飞书开放平台（https://open.feishu.cn/app）帮我完成应用创建、权限导入、长连接事件/回调配置与版本发布，只在需要我扫码登录、二次确认或最后在飞书发“你好”配对时提醒我。
+安装到本机 Antigravity 全局插件目录（macOS/Linux 为 ~/.gemini/config/plugins/feishu-remote，Windows 为 %USERPROFILE%\.gemini\config\plugins\feishu-remote）。如果当前环境支持浏览器操作，也请直接打开飞书开放平台（https://open.feishu.cn/app）帮我完成应用创建、权限导入、长连接事件/回调配置与版本发布，只在需要我扫码登录、二次确认或最后在飞书发“你好”配对时提醒我。
 ```
 
 ### 2. 给 AI 助手（Antigravity / Coding Agent）的部署 SOP
@@ -34,27 +39,51 @@ https://github.com/handais/antigravity-feishu-remote
 > 请严格按以下步骤依次执行并校验输出；每步失败立即停止并报告原因，不要跳过检查。
 
 #### Step 1 — 前置环境检查
-1. 检查系统平台（支持 **macOS `launchd`**、**Linux `systemd --user`**、**原生 Windows（`pid` 后台模式 + `where agy` + 系统代理 + `GetLastInputInfo` 离开感应）** 及 **WSL2**）。
+1. 检查系统平台与支持边界：
+   - **macOS**：已实机完整验证（`launchd` 常驻）。
+   - **Linux / 原生 Windows**：实验性支持（代码已适配并通过三平台 CI，作者未做真实实机端到端验证）。Windows 使用 PowerShell 语法，Linux/WSL2 走 `systemd --user` 或后台进程；若遇到平台特定报错，先完整记录 `cli.mjs status` / `cli.mjs logs` 方便定位或向仓库反馈。
 2. 检查 Node 版本与 `agy` CLI：
-   ```bash
-   node -v && which agy
-   ```
+   - **macOS / Linux (bash/zsh)**：
+     ```bash
+     node -v && which agy
+     ```
+   - **Windows (PowerShell)**（勿用 `which` 或 `&&`，PowerShell 5.1 不支持 `&&`）：
+     ```powershell
+     node -v; Get-Command agy
+     ```
+     *(若使用 CMD 可运行 `node -v && where agy`。)*
    - 要求 **`Node.js >= 22.5.0`**（`/desktop` 只读索引与 `Stop` Hook 子代理过滤依赖内置 `node:sqlite`）。若版本过低，请先协助用户升级 Node 或提示安装。
    - 若找不到 `agy`，提醒用户先安装并完成 `agy` 登录验证。
 
 #### Step 2 — 下载插件并安装依赖与体检
-1. 若 `~/.gemini/config/plugins/feishu-remote` 尚不存在，克隆仓库并安装生产依赖：
-   ```bash
-   mkdir -p ~/.gemini/config/plugins
-   git clone https://github.com/handais/antigravity-feishu-remote.git ~/.gemini/config/plugins/feishu-remote
-   cd ~/.gemini/config/plugins/feishu-remote && npm install --omit=dev
-   ```
-   *(若已通过 zip 解压到此目录，进入目录执行 `npm install --omit=dev` 即可。)*
+> [!CAUTION]
+> 插件目录在 macOS/Linux 为 `~/.gemini/config/plugins/feishu-remote`，在 Windows 为 `$HOME\.gemini\config\plugins\feishu-remote`（即 `%USERPROFILE%\.gemini\config\plugins\feishu-remote`）。**在 Windows PowerShell/CMD 下严禁直接执行 `mkdir -p` 或向外部命令传未展开的 `~` 路径。**
+
+1. 若插件目录尚不存在，安装或克隆仓库并安装生产依赖（也可用跨平台的 `agy plugin install https://github.com/handais/antigravity-feishu-remote` 替代克隆）：
+   - **macOS / Linux (bash/zsh)**：
+     ```bash
+     mkdir -p ~/.gemini/config/plugins
+     git clone https://github.com/handais/antigravity-feishu-remote.git ~/.gemini/config/plugins/feishu-remote
+     cd ~/.gemini/config/plugins/feishu-remote && npm install --omit=dev
+     ```
+   - **Windows (PowerShell)**：
+     ```powershell
+     New-Item -ItemType Directory -Force "$HOME\.gemini\config\plugins" | Out-Null
+     git clone https://github.com/handais/antigravity-feishu-remote.git "$HOME\.gemini\config\plugins\feishu-remote"
+     Set-Location "$HOME\.gemini\config\plugins\feishu-remote"; npm install --omit=dev
+     ```
+   *(若已通过 zip 解压到此目录，进入对应目录执行 `npm install --omit=dev` 即可。)*
 2. 运行代码体检与隔离冒烟测试，确认本地环境完全兼容：
-   ```bash
-   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs check
-   node ~/.gemini/config/plugins/feishu-remote/scripts/smoke-test.mjs
-   ```
+   - **macOS / Linux**：
+     ```bash
+     node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs check
+     node ~/.gemini/config/plugins/feishu-remote/scripts/smoke-test.mjs
+     ```
+   - **Windows (PowerShell)**：
+     ```powershell
+     node "$HOME\.gemini\config\plugins\feishu-remote\scripts\cli.mjs" check
+     node "$HOME\.gemini\config\plugins\feishu-remote\scripts\smoke-test.mjs"
+     ```
    - 期望：`cli.mjs check` 输出 `"ok": true` 且 `"errors": []`；`smoke-test.mjs` 输出 `ALL SMOKE TESTS PASSED`。
 
 #### Step 3 — 飞书开放平台配置（支持 Antigravity IDE 浏览器半自动代办）
@@ -64,38 +93,47 @@ https://github.com/handais/antigravity-feishu-remote
   2. 新建一个企业自建应用（或进入用户指定的已有应用），开启 **应用能力 → 机器人（Bot）**。
   3. 进入 **权限管理 → 批量导入/导出权限**，粘贴下方 **[二、飞书开放平台 3 分钟配置清单](#二飞书开放平台-3-分钟配置清单)** 中的 JSON 一键开通权限（若用户计划建个人话题群免 `@` 使用，顺带确认开通 `im:message.group_msg`）。
   4. 进入 **凭证与基础信息** 获取 `App ID` 与 `App Secret`（若点击查看需要验证码/人工复制，请让用户粘贴或仅在本机运行 `cli.mjs setup`，**绝不在对话回复里明文回显 `App Secret`**）。
-  5. **先跑 Step 4 启动本地守护进程再保存长连接**：因为飞书后台开启「使用长连接接收事件/回调」时可能会校验当前应用是否已有在线长连接，建议先完成 Step 4 的 `cli.mjs setup` 与 `cli.mjs start`，确保长连接已连上。
+  5. **先跑 Step 4 的 `setup` 与 `start` 启动本地守护进程，再保存长连接**：因为飞书后台开启「使用长连接接收事件/回调」时可能会校验当前应用是否已有在线长连接，请先完成 Step 4 写入凭证并启动守护进程（注意：此时应用尚未发布版本，`cli.mjs scopes` 里的权限显示 `pending` 属正常现象，**发布后再跑 `scopes` 验收**）。
   6. 回到网页 **事件与回调**：将「事件配置」和「回调配置」的订阅方式均设为 **使用长连接接收**，添加事件 `im.message.receive_v1`、`application.bot.menu_v6` 与回调 `card.action.trigger`。
   7. （可选）进入 **机器人自定义菜单** 配置 `menu_panel` / `menu_commands` / `menu_new` / `menu_stop`（响应动作选「推送事件」）。
   8. 进入 **版本管理与发布** → 创建版本（可用范围保持仅自己或指定成员）并提交发布（遇到需人工确认/审核提示时由用户确认）。
+  9. **发布后权限验收**：运行 `cli.mjs scopes` 确认基础 `im:message`、`im:resource`、`cardkit:*` 等权限均已变为 `granted`（若仍有 `pending`，确认版本已正式生效并等待数十秒再复查）。
 
 - **路径 B（纯命令行环境、无浏览器工具）**：
-  - 引导用户按下方 **[二、飞书开放平台 3 分钟配置清单](#二飞书开放平台-3-分钟配置清单)** 操作并发布，向用户索取且**仅索取**两项信息：**`App ID`** 与 **`App Secret`**，再执行 Step 4。
+  - 引导用户按下方 **[二、飞书开放平台 3 分钟配置清单](#二飞书开放平台-3-分钟配置清单)** 操作并发布，向用户索取且**仅索取**两项信息：**`App ID`** 与 **`App Secret`**，再执行 Step 4（并在确认版本已发布后运行 `cli.mjs scopes` 验收）。
 
 #### Step 4 — 写入配置、启动守护进程与验收
-拿到 `App ID` 和 `App Secret` 后执行：
-```bash
-node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup \
-  --app-id "<APP_ID>" \
-  --app-secret "<APP_SECRET>" \
-  --cwd "$HOME" \
-  --mode accept-edits \
-  --notify-mode away
+拿到 `App ID` 和 `App Secret` 后执行（`cli.mjs` 内部会自动把 `--cwd ~` 跨平台展开为当前用户主目录，并把配置保存到 `~/.config/antigravity-feishu/` / `%USERPROFILE%\.config\antigravity-feishu\`）：
 
-node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs start
-node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs status
-node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
-```
-- 验收标准：
+- **macOS / Linux (bash/zsh)**：
+  ```bash
+  node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup \
+    --app-id "<APP_ID>" \
+    --app-secret "<APP_SECRET>" \
+    --cwd ~ \
+    --mode accept-edits \
+    --notify-mode away
+
+  node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs start
+  node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs status
+  ```
+- **Windows (PowerShell)**（勿使用 `\` 续行）：
+  ```powershell
+  node "$HOME\.gemini\config\plugins\feishu-remote\scripts\cli.mjs" setup --app-id "<APP_ID>" --app-secret "<APP_SECRET>" --cwd ~ --mode accept-edits --notify-mode away
+  node "$HOME\.gemini\config\plugins\feishu-remote\scripts\cli.mjs" start
+  node "$HOME\.gemini\config\plugins\feishu-remote\scripts\cli.mjs" status
+  ```
+- 阶段验收标准：
   - `cli.mjs status` 中 `configured: true` 且 `daemon.running: true`；
-  - `cli.mjs scopes` 确认基础 `im:message`、`im:resource`、`cardkit:*` 等权限处于 `granted` 状态（若有 `pending`，提醒用户在飞书后台发布版本）。
+  - 若是路径 B（应用已发布版本）或已完成 Step 3 第 8 步发布，继续执行 `cli.mjs scopes`（Windows 为 `node "$HOME\.gemini\config\plugins\feishu-remote\scripts\cli.mjs" scopes`）确认基础 `im:message`、`im:resource`、`cardkit:*` 等权限处于 `granted` 状态。
+- **Windows 重启后提醒**：原生 Windows 下 `cli.mjs start` 采用分离后台 PID 模式，**系统重启后不会像 macOS `launchd` / Linux `systemd` 那样自动开机启动**；部署完成时请提醒用户：重启电脑后需重新运行一次 `cli.mjs start`（或自行配置 Windows 任务计划程序 / WSL2）。
 
 #### Step 5 — 首轮配对验活
 1. 提示用户在手机/电脑飞书里找到该机器人，**私聊发送一句 `你好`**，触发自动白名单绑定与欢迎卡片。
-2. 绑定完成后，可选执行 `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs test-send --panel` 验证控制面板卡片可正常送达。
+2. 绑定完成后，可选执行 `cli.mjs test-send --panel` 验证控制面板卡片可正常送达。
 
 #### AI 必守红线与排错速查
-- **凭证隔离红线**：严禁将 `appSecret`、`open_id` 写入 `~/.gemini/config/plugins/feishu-remote/` 仓库目录内，也严禁在回复或日志中明文回显 `appSecret`（所有凭证与状态统一由 `cli.mjs setup` 保存在 `~/.config/antigravity-feishu/`，权限 `0600`）。
+- **凭证隔离红线**：严禁将 `appSecret`、`open_id` 写入插件仓库目录内（`~/.gemini/config/plugins/feishu-remote/` 或 `%USERPROFILE%\.gemini\config\plugins\feishu-remote\`），也严禁在回复或日志中明文回显 `appSecret`（所有凭证与状态统一由 `cli.mjs setup` 保存在 `~/.config/antigravity-feishu/` / `%USERPROFILE%\.config\antigravity-feishu\`，POSIX 权限 `0600`）。
 - **子进程重启禁令**：如果当前任务本身是由飞书桥接拉起的子会话（`FEISHU_REMOTE_BRIDGE_CHILD=1`），禁止自行运行 `cli.mjs restart` 杀掉父守护进程；应提示用户在飞书发 `/reload` 安全重启。
 - **常见快速调整**：
   - 话题群免 `@` 触发：确保飞书后台已开通并发布 `im:message.group_msg`，再执行 `cli.mjs setup --group-policy all`（白名单依然仅放行授权 `open_id`）。
@@ -223,6 +261,8 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs scopes
 ## 三、本机安装与启动
 
 > **环境要求**：`Node.js 22.5+`（`/desktop` 只读索引扫描依赖内置 `node:sqlite`）及已登录的 `agy` CLI。守护进程托管支持 **macOS (`launchd`)**、**Linux (`systemd --user`)** 与 **原生 Windows**（PowerShell/CMD 下自动走分离后台 `pid` 模式，支持 `where agy`、系统代理读取与 `GetLastInputInfo` 离开感应；Windows 如需开机自启可配合计划任务或使用 WSL2）。
+>
+> **目录与平台说明**：Windows 用户的全局插件目录为 `%USERPROFILE%\.gemini\config\plugins\feishu-remote`（PowerShell 为 `$HOME\.gemini\config\plugins\feishu-remote`），凭证配置目录为 `%USERPROFILE%\.config\antigravity-feishu\`。目前作者主力在 **macOS** 实机验证，**Linux / Windows 属于通过三平台 CI 测试的实验性支持**。
 
 ### 1. 安装插件与依赖
 
