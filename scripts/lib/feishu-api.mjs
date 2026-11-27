@@ -76,6 +76,21 @@ export async function sendText(client, { receiveId, receiveIdType = 'open_id', t
   return res?.data?.message_id || '';
 }
 
+export async function replyText(client, { messageId, text, replyInThread = false }) {
+  const res = await client.im.v1.message.reply({
+    data: {
+      msg_type: 'text',
+      content: JSON.stringify({ text: String(text || '') }),
+      ...(replyInThread ? { reply_in_thread: true } : {}),
+    },
+    path: {
+      message_id: messageId,
+    },
+  });
+  assertLarkOk(res, 'replyText');
+  return res?.data?.message_id || '';
+}
+
 export async function replyCard(client, { messageId, card, replyInThread = false }) {
   const res = await client.im.v1.message.reply({
     data: {

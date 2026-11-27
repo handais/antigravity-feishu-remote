@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import {
   getPluginRoot,
   loadConfig,
@@ -73,13 +75,14 @@ function inferReceiveIdType(receiveId, fallback = 'open_id') {
   return fallback || 'open_id';
 }
 
-function collectAllowedTargets(config, state) {
+function collectAllowedTargets(config, state, env = process.env) {
   const allowedOpenIds = new Set(
     (Array.isArray(config?.security?.allowedOpenIds) ? config.security.allowedOpenIds : [])
       .map((id) => String(id || '').trim())
       .filter(Boolean),
   );
   const allowedChatIds = new Set();
+  const allowedThreadRootIds = new Set();
 
   const defaultId = String(config?.notifications?.defaultReceiveId || '').trim();
   const defaultType = inferReceiveIdType(
@@ -100,19 +103,34 @@ function collectAllowedTargets(config, state) {
     if (clean) allowedChatIds.add(clean);
   }
   for (const key of Object.keys(state?.chats || {})) {
-    const base = String(key || '').split('#')[0].trim();
+    const [rawBase, rawThread] = String(key || '').split('#');
+    const base = String(rawBase || '').trim();
+    const threadRoot = String(rawThread || '').trim();
     if (base.startsWith('oc_')) {
       allowedChatIds.add(base);
     } else if (base.startsWith('ou_') && allowedOpenIds.size > 0 && allowedOpenIds.has(base)) {
       allowedOpenIds.add(base);
     }
+    if (threadRoot) {
+      allowedThreadRootIds.add(threadRoot);
+    }
   }
-  return { allowedOpenIds, allowedChatIds };
+  if (env?.FEISHU_REMOTE_BRIDGE_CHILD === '1') {
+    const bridgeChatId = String(env.FEISHU_REMOTE_CHAT_ID || '').trim();
+    if (bridgeChatId.startsWith('oc_')) {
+      allowedChatIds.add(bridgeChatId);
+    }
+    const bridgeThreadRootId = String(env.FEISHU_REMOTE_THREAD_ROOT_ID || '').trim();
+    if (bridgeThreadRootId) {
+      allowedThreadRootIds.add(bridgeThreadRootId);
+    }
+  }
+  return { allowedOpenIds, allowedChatIds, allowedThreadRootIds };
 }
 
-function assertTargetAuthorized(receiveId, receiveIdType, config, state) {
+function assertTargetAuthorized(receiveId, receiveIdType, config, state, env = process.env) {
   if (config?.security?.allowExternalMcpTargets === true) return;
-  const { allowedOpenIds, allowedChatIds } = collectAllowedTargets(config, state);
+  const { allowedOpenIds, allowedChatIds } = collectAllowedTargets(config, state, env);
   const cleanId = String(receiveId || '').trim();
   if (receiveIdType === 'open_id' && allowedOpenIds.has(cleanId)) {
     return;
@@ -126,6 +144,19 @@ function assertTargetAuthorized(receiveId, receiveIdType, config, state) {
   }
   throw new Error(
     `Target ${receiveIdType}:${cleanId} is outside authorized Feishu targets (allowedOpenIds / known chats). Set security.allowExternalMcpTargets=true to override.`,
+  );
+}
+
+function assertReplyTargetAuthorized(replyToMessageId, config, state, env = process.env) {
+  if (config?.security?.allowExternalMcpTargets === true) return;
+  const cleanReplyTo = String(replyToMessageId || '').trim();
+  if (!cleanReplyTo) return;
+  const { allowedThreadRootIds } = collectAllowedTargets(config, state, env);
+  if (allowedThreadRootIds.has(cleanReplyTo)) {
+    return;
+  }
+  throw new Error(
+    `Reply target message_id:${cleanReplyTo} is outside authorized Feishu topic threads. Set security.allowExternalMcpTargets=true to override.`,
   );
 }
 
@@ -144,31 +175,69 @@ async function getReusableClient(config) {
   return cachedFeishuClient;
 }
 
-function resolveTarget(args, config, state = loadState()) {
+export function resolveTarget(args, config, state = loadState(), env = process.env) {
+  const isBridgeChild = env?.FEISHU_REMOTE_BRIDGE_CHILD === '1';
+  const bridgeChatId = isBridgeChild ? String(env?.FEISHU_REMOTE_CHAT_ID || '').trim() : '';
+  const bridgeThreadRootId = isBridgeChild ? String(env?.FEISHU_REMOTE_THREAD_ROOT_ID || '').trim() : '';
+
   const explicitId = String(args?.receive_id || '').trim();
+  const explicitReplyTo = String(args?.reply_to_message_id || '').trim();
   const defaultId = String(config?.notifications?.defaultReceiveId || '').trim();
   const fallbackOpenId = String(config?.security?.allowedOpenIds?.[0] || '').trim();
 
   let receiveId = '';
   let receiveIdType = 'open_id';
+  let replyToMessageId = '';
+  let replyInThread = false;
+
   if (explicitId) {
     receiveId = explicitId;
-    receiveIdType = String(args?.receive_id_type || '').trim() || inferReceiveIdType(explicitId, config.notifications.defaultReceiveIdType || 'open_id');
+    receiveIdType =
+      String(args?.receive_id_type || '').trim() ||
+      inferReceiveIdType(explicitId, config?.notifications?.defaultReceiveIdType || 'open_id');
+    replyToMessageId = explicitReplyTo;
+    replyInThread = Boolean(explicitReplyTo && args?.reply_in_thread !== false);
+  } else if (bridgeThreadRootId) {
+    receiveId = bridgeChatId || defaultId || fallbackOpenId;
+    receiveIdType =
+      String(args?.receive_id_type || '').trim() ||
+      (bridgeChatId
+        ? inferReceiveIdType(bridgeChatId, 'chat_id')
+        : config?.notifications?.defaultReceiveIdType || inferReceiveIdType(receiveId, 'open_id'));
+    replyToMessageId = explicitReplyTo || bridgeThreadRootId;
+    replyInThread = args?.reply_in_thread === false ? false : true;
+  } else if (bridgeChatId) {
+    receiveId = bridgeChatId;
+    receiveIdType = String(args?.receive_id_type || '').trim() || inferReceiveIdType(bridgeChatId, 'chat_id');
+    replyToMessageId = explicitReplyTo;
+    replyInThread = Boolean(explicitReplyTo && args?.reply_in_thread === true);
   } else if (defaultId) {
     receiveId = defaultId;
-    receiveIdType = String(args?.receive_id_type || '').trim() || config.notifications.defaultReceiveIdType || inferReceiveIdType(defaultId, 'open_id');
+    receiveIdType =
+      String(args?.receive_id_type || '').trim() ||
+      config?.notifications?.defaultReceiveIdType ||
+      inferReceiveIdType(defaultId, 'open_id');
+    replyToMessageId = explicitReplyTo;
+    replyInThread = Boolean(explicitReplyTo && args?.reply_in_thread === true);
   } else if (fallbackOpenId) {
     receiveId = fallbackOpenId;
     receiveIdType = String(args?.receive_id_type || '').trim() || 'open_id';
+    replyToMessageId = explicitReplyTo;
+    replyInThread = Boolean(explicitReplyTo && args?.reply_in_thread === true);
   }
 
-  if (!receiveId) {
+  if (!receiveId && !replyToMessageId) {
     throw new Error(
       'No receive_id provided and no defaultReceiveId or bound allowedOpenIds configured yet.',
     );
   }
-  assertTargetAuthorized(receiveId, receiveIdType, config, state);
-  return { receiveId, receiveIdType };
+  if (receiveId) {
+    assertTargetAuthorized(receiveId, receiveIdType, config, state, env);
+  }
+  if (replyToMessageId) {
+    assertReplyTargetAuthorized(replyToMessageId, config, state, env);
+  }
+  return { receiveId, receiveIdType, replyToMessageId, replyInThread };
 }
 
 function toolResult(data, isError = false) {
@@ -200,7 +269,7 @@ function createMcpServer({ Server, CallToolRequestSchema, ListToolsRequestSchema
   tools: [
     {
       name: 'feishu_send_message',
-      description: 'Send a plain text message to the configured Feishu user or chat.',
+      description: 'Send a plain text message to the configured Feishu user or chat (auto-replies into the active topic thread when invoked inside a Feishu topic session).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -211,13 +280,21 @@ function createMcpServer({ Server, CallToolRequestSchema, ListToolsRequestSchema
             enum: ['open_id', 'chat_id', 'user_id', 'union_id', 'email'],
             description: 'Optional ID type (defaults to config defaultReceiveIdType).',
           },
+          reply_to_message_id: {
+            type: 'string',
+            description: 'Optional topic root message_id to reply under.',
+          },
+          reply_in_thread: {
+            type: 'boolean',
+            description: 'Whether to reply inside the topic thread when reply_to_message_id is active.',
+          },
         },
         required: ['text'],
       },
     },
     {
       name: 'feishu_send_card',
-      description: 'Send a rich Feishu interactive markdown card to the configured user or chat.',
+      description: 'Send a rich Feishu interactive markdown card to the configured user or chat (auto-replies into the active topic thread when invoked inside a Feishu topic session).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -233,13 +310,21 @@ function createMcpServer({ Server, CallToolRequestSchema, ListToolsRequestSchema
             enum: ['open_id', 'chat_id', 'user_id', 'union_id', 'email'],
             description: 'Optional ID type (defaults to config defaultReceiveIdType).',
           },
+          reply_to_message_id: {
+            type: 'string',
+            description: 'Optional topic root message_id to reply under.',
+          },
+          reply_in_thread: {
+            type: 'boolean',
+            description: 'Whether to reply inside the topic thread when reply_to_message_id is active.',
+          },
         },
         required: ['title', 'markdown'],
       },
     },
     {
       name: 'feishu_send_file',
-      description: 'Upload and send a local image or file to the configured Feishu user or chat.',
+      description: 'Upload and send a local image or file to the configured Feishu user or chat (auto-replies into the active topic thread when invoked inside a Feishu topic session).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -253,6 +338,14 @@ function createMcpServer({ Server, CallToolRequestSchema, ListToolsRequestSchema
             type: 'string',
             enum: ['open_id', 'chat_id', 'user_id', 'union_id', 'email'],
             description: 'Optional ID type (defaults to config defaultReceiveIdType).',
+          },
+          reply_to_message_id: {
+            type: 'string',
+            description: 'Optional topic root message_id to reply under.',
+          },
+          reply_in_thread: {
+            type: 'boolean',
+            description: 'Whether to reply inside the topic thread when reply_to_message_id is active.',
           },
         },
         required: ['file_path'],
@@ -439,18 +532,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     stripProcessProxyEnv(config.feishu.proxy);
 
     if (name === 'feishu_send_message') {
-      const { sendText } = await loadFeishuApi();
+      const { replyText, sendText } = await loadFeishuApi();
       const client = await getReusableClient(config);
       const target = resolveTarget(args, config);
-      const messageId = await sendText(client, {
-        ...target,
-        text: String(args.text || ''),
-      });
+      const text = String(args.text || '');
+      const messageId = target.replyToMessageId
+        ? await replyText(client, {
+            messageId: target.replyToMessageId,
+            text,
+            replyInThread: target.replyInThread,
+          })
+        : await sendText(client, {
+            receiveId: target.receiveId,
+            receiveIdType: target.receiveIdType,
+            text,
+          });
       return toolResult({ ok: true, messageId, ...target });
     }
 
     if (name === 'feishu_send_card') {
-      const { buildCard, sanitizeForFeishuMarkdown, sendCard } = await loadFeishuApi();
+      const { buildCard, replyCard, sanitizeForFeishuMarkdown, sendCard } = await loadFeishuApi();
       const client = await getReusableClient(config);
       const target = resolveTarget(args, config);
       const template = VALID_CARD_COLORS.has(args.color) ? args.color : 'blue';
@@ -459,7 +560,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         template,
         markdown: sanitizeForFeishuMarkdown(String(args.markdown || '')),
       });
-      const messageId = await sendCard(client, { ...target, card });
+      const messageId = target.replyToMessageId
+        ? await replyCard(client, {
+            messageId: target.replyToMessageId,
+            card,
+            replyInThread: target.replyInThread,
+          })
+        : await sendCard(client, {
+            receiveId: target.receiveId,
+            receiveIdType: target.receiveIdType,
+            card,
+          });
       return toolResult({ ok: true, messageId, ...target });
     }
 
@@ -476,7 +587,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const client = await getReusableClient(config);
       const target = resolveTarget(args, config);
       const sent = await sendLocalMedia(client, {
-        ...target,
+        receiveId: target.receiveId,
+        receiveIdType: target.receiveIdType,
+        replyToMessageId: target.replyToMessageId,
+        replyInThread: target.replyInThread,
         filePath: resolvedPath,
         forceFile: Boolean(args.as_file),
       });
@@ -674,7 +788,13 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error('[feishu-remote-mcp] Fatal error:', err);
-  process.exit(1);
-});
+const isMain = Boolean(
+  process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href,
+);
+
+if (isMain) {
+  main().catch((err) => {
+    console.error('[feishu-remote-mcp] Fatal error:', err);
+    process.exit(1);
+  });
+}
