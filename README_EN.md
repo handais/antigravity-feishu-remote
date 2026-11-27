@@ -1,13 +1,37 @@
-# Feishu Remote — Antigravity Plugin
+<div align="center">
+
+<img src="./assets/hero-banner.svg" alt="Feishu Remote Banner" width="100%" />
+
+<br />
 
 [![CI](https://github.com/handais/antigravity-feishu-remote/actions/workflows/ci.yml/badge.svg)](https://github.com/handais/antigravity-feishu-remote/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/handais/antigravity-feishu-remote)](https://github.com/handais/antigravity-feishu-remote/releases)
 [![Node](https://img.shields.io/badge/node-%3E%3D22.5.0-brightgreen)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
-**English** | [简体中文 (README.md)](./README.md)
+**English** · [简体中文 (README.md)](./README.md) · [Changelog](./CHANGELOG.md)
 
-Control your local **Antigravity** CLI / IDE directly from **Feishu** or **Lark** (mobile or desktop) over a **WebSocket long connection**—no public IP, reverse proxy, or webhook server required. Includes **CardKit 2.0** typewriter streaming, multi-turn session management, Topic Group parallel threads, Desktop-to-Phone handoff, MCP proactive messaging & cloud doc tools, and a `Stop` completion notification hook.
+</div>
+
+Control your local **Antigravity** CLI / IDE directly from **Feishu** or **Lark** (mobile or desktop) over a **WebSocket long connection**—no public IP, reverse proxy, or webhook server required. Includes **CardKit 2.0** typewriter streaming, multi-turn session management, Topic Group parallel threads, `/guard` high-risk command approval, **bidirectional Desktop ⇄ Mobile session handoff** (`/desktop`, `/handoff`, `feishu_read_mobile_session`), **safe mobile self-iteration of the plugin itself** (edit plugin code right from Feishu, `/reload` syntax + smoke dual-check hot-restart, and one-tap snapshot `/rollback`), MCP proactive messaging & cloud doc tools, and a `Stop` completion notification hook.
+
+---
+
+## Keynote Preview
+
+<div align="center">
+  <img src="./assets/keynote-demo.gif" alt="Feishu Remote Keynote Demo" width="100%" />
+  <br />
+  <sub>01 Highlights → 02 CardKit 2.0 Live Streaming → 03 Multi-Topic &amp; Control Panel → 04 <code>/guard</code> Command Approval → 05 Session Handoff &amp; Mobile Self-Iteration</sub>
+</div>
+
+---
+
+## Architecture & Security Model
+
+<div align="center">
+  <img src="./assets/architecture-flow.svg" alt="Feishu Remote Architecture" width="100%" />
+</div>
 
 ---
 

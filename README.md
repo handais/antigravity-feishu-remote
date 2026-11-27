@@ -1,18 +1,78 @@
-# 飞书远程控制 (Feishu Remote) — Antigravity 插件
+<div align="center">
+
+<img src="./assets/hero-banner.svg" alt="Feishu Remote Banner" width="100%" />
+
+<br />
 
 [![CI](https://github.com/handais/antigravity-feishu-remote/actions/workflows/ci.yml/badge.svg)](https://github.com/handais/antigravity-feishu-remote/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/handais/antigravity-feishu-remote)](https://github.com/handais/antigravity-feishu-remote/releases)
 [![Node](https://img.shields.io/badge/node-%3E%3D22.5.0-brightgreen)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
-**简体中文** | [English Documentation (README_EN.md)](./README_EN.md) | [更新日志 (CHANGELOG.md)](./CHANGELOG.md)
+**简体中文** · [English Documentation](./README_EN.md) · [更新日志](./CHANGELOG.md)
 
-> Remotely control your local Antigravity CLI/IDE from Feishu or Lark over WebSocket long connection (no public IP required), with CardKit 2.0 streaming, MCP push & cloud doc tools, and desktop completion handoff hooks. All secrets stay isolated outside the plugin folder (`~/.config/antigravity-feishu/`, mode `0600`).
+[🎬 发布会演示](#-发布会演示keynote-preview) · [✨ 核心亮点](#-核心亮点feature-bento-grid) · [🏗️ 架构与安全](#-架构与零泄密安全模型) · [🤖 AI 一键部署](#-交给-ai-一键自动部署agent-quickstart) · [📋 飞书配置清单](#二飞书开放平台-3-分钟配置清单) · [📦 分享打包](#四如何打包分享给朋友)
 
-通过飞书 **WebSocket 长连接**，让你在手机（安卓 / iOS）飞书里直接向本机 Antigravity 发任务、实时看流式卡片进度、继续多轮上下文，并支持本地目录切换、模型/权限模式切换、MCP 主动推送和任务完成通知。
+</div>
 
-> **免公网 IP / 免内网穿透 / 分享不泄密**
-> 个人 `App Secret` 和授权用户白名单统一保存在本机 `~/.config/antigravity-feishu/config.json`（Windows 为 `%USERPROFILE%\.config\antigravity-feishu\config.json`，`0600` 权限），插件目录内不含任何个人密钥，打包即可分享给朋友。
+> **免公网 IP · 免内网穿透 · 零泄密隔离**  
+> 通过飞书 **WebSocket 长连接**，让你在手机（安卓 / iOS）或桌面飞书里随时指挥本机 **Antigravity (`agy`)**——实时看 **CardKit 2.0 打字机流式卡片**、多话题并发执行、拦截高危 Shell 命令、**电脑 ⇄ 手机双向会话接力**，甚至**在手机上直接修改并双检热更新本插件自身（支持快照一键回滚）**。  
+> 个人 `App Secret` 与白名单严格保存在 `~/.config/antigravity-feishu/`（Windows 为 `%USERPROFILE%\.config\antigravity-feishu\`，`0600` 权限），插件目录零密钥，打包即可安全分享给朋友。
+
+---
+
+## 🎬 发布会演示（Keynote Preview）
+
+<div align="center">
+  <img src="./assets/keynote-demo.gif" alt="Feishu Remote Keynote Demo" width="100%" />
+  <br />
+  <sub>01 核心亮点 → 02 CardKit 2.0 实时流式编码 → 03 多话题并发 &amp; 控制面板 → 04 <code>/guard</code> 高危命令飞书审批 → 05 双向会话接力 &amp; 手机自迭代</sub>
+</div>
+
+---
+
+## ✨ 核心亮点（Feature Bento Grid）
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>⚡ CardKit 2.0 打字机流式卡片</h3>
+      实时原地刷新工具步骤、耗时与 Token 用量，失败自动无缝降级 <code>patchCard</code>；超长输出智能分片且不截断代码块，完成后自动在原消息贴上 <code>DONE</code> 表情并附带改动 Diff 按钮。
+    </td>
+    <td width="50%" valign="top">
+      <h3>🧵 单群多话题并发隔离</h3>
+      在飞书「话题群」内按 <code>chatId#threadRootId</code> 自动隔离上下文与工作目录。开几个话题就并发几路任务（默认上限 4），流式输出、分片与文件回传全部锁回原话题楼。
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>💻 电脑 ⇄ 手机双向无缝接力</h3>
+      离开电脑自动感应（<code>--notify-mode away</code>）并把桌面端完成结果推到飞书，支持「🧵 新开话题接管」或回流原楼；随时用 <code>/handoff</code> + <code>feishu_read_mobile_session</code> 同步回桌面端继续。
+    </td>
+    <td width="50%" valign="top">
+      <h3>🚀 手机远程自迭代插件（防变砖）</h3>
+      出门在外也能直接在飞书里让 AI 修改 <code>feishu-remote</code> 源码：<code>/reload</code> 先自动跑语法与冒烟双检，通过后零中断热重启；每次启动自动留存健康快照，异常支持 <code>/rollback</code> 一键回滚。
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>🛡️ <code>/guard</code> 高危命令飞书审批</h3>
+      内置 <code>PreToolUse</code> 安全钩子：当远程任务尝试执行 <code>rm -rf</code>、<code>git push --force</code>、<code>sudo</code> 等高危命令时，自动向手机推送审批卡片，超时 Fail-Closed 自动拒绝。
+    </td>
+    <td width="50%" valign="top">
+      <h3>🎛️ 控制面板 · 云文档与技能生态</h3>
+      支持动态置顶高频操作（<code>⭐ 常用操作</code>）、<code>⚡ 30m全权</code> 倒计时自动降权与 <code>🛠️ 设置</code> 二级页；消息贴飞书云文档链接自动读取正文与批注，支持 Task v2 待办及 <code>/</code> 技能清单。
+    </td>
+  </tr>
+</table>
+
+---
+
+## 🏗️ 架构与零泄密安全模型
+
+<div align="center">
+  <img src="./assets/architecture-flow.svg" alt="Feishu Remote Architecture and Security Model" width="100%" />
+</div>
 
 > [!NOTE]
 > **平台实测说明**
@@ -142,7 +202,12 @@ https://github.com/handais/antigravity-feishu-remote
 
 ---
 
-## 一、功能一览
+## 一、全部功能与指令速查
+
+插件涵盖 **飞书 WebSocket 守护进程**、**25+ 飞书斜杠指令与交互卡片**、**`feishu-remote-tools` MCP 工具集** 以及 **`Stop` / `PreToolUse` 双生命周期 Hook**。
+
+<details>
+<summary><b>📖 展开查看完整功能清单、飞书指令集、MCP 工具与 Hook 说明</b></summary>
 
 1. **飞书长连接桥接守护进程（Daemon）**：
    - 开机后台常驻（macOS `launchd` / Linux `systemd --user`）。
@@ -150,11 +215,11 @@ https://github.com/handais/antigravity-feishu-remote
    - **消息表情状态反馈**：任务完成后自动在原消息贴上 `DONE` 表情。
    - **任务自动排队 & 失败重试**：上一条任务尚未完成时，后续发送的消息自动排队接力执行（支持一键中止当前立刻执行或取消排队）；中止/异常卡片自带 `🔄 重试` 按钮。
    - **引用回复 & 云文档上下文**：在飞书长按「回复」历史消息、卡片或截图时自动带入上下文；在消息里直接贴 `feishu.cn/docx/...` 或 `/wiki/...` 链接会自动拉取正文给 Antigravity。
-   - 每个飞书会话独立记忆工作目录、权限模式（含**临时全权限到期自动降权**）、模型与最近 10 条历史会话。
+   - 每个飞书会话独立记忆工作目录、权限模式（含**临时全权限到期自动降权**）、模型与最近历史会话（支持跨窗口/跨话题聚合）。
    - **单群多话题并行（话题群模式）**：在飞书「话题群」中按 `chatId#threadRootId` 自动隔离会话，群内每开一个话题即一个独立并行会话（默认全局最多同时执行 4 个并发任务，可通过 `--max-concurrent` 调整），消息、流式卡片、分片与文件回传全部锁回原话题楼。
    - **安全白名单**：默认首次私聊发消息的账号自动绑定为唯一主人（`autoBindFirstUser`），其他陌生私聊直接拦截并提示其 `open_id`。
 2. **飞书常用指令与快捷方式**：
-   - **多页可视化控制面板 + 卡片交互按钮**：可在飞书开放平台开启「机器人自定义菜单」与 `card.action.trigger` 长连接回调，不用记命令直接点按钮操作；支持在主控制面板、目录浏览、命令与技能、最近会话和模型切换之间**原地翻页切换**（子页面均带 `⬅️ 返回面板`）。消息回复卡片内也自带「🆕 新对话」「⚙️ 控制面板」「🗂️ 最近会话」及执行中的「🛑 立即中止」按钮。
+   - **多页可视化控制面板 + 卡片交互按钮**：可在飞书开放平台开启「机器人自定义菜单」与 `card.action.trigger` 长连接回调，不用记命令直接点按钮操作；支持在主控制面板、目录浏览、命令与技能、最近会话、模型切换和 `🛠️ 设置` 之间**原地翻页切换**（子页面均带 `⬅️ 返回面板`）。消息回复卡片内也自带「🆕 新对话」「⚙️ 控制面板」「🗂️ 最近会话」及执行中的「🛑 立即中止」按钮。
    - `/panel`（或 `/menu`）：打开带按钮的控制面板（一键切换常用目录/模式/模型、**⚡ 30m全权**、**🌿 Git**、**🔐 权限**、目录浏览器、收藏目录、开新对话、**♻️ 安全重启** / **⏪ 快照回滚**）
    - `/` 或 `/skills`：查看 `agy` 内置命令与本机已安装 Skills 清单（支持一键 `/compact` 及 `/agy <原始命令>` 强制透传）
    - `/git`：零延迟查看当前工作目录 Git 分支、工作区改动及最近 5 条提交（不经大模型）
@@ -170,7 +235,7 @@ https://github.com/handais/antigravity-feishu-remote
    - `/help`：查看全部命令
    - `/status`：查看当前工作目录、模式（含临时全权倒计时）、模型、队列条数、会话 ID 与运行状态
    - `/new`：开启新对话（清空当前上下文绑定）
-   - `/sessions` / `/use <序号|ID>`：查看并切回最近飞书会话（顶部支持一键切换到 **`💻 电脑对话`**）
+   - `/sessions [all|here]` / `/use <序号|ID>`：查看并切回全部飞书窗口或当前话题的最近会话（跨窗口切换自动同步工作目录 `cwd`，顶部支持一键切换到 **`💻 电脑对话`**）
    - `/desktop [关键词]`（别名 `/pc`）：只读扫描与全文检索本机 CLI / 桌面端历史对话，预览最近上下文并支持**双轨接管**（可选 **`🧵 新开话题接管`** 在话题群独立开楼隔离上下文，或 **`📱 当前对话接管`** / **`👀 接管并总结`**）
    - `/topic [set|clear]` / `/unlink`：查看或绑定「🧵 新开话题接管」的默认话题群；`/unlink` 可结束当前话题楼与电脑端的自动回流追踪
    - `/handoff [cli|desktop]`（别名 `/back`）：生成手机端回流电脑端的终端 `agy --conversation` 恢复命令与桌面交接提示词（自动写入系统剪贴板与交接快照，并支持桌面端通过 `feishu_read_mobile_session` 无感同步手机进度、自动检测原桌面端分叉）
@@ -185,7 +250,7 @@ https://github.com/handais/antigravity-feishu-remote
    - `/model [模型名|default]` / `/models`：查看可用模型或切换模型（支持点击按钮切换）
    - `/stop`（或 `/cancel`）：立即中止当前正在执行的任务
    - **多模态收发**：手机直接发送图片/截图、文件（PDF/代码/文档）、语音或图文混排，自动下载至 `~/.config/antigravity-feishu/inbox/`（7 天自动清理）并由 Antigravity 原生读取分析。
-   - **基础存储与性能治理**：`mcp-server.mjs` 按需懒加载飞书 SDK；守护进程默认 `warn` 级静音，启动及每 24 小时自动原地截断超 5 MB 的日志文件，并限制 `inbox/` 附件 7 天过期与 200 MB 总上限。
+   - **基础存储与性能治理**：`mcp-server.mjs` 按需懒加载飞书 SDK；守护进程默认 `warn` 级静音并带本地时间戳，启动及每 24 小时自动原地截断超 5 MB 的日志文件，并限制 `inbox/` 附件 7 天过期与 200 MB 总上限。
 3. **MCP 主动推送与文档/任务工具（`feishu-remote-tools`）**：
    - `feishu_send_message` / `feishu_send_card` / `feishu_send_file`：让桌面端 Antigravity 主动向你手机发汇报或回传本地图片/文件。
    - `feishu_read_doc` / `feishu_write_doc`：读取飞书云文档/Wiki（含正文及划词/全文批注），或将 Markdown 分析报告直接新建/追加写入飞书云文档。
@@ -197,13 +262,15 @@ https://github.com/handais/antigravity-feishu-remote
    - 当飞书桥接拉起的子任务尝试执行高危 Shell 命令时，`PreToolUse` Hook 自动向飞书推送审批卡片，确认后才放行。
    - 飞书每轮任务结束后，若修改了本地文件，完成卡片会自动附带 **`🔍 看改动 Diff`**、**`📄 查看改动文件`** 与 **`📥 发到聊天`** 快捷按钮。
 
+</details>
+
 ---
 
 ## 二、飞书开放平台 3 分钟配置清单
 
 1. 登录 [飞书开放平台](https://open.feishu.cn/app) → 进入你的 **企业自建应用**。
 2. **添加应用能力**：开启 **机器人（Bot）**。
-   - **权限管理**（也支持在飞书开放平台「权限管理 → 批量导入/导出权限」直接粘贴下方 JSON 一键导入）：
+3. **权限管理**（也支持在飞书开放平台「权限管理 → 批量导入/导出权限」直接粘贴下方 JSON 一键导入）：
 ```json
 {
   "scopes": {
@@ -228,7 +295,9 @@ https://github.com/handais/antigravity-feishu-remote
   }
 }
 ```
-   - 权限详细说明：
+<details>
+<summary>查看各项权限用途说明</summary>
+
    - **基础必需**：
      - `im:message`（获取与发送单聊、群组消息）
      - `im:message:send_as_bot`（以应用身份发消息）
@@ -241,18 +310,15 @@ https://github.com/handais/antigravity-feishu-remote
      - `docx:document` / `docs:permission.member:create` / `docx:document:readonly` / `docx:document:write_only` / `docx:document.block:convert` / `wiki:node:read`（飞书云文档与 Wiki 读取/创建/写入及自动给主人开协作者权限）
      - `im:message.group_at_msg:readonly`（可选，如需在群里 `@机器人` 使用）
      - `im:message.group_msg`（可选，仅在配合 `--group-policy all` 实现单人话题群免 `@` 直接打字触发时需要）
+
+</details>
+
 4. **事件与回调**：
    - **事件配置**：订阅方式选择 **「使用长连接接收事件」**，添加事件 **`im.message.receive_v1`**（接收消息 v2.0）和 **`application.bot.menu_v6`**（机器人自定义菜单事件，用于响应底部菜单点击）。
    - **回调配置**：订阅方式选择 **「使用长连接接收回调」**，添加回调 **`card.action.trigger`**（用于响应控制面板、目录浏览、队列、权限、Git、重试等卡片按钮点击）。
 5. **机器人自定义菜单（推荐，不用打字直接点）**：
    - 在 **应用能力 → 机器人 → 机器人自定义菜单** 中开启（推荐「悬浮菜单」或底部菜单）。
-   - 每个菜单项推荐把「响应动作」设为 **「推送事件」**，Event Key 可设为：
-     - `menu_panel`（打开控制面板）
-     - `menu_commands`（查看 `agy` 内置命令与本机 Skills 清单，别名 `menu_skills`）
-     - `menu_new`（开启新对话）
-     - `menu_stop`（中止当前任务）
-     - （也支持 `menu_dirs`、`menu_effort`、`menu_git`、`menu_scopes`、`menu_queue`、`menu_mode_temp_full`、`menu_ops`、`menu_reload`、`menu_sessions`、`menu_models`、`menu_mode_full`、`menu_help`）
-   - 若偏好「发送消息」模式，也可以把动作设为发送 `/panel`、`/`、`/new`、`/stop`。
+   - 每个菜单项推荐把「响应动作」设为 **「推送事件」**，Event Key 可设为：`menu_panel`（控制面板）、`menu_commands`（命令与 Skills）、`menu_new`（新对话）、`menu_stop`（中止任务）；也支持 `menu_dirs`、`menu_effort`、`menu_git`、`menu_scopes`、`menu_queue`、`menu_mode_temp_full`、`menu_ops`、`menu_reload`、`menu_sessions`、`menu_models`、`menu_mode_full`、`menu_help`（或直接发送 `/panel`、`/`、`/new`、`/stop`）。
 6. **版本管理与发布**：创建版本并发布（如果只给自己用，可发布为仅自己/指定测试人员可见）。
 7. 在 **凭证与基础信息** 页面复制 **`App ID`** 和 **`App Secret`**。
 
@@ -299,7 +365,9 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs status
 打开手机飞书，搜你的机器人名字，在**私聊**里给它发一句 `你好`（或 `/help`）。  
 机器人会自动绑定你的飞书 `open_id` 为白名单主人并回复欢迎卡片，随后即可直接发任务使用！
 
-### 5. 常用运维命令
+<details>
+<summary><b>🛠️ 展开查看常用 CLI 运维命令（状态、日志、体检、文档与重启）</b></summary>
+
 ```bash
 # 查看状态
 node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs status
@@ -332,6 +400,8 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs restart
 node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs stop
 ```
 
+</details>
+
 ---
 
 ## 四、如何打包分享给朋友？
@@ -344,7 +414,7 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs pack --out ~/Desktop
 
 ### 朋友收到 zip 后的安装步骤（4 步）
 1. 确保朋友电脑上已安装 `Node.js`（22.5+）和 `agy` CLI（并已登录）。
-2. 把 zip 解压到他自己电脑的 `~/.gemini/config/plugins/feishu-remote/`。
+2. 把 zip 解压到他自己电脑的 `~/.gemini/config/plugins/`（最终路径为 `~/.gemini/config/plugins/feishu-remote/plugin.json`，注意不要套娃）。
 3. 安装依赖并写入他自己的飞书应用凭证：
    ```bash
    cd ~/.gemini/config/plugins/feishu-remote && npm install --omit=dev
