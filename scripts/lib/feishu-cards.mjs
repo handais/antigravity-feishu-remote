@@ -451,7 +451,7 @@ export function buildFrequentPanelButtons({
     desktop_list: { label: '💻 电脑对话', value: { cmd: 'desktop_list', filter: 'all', inplace: true } },
     handoff: { label: '💻 交回电脑', value: { cmd: 'handoff', inplace: true } },
     tasks: { label: '✅ 飞书待办', value: { cmd: 'tasks', filter: 'open', inplace: true } },
-    dirs: { label: '📁 浏览目录', value: { cmd: 'dirs', inplace: true } },
+    dirs: { label: '📁 切换目录', value: { cmd: 'dirs', inplace: true } },
     git: { label: '🌿 Git', value: { cmd: 'git', inplace: true } },
     models: { label: '🧠 模型', value: { cmd: 'models', inplace: true } },
     effort_menu: { label: '🎛️ 强度', value: { cmd: 'effort_menu', inplace: true } },
@@ -584,7 +584,7 @@ export function buildControlPanelCard({
 
   const taskRow = [
     { label: '✅ 飞书待办', value: { cmd: 'tasks', filter: 'open', inplace: true } },
-    { label: '📁 浏览目录', value: { cmd: 'dirs', inplace: true } },
+    { label: '📁 切换目录', value: { cmd: 'dirs', inplace: true } },
     { label: '🌿 Git', value: { cmd: 'git', inplace: true } },
   ];
 
@@ -729,7 +729,7 @@ export function buildPanelHelpCard() {
     '',
     '**📂 任务与工作区**',
     '- `✅ 飞书待办`：查看并快速完成你的飞书任务列表',
-    '- `📁 浏览目录`：可视化切换工作目录（支持翻页与显示隐藏目录）',
+    '- `📁 切换目录`：可视化切换工作目录（支持翻页与显示隐藏目录）',
     '- `🌿 Git`：查看当前仓库分支、改动文件与最近提交',
     '- `📂 快捷目录 / 📌 收藏目录`：一键跳回常用目录或收藏/取消收藏当前目录',
     '',
@@ -1240,7 +1240,7 @@ export function buildDirSearchCard({ query, matches = [], currentCwd = '' }) {
   }));
 
   const navRow = [
-    { label: '📁 浏览目录', value: { cmd: 'dirs', inplace: true } },
+    { label: '📁 切换目录', value: { cmd: 'dirs', inplace: true } },
     { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
   ];
 
@@ -1401,7 +1401,7 @@ export function buildGitStatusCard({ cwd, gitInfo }) {
         `- **状态**：当前目录不是 Git 仓库（\`${sanitizeForFeishuMarkdown(gitInfo?.error || 'not a git repository')}\`）`,
       ].join('\n'),
       buttonRows: [[
-        { label: '📁 浏览目录', value: { cmd: 'dirs', inplace: true } },
+        { label: '📁 切换目录', value: { cmd: 'dirs', inplace: true } },
         { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
       ]],
     });
@@ -1431,7 +1431,7 @@ export function buildGitStatusCard({ cwd, gitInfo }) {
     markdown: lines.join('\n'),
     buttonRows: [[
       { label: '🔄 刷新 Git', type: 'primary', value: { cmd: 'git', inplace: true } },
-      { label: '📁 浏览目录', value: { cmd: 'dirs', inplace: true } },
+      { label: '📁 切换目录', value: { cmd: 'dirs', inplace: true } },
       { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
     ]],
     footer: '零延迟本地查询（不消耗模型额度）',

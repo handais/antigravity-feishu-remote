@@ -531,7 +531,7 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
     assert.equal(freqColSet.columns.length, 4, '⭐ 常用操作 must display top 4 buttons');
     const freqLabels = freqColSet.columns.map((col) => col.elements[0].text.content);
     assert.equal(freqLabels[0], '🌿 Git');
-    assert.ok(!freqLabels.includes('📁 浏览目录'), '5th-ranked dirs must not appear when capped at 4');
+    assert.ok(!freqLabels.includes('📁 切换目录'), '5th-ranked dirs must not appear when capped at 4');
     for (const el of elements) {
       if (el.tag === 'column_set') {
         assert.ok(el.columns.length <= 5, `column_set exceeded 5 columns: ${el.columns.length}`);

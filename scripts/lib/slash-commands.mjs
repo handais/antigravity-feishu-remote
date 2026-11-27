@@ -563,7 +563,7 @@ export async function handleSlashCommand(
         template: 'blue',
         markdown: `\`${chatState.cwd}\``,
         buttonRows: [[
-          { label: '📁 浏览目录', value: { cmd: 'dirs' } },
+          { label: '📁 切换目录', value: { cmd: 'dirs' } },
           { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
         ]],
       });
@@ -625,7 +625,7 @@ export async function handleSlashCommand(
       template: 'red',
       markdown: `路径不存在且未在常用目录中找到匹配 \`${arg}\` 的文件夹。`,
       buttonRows: [[
-        { label: '📁 浏览目录', value: { cmd: 'dirs' } },
+        { label: '📁 切换目录', value: { cmd: 'dirs' } },
         { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
       ]],
     });
