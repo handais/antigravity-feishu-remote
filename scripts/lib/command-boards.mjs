@@ -517,7 +517,7 @@ export function buildGoalBoardCard({
 } = {}) {
   const timeoutSec = resolveEffectiveTimeoutSeconds(chatState, config);
   const timeoutReady = timeoutSec === 0;
-  const mode = chatState?.mode || config?.agy?.defaultMode || 'accept-edits';
+  const mode = chatState?.mode || config?.agy?.defaultMode || 'auto';
   const guardEnabled = resolveRiskyApprovalEnabled(config);
   const activePending = getActivePendingCommand(chatState);
   const goalArmed = activePending?.prefix === '/goal';
@@ -771,7 +771,8 @@ export function buildPlanBoardCard({
   telemetry = null,
 } = {}) {
   const convId = chatState?.conversationId || '';
-  const mode = chatState?.mode || config?.agy?.defaultMode || 'accept-edits';
+  const mode = chatState?.mode || config?.agy?.defaultMode || 'auto';
+  const resumeMode = config?.agy?.defaultMode && config.agy.defaultMode !== 'plan' ? config.agy.defaultMode : 'auto';
   const activePending = getActivePendingCommand(chatState);
   const planArmed = activePending?.prefix === '/plan';
   const grillArmed = activePending?.prefix === '/grill-me';
@@ -803,7 +804,7 @@ export function buildPlanBoardCard({
     },
     {
       label: mode === 'plan' ? '🤖 切自动执行' : '📖 切只读规划',
-      value: { cmd: 'board_set_mode', arg: mode === 'plan' ? 'accept-edits' : 'plan', board: 'plan', inplace: true },
+      value: { cmd: 'board_set_mode', arg: mode === 'plan' ? resumeMode : 'plan', board: 'plan', inplace: true },
     },
   ];
   if (planArmed || grillArmed) {

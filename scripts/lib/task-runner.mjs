@@ -1,7 +1,9 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { updateState } from './config.mjs';
 import { buildCard, chunkButtons, replyCard } from './feishu-api.mjs';
-import { runAgyTurn } from './agy-runner.mjs';
+import { isSafeCliConversationId, runAgyTurn } from './agy-runner.mjs';
+import { getGeminiRoot } from './desktop-sessions.mjs';
 import {
   ASYNC_ORCHESTRATION_TOOLS,
   createAgySessionPool,
@@ -28,6 +30,148 @@ import {
 } from './command-boards.mjs';
 
 const FILE_MODIFY_TOOL_RE = /^(?:write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content|create_file|apply_patch|notebook_edit)$/i;
+const PERMISSION_DENIED_RE = /permission check failed|user denied permission|permission denied to run|requires approval|not allowed in (?:accept-edits|plan) mode/i;
+
+export function isExplicitFailureStatus(status) {
+  const normalized = String(status || '').trim().toUpperCase();
+  return Boolean(normalized && normalized !== 'SUCCESS' && normalized !== 'OK');
+}
+
+export function isPermissionDeniedError(text) {
+  return PERMISSION_DENIED_RE.test(String(text || ''));
+}
+
+function extractCommandArgFromToolCall(toolCall) {
+  let args = toolCall?.args;
+  if (typeof args === 'string') {
+    try {
+      args = JSON.parse(args);
+    } catch {
+      args = null;
+    }
+  }
+  const raw = args?.CommandLine || args?.command || '';
+  return String(raw || '').replace(/^"|"$/g, '').trim();
+}
+
+function matchToolCallForError(toolCalls, errorText) {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+    return { toolName: '', commandLine: '' };
+  }
+  const errLower = String(errorText || '').toLowerCase();
+  for (let i = toolCalls.length - 1; i >= 0; i -= 1) {
+    const tc = toolCalls[i];
+    const cmdLine = extractCommandArgFromToolCall(tc);
+    if (cmdLine && errLower.includes(cmdLine.toLowerCase().slice(0, 40))) {
+      return { toolName: String(tc?.name || ''), commandLine: cmdLine };
+    }
+  }
+  const lastNonMeta = [...toolCalls].reverse().find((tc) => tc?.name && tc.name !== 'update_steps') || toolCalls[toolCalls.length - 1];
+  return {
+    toolName: String(lastNonMeta?.name || ''),
+    commandLine: extractCommandArgFromToolCall(lastNonMeta),
+  };
+}
+
+/**
+ * Inspect the trailing turn of a conversation's transcript.jsonl for an unrecovered error.
+ * Stops scanning backwards at the most recent PLANNER_RESPONSE or USER_INPUT boundary so earlier
+ * recovered tool errors (e.g. probing a non-existent file) are never surfaced.
+ */
+export function inspectTranscriptLastTurnError(conversationId) {
+  if (!isSafeCliConversationId(conversationId)) return null;
+  const transcriptPath = path.join(
+    getGeminiRoot(),
+    'antigravity-cli',
+    'brain',
+    conversationId,
+    '.system_generated',
+    'logs',
+    'transcript.jsonl',
+  );
+  let tailText = '';
+  let fd = null;
+  try {
+    if (!fs.existsSync(transcriptPath)) return null;
+    const stat = fs.statSync(transcriptPath);
+    if (!stat.isFile() || stat.size <= 0) return null;
+    const readBytes = Math.min(stat.size, 65_536);
+    const offset = Math.max(0, stat.size - readBytes);
+    const buf = Buffer.alloc(readBytes);
+    fd = fs.openSync(transcriptPath, 'r');
+    fs.readSync(fd, buf, 0, readBytes, offset);
+    tailText = buf.toString('utf8');
+    if (offset > 0) {
+      const firstNl = tailText.indexOf('\n');
+      tailText = firstNl >= 0 ? tailText.slice(firstNl + 1) : '';
+    }
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  const lines = tailText.split(/\r?\n/).filter((l) => l.trim());
+  let trailingError = null;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    let entry;
+    try {
+      entry = JSON.parse(lines[i]);
+    } catch {
+      continue;
+    }
+    const entryType = String(entry?.type || '').toUpperCase();
+    const entryStatus = String(entry?.status || '').toUpperCase();
+    if (entryType === 'USER_INPUT') {
+      break;
+    }
+    if (entryType === 'PLANNER_RESPONSE') {
+      if (trailingError) {
+        const matched = matchToolCallForError(entry.tool_calls, trailingError.error);
+        return {
+          error: trailingError.error,
+          toolName: matched.toolName,
+          commandLine: matched.commandLine,
+          stepIndex: trailingError.stepIndex,
+        };
+      }
+      if (entryStatus === 'ERROR' && entry.error) {
+        return {
+          error: String(entry.error).trim(),
+          toolName: '',
+          commandLine: '',
+          stepIndex: entry.step_index ?? null,
+        };
+      }
+      return null;
+    }
+    if (!trailingError && entryStatus === 'ERROR') {
+      const errMsg = String(entry.error || entry.content || '').trim();
+      if (errMsg) {
+        trailingError = {
+          error: errMsg,
+          stepIndex: entry.step_index ?? null,
+        };
+      }
+    }
+  }
+
+  if (trailingError) {
+    return {
+      error: trailingError.error,
+      toolName: '',
+      commandLine: '',
+      stepIndex: trailingError.stepIndex,
+    };
+  }
+  return null;
+}
 
 export function resolvePromptWithHandoff(text, pendingHandoff) {
   return pendingHandoff?.contextBlock
@@ -39,7 +183,7 @@ export function shouldClearPendingHandoff({ hadConversationId, result } = {}) {
   if (!hadConversationId) {
     return Boolean(result?.conversationId);
   }
-  return !result?.aborted && (result?.status === 'SUCCESS' || result?.exitCode === 0);
+  return !result?.aborted && !isExplicitFailureStatus(result?.status) && result?.exitCode === 0;
 }
 
 export function extractModifiedFilePath(toolName, parameters, cwd = '') {
@@ -80,7 +224,7 @@ export function formatToolStatusMarkdown({
   if (toolEntries.length > 0) {
     lines.push('', '**执行步骤：**');
     for (const entry of toolEntries.slice(-6)) {
-      const icon = entry.done ? '✅' : '🔧';
+      const icon = entry.failed ? '❌' : entry.done ? '✅' : '🔧';
       const safeSummary = entry.summary
         ? String(entry.summary).replace(/\s+/g, ' ').replace(/`/g, "'").trim()
         : '';
@@ -120,7 +264,7 @@ export function sanitizeRetryPayload(payload) {
 }
 
 export function isTransientStartupRace(result) {
-  if (!result || result.aborted || result.status === 'SUCCESS' || result.exitCode === 0) {
+  if (!result || result.aborted || (!isExplicitFailureStatus(result.status) && result.exitCode === 0)) {
     return false;
   }
   if (result.conversationId) return false;
@@ -185,7 +329,7 @@ export function createTaskRunner({
         stateEntry.session.updateStatus(
           formatToolStatusMarkdown({
             cwd: entry?.signature?.cwd || process.cwd(),
-            mode: entry?.signature?.mode || 'accept-edits',
+            mode: entry?.signature?.mode || 'auto',
             effort: entry?.signature?.effort || '',
             attachmentNote: '🔔 来自后台子代理 / 定时器的异步回信',
             toolEntries: stateEntry.toolEntries,
@@ -207,7 +351,7 @@ export function createTaskRunner({
           template: 'wathet',
           initialStatus: formatToolStatusMarkdown({
             cwd: entry?.signature?.cwd || process.cwd(),
-            mode: entry?.signature?.mode || 'accept-edits',
+            mode: entry?.signature?.mode || 'auto',
             effort: entry?.signature?.effort || '',
             attachmentNote: '🔔 来自后台子代理 / 定时器的异步回信',
             toolEntries: [],
@@ -236,12 +380,13 @@ export function createTaskRunner({
             durationSeconds: null,
           });
           refreshAsyncStatus();
-        } else if (evt.kind === 'tool_done') {
+        } else if (evt.kind === 'tool_done' || evt.kind === 'tool_error') {
           const target = [...stateEntry.toolEntries].reverse().find(
             (e) => !e.done && (e.stepIndex === evt.stepIndex || e.toolName === evt.toolName),
           );
           if (target) {
             target.done = true;
+            if (evt.kind === 'tool_error') target.failed = true;
             target.durationSeconds = evt.durationSeconds ?? null;
           }
           refreshAsyncStatus();
@@ -262,11 +407,12 @@ export function createTaskRunner({
       }
 
       if (type === 'result' && result) {
-        const isFailed = result.status !== 'SUCCESS' && result.exitCode !== 0;
+        const isFailed = isExplicitFailureStatus(result.status) || result.exitCode !== 0;
         const convId = result.conversationId || entry?.conversationId || '';
         const stillRunningBackground = !isFailed && Boolean(convId && hasRunningChildSubagents(convId));
+        const errDetail = result.stderr || result.error || result.finishedReason || `exit code ${result.exitCode}`;
         const body = isFailed
-          ? (result.response ? `${result.response}\n\n---\n**错误信息：**\n\`\`\`\n${result.stderr || result.finishedReason || `exit code ${result.exitCode}`}\n\`\`\`` : `\`\`\`\n${result.stderr || result.finishedReason || `exit code ${result.exitCode}`}\n\`\`\``)
+          ? (result.response ? `${result.response}\n\n---\n**错误信息：**\n\`\`\`\n${errDetail}\n\`\`\`` : `\`\`\`\n${errDetail}\n\`\`\``)
           : (result.response || stateEntry.liveText.trim() || '_（后台协作唤醒完成，无附加文本输出）_');
         const elapsedSec = ((Date.now() - stateEntry.startedAt) / 1000).toFixed(1);
         const isParked = sessionPool.has(runKey);
@@ -418,7 +564,7 @@ export function createTaskRunner({
 
     let chatState = {
       cwd: config?.agy?.defaultCwd || process.cwd(),
-      mode: config?.agy?.defaultMode || 'accept-edits',
+      mode: config?.agy?.defaultMode || 'auto',
       effort: config?.agy?.defaultEffort || '',
       model: config?.agy?.defaultModel || '',
       conversationId: '',
@@ -555,7 +701,7 @@ export function createTaskRunner({
             durationSeconds: null,
           });
           refreshStatus();
-        } else if (evt.kind === 'tool_done') {
+        } else if (evt.kind === 'tool_done' || evt.kind === 'tool_error') {
           let target = null;
           for (let i = toolEntries.length - 1; i >= 0; i -= 1) {
             const candidate = toolEntries[i];
@@ -574,13 +720,15 @@ export function createTaskRunner({
           }
           if (target) {
             target.done = true;
+            if (evt.kind === 'tool_error') target.failed = true;
             target.durationSeconds = evt.durationSeconds ?? null;
           } else {
             toolEntries.push({
               stepIndex: evt.stepIndex,
               toolName: evt.toolName,
-              summary: '',
+              summary: evt.summary || '',
               done: true,
+              failed: evt.kind === 'tool_error',
               durationSeconds: evt.durationSeconds ?? null,
             });
           }
@@ -750,20 +898,82 @@ export function createTaskRunner({
       let template = 'green';
       let body = result.response;
       let isFailed = false;
+      let isPermissionBlocked = false;
+      const isHardFailed = isExplicitFailureStatus(result.status) || result.exitCode !== 0;
 
       if (result.aborted) {
         title = '🛑 任务已中止';
         template = 'grey';
         body = result.response || '任务已被用户中止。';
         isFailed = true;
-      } else if (result.status !== 'SUCCESS' && result.exitCode !== 0) {
-        title = '❌ 执行异常';
-        template = 'red';
-        isFailed = true;
-        const errDetail = result.stderr || result.finishedReason || `exit code ${result.exitCode}`;
-        body = result.response ? `${result.response}\n\n---\n**错误信息：**\n\`\`\`\n${errDetail}\n\`\`\`` : `\`\`\`\n${errDetail}\n\`\`\``;
-      } else if (!body) {
-        body = '_（本次执行没有输出文本回复）_';
+      } else if (isHardFailed || !body) {
+        const lastToolErr = Array.isArray(result.toolErrors) && result.toolErrors.length > 0
+          ? result.toolErrors[result.toolErrors.length - 1]
+          : null;
+        const toolErrText = lastToolErr
+          ? [
+              lastToolErr.toolName ? `[${lastToolErr.toolName}]` : '',
+              lastToolErr.summary || '',
+              lastToolErr.error || '',
+            ].filter(Boolean).join(' ')
+          : '';
+        let diagText = String(result.stderr || result.error || result.finishedReason || toolErrText || '').trim();
+        let transcriptErr = null;
+        if (!diagText) {
+          transcriptErr = inspectTranscriptLastTurnError(result.conversationId || freshChat.conversationId);
+          if (transcriptErr?.error) {
+            diagText = transcriptErr.error;
+          }
+        }
+        const trimmedDiag = diagText.length > 500 ? `${diagText.slice(0, 497)}...` : diagText;
+
+        if (diagText && isPermissionDeniedError(diagText)) {
+          isPermissionBlocked = true;
+          isFailed = true;
+          title = '⚠️ 执行在权限检查处中断';
+          template = 'orange';
+          const detailParts = [
+            `当前会话处于 \`${freshChat.mode}\` 模式，飞书无头模式无法弹出终端确认，命令被系统权限检查自动拦截，导致本轮提前中止。`,
+          ];
+          if (transcriptErr?.commandLine) {
+            detailParts.push('', `**被拦截命令：** \`${transcriptErr.commandLine}\``);
+          }
+          detailParts.push('', '**中断详情：**', '```', trimmedDiag, '```');
+          if (modifiedFiles.length > 0) {
+            detailParts.push(
+              '',
+              `✅ 中断前已完成 **${modifiedFiles.length} 个文件** 的修改（改动已保留，无需重写），切到 \`auto\` 或 \`full\` 模式后继续验证即可。`,
+            );
+          }
+          const diagBlock = detailParts.join('\n');
+          body = result.response ? `${result.response}\n\n---\n${diagBlock}` : diagBlock;
+        } else if (isHardFailed) {
+          title = '❌ 执行异常';
+          template = 'red';
+          isFailed = true;
+          const errDetail = trimmedDiag || `exit code ${result.exitCode}`;
+          body = result.response
+            ? `${result.response}\n\n---\n**错误信息：**\n\`\`\`\n${errDetail}\n\`\`\``
+            : `\`\`\`\n${errDetail}\n\`\`\``;
+        } else if (trimmedDiag) {
+          title = '⚠️ 本轮未输出文本回复';
+          template = 'orange';
+          isFailed = true;
+          const warnParts = [
+            '本轮执行未生成最终文本回复，最后一步存在异常退出记录：',
+            '```',
+            trimmedDiag,
+            '```',
+          ];
+          if (modifiedFiles.length > 0) {
+            warnParts.push('', `> 提示：中断前已完成 **${modifiedFiles.length} 个文件** 的修改，可点击「🔍 看改动 Diff」或「🔄 重试」。`);
+          }
+          body = warnParts.join('\n');
+        } else {
+          body = modifiedFiles.length > 0
+            ? `_（本次执行已完成 ${modifiedFiles.length} 个文件改动，模型未附带额外文本总结）_`
+            : '_（本次执行没有输出文本回复）_';
+        }
       } else if (isParkedAlive && usedAsyncTools) {
         const usedSubagentTools = result.toolsUsed.some((t) =>
           ['send_message', 'invoke_subagent', 'swarm', 'run_workflow'].includes(String(t || '').toLowerCase()),
@@ -797,7 +1007,13 @@ export function createTaskRunner({
         ...(turnBoard.kind === 'swarm' ? [{ label: '🐝 Swarm 看板', value: { cmd: 'cmd_board', board: 'swarm' } }] : []),
         ...(turnBoard.kind === 'schedule' ? [{ label: '⏰ 定时看板', value: { cmd: 'cmd_board', board: 'schedule' } }] : []),
         ...(isParkedAlive && !result.aborted ? [{ label: '🔌 释放保活', value: { cmd: 'stop_keepalive' } }] : []),
-        ...(isFailed ? [{ label: '🔄 重试', type: 'primary', value: { cmd: 'retry' } }] : []),
+        ...(isPermissionBlocked && freshChat.mode !== 'auto'
+          ? [{ label: '🤖 切自动模式', type: 'primary', value: { cmd: 'mode', arg: 'auto' } }]
+          : []),
+        ...(isPermissionBlocked && freshChat.mode !== 'full'
+          ? [{ label: '⚡ 30m全权', value: { cmd: 'mode_temp_full', arg: '30' } }]
+          : []),
+        ...(isFailed ? [{ label: '🔄 重试', type: isPermissionBlocked ? 'default' : 'primary', value: { cmd: 'retry' } }] : []),
         ...(!result.aborted && modifiedFiles.length > 0
           ? [
               { label: '🔍 看改动 Diff', value: { cmd: 'turn_diff' } },

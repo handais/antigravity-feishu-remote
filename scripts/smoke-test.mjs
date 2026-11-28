@@ -303,6 +303,7 @@ try {
   assert.ok(buildAgyArgs({ prompt: 'hi', mode: 'auto' }).includes('auto'));
   assert.ok(buildAgyArgs({ prompt: 'hi', mode: 'full' }).includes('--dangerously-skip-permissions'));
   assert.ok(!buildAgyArgs({ prompt: 'hi', mode: 'default' }).includes('--mode'));
+  assert.equal(DEFAULT_CONFIG.agy.defaultMode, 'auto');
   assert.equal(DEFAULT_CONFIG.agy.timeoutSeconds, 3600);
   assert.ok(!buildAgyArgs({ prompt: 'hi', timeoutSeconds: 0 }).includes('--print-timeout'));
 

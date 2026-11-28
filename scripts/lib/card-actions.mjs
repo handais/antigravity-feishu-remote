@@ -633,7 +633,7 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
           ? targetChat.mode
           : targetChat.fullRevertMode && targetChat.fullRevertMode !== 'full'
             ? targetChat.fullRevertMode
-            : 'accept-edits';
+            : 'auto';
       targetChat.mode = 'full';
       targetChat.fullExpiresAt = Date.now() + 30 * 60_000;
       targetChat.persistentSession = false;

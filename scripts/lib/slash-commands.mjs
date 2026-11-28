@@ -391,7 +391,7 @@ export async function handleSlashCommand(
     const isTempFull = chatState.mode === 'full' && Number(chatState.fullExpiresAt || 0) > Date.now();
     const remainMin = isTempFull ? Math.max(1, Math.ceil((chatState.fullExpiresAt - Date.now()) / 60000)) : 0;
     const modeText = isTempFull
-      ? `\`full\`（临时授权，约 ${remainMin}m 后切回 \`${chatState.fullRevertMode || 'accept-edits'}\`）`
+      ? `\`full\`（临时授权，约 ${remainMin}m 后切回 \`${chatState.fullRevertMode || 'auto'}\`）`
       : `\`${chatState.mode}\``;
     const notifyMode = resolveStopNotifyMode(config);
     const awayMin = Math.max(1, Math.round(Number(config?.notifications?.awayIdleSeconds || 120) / 60));
@@ -872,7 +872,7 @@ export async function handleSlashCommand(
       const isTempFull = chatState.mode === 'full' && Number(chatState.fullExpiresAt || 0) > Date.now();
       const remainMin = isTempFull ? Math.max(1, Math.ceil((chatState.fullExpiresAt - Date.now()) / 60000)) : 0;
       const modeDesc = isTempFull
-        ? `\`full\`（⏱️ 临时授权，约 ${remainMin} 分钟后自动切回 \`${chatState.fullRevertMode || 'accept-edits'}\`）`
+        ? `\`full\`（⏱️ 临时授权，约 ${remainMin} 分钟后自动切回 \`${chatState.fullRevertMode || 'auto'}\`）`
         : `\`${chatState.mode}\``;
       await replySimple({
         title: '🛡️ 当前执行模式',
@@ -901,7 +901,7 @@ export async function handleSlashCommand(
             ? c.mode
             : c.fullRevertMode && c.fullRevertMode !== 'full'
               ? c.fullRevertMode
-              : 'accept-edits';
+              : 'auto';
         c.mode = 'full';
         c.fullExpiresAt = Date.now() + minutes * 60_000;
         c.persistentSession = false;

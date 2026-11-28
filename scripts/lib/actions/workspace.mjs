@@ -238,7 +238,7 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
           ? targetChat.mode
           : targetChat.fullRevertMode && targetChat.fullRevertMode !== 'full'
             ? targetChat.fullRevertMode
-            : 'accept-edits';
+            : 'auto';
       targetChat.mode = 'full';
       targetChat.fullExpiresAt = Date.now() + minutes * 60_000;
       targetChat.persistentSession = false;

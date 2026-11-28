@@ -65,7 +65,7 @@ export function getOrCreateChatState(state, chatId, config) {
     const parentState = threadRootId && parentChatId ? state.chats[parentChatId] : null;
     const baseMode = parentState?.mode && parentState.mode !== 'full'
       ? parentState.mode
-      : (config.agy.defaultMode || 'accept-edits');
+      : (config.agy.defaultMode || 'auto');
     state.chats[chatId] = {
       conversationId: '',
       cwd: parentState?.cwd || config.agy.defaultCwd || os.homedir(),
@@ -87,7 +87,7 @@ export function getOrCreateChatState(state, chatId, config) {
       state.chats[chatId].fullExpiresAt = 0;
     }
     if (!state.chats[chatId].fullRevertMode) {
-      state.chats[chatId].fullRevertMode = config.agy.defaultMode || 'accept-edits';
+      state.chats[chatId].fullRevertMode = config.agy.defaultMode || 'auto';
     }
     if (state.chats[chatId].effort === undefined) {
       state.chats[chatId].effort = '';
@@ -178,7 +178,7 @@ export function enforceTempFullExpiry(state, chatState) {
   if (chatState?.mode === 'full' && expiresAt > 0 && Date.now() >= expiresAt) {
     const revertTo = chatState.fullRevertMode && chatState.fullRevertMode !== 'full'
       ? chatState.fullRevertMode
-      : 'accept-edits';
+      : 'auto';
     chatState.mode = revertTo;
     chatState.fullExpiresAt = 0;
     return { expired: true, previousMode: 'full', revertedTo: revertTo };

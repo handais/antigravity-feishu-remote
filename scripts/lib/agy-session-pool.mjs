@@ -223,9 +223,11 @@ export function createAgySessionPool({
             response: stalled.accumulatedText.trim(),
             status: 'ERROR',
             finishedReason: `Async session wakeup timed out after ${Math.round(asyncTurnWatchdogMs / 1000)}s.`,
+            error: '',
             durationSeconds: (Date.now() - stalled.startedAt) / 1000,
             usage: null,
             toolsUsed: [...stalled.toolsUsed],
+            toolErrors: [...(stalled.toolErrors || [])],
             stderr: entry.stderr.trim(),
             exitCode: 1,
             aborted: false,
@@ -273,6 +275,14 @@ export function createAgySessionPool({
           turn.resolvedConvId = evt.conversationId;
         } else if (evt.kind === 'tool_start') {
           turn.toolsUsed.push(evt.toolName);
+        } else if (evt.kind === 'tool_error') {
+          turn.toolErrors.push({
+            stepIndex: evt.stepIndex,
+            toolName: evt.toolName,
+            summary: evt.summary || '',
+            error: evt.error || '',
+            state: evt.state || 'ERROR',
+          });
         } else if (evt.kind === 'text_delta') {
           turn.accumulatedText += evt.textDelta;
         }
@@ -297,9 +307,11 @@ export function createAgySessionPool({
             response: (evt.response || turn.accumulatedText || '').trim(),
             status,
             finishedReason: evt.finishedReason || '',
+            error: evt.error || '',
             durationSeconds: evt.durationSeconds ?? null,
             usage: evt.usage || null,
             toolsUsed: [...turn.toolsUsed],
+            toolErrors: [...turn.toolErrors],
             stderr: entry.stderr.trim(),
             exitCode: isErr ? 1 : 0,
             aborted: Boolean(turn.aborted),
@@ -329,6 +341,7 @@ export function createAgySessionPool({
         entry.asyncTurn = {
           startedAt: Date.now(),
           toolsUsed: [],
+          toolErrors: [],
           accumulatedText: '',
         };
         emitAsync({ type: 'start', runKey: entry.key, entry, evt });
@@ -338,6 +351,14 @@ export function createAgySessionPool({
 
       if (evt.kind === 'tool_start') {
         entry.asyncTurn.toolsUsed.push(evt.toolName);
+      } else if (evt.kind === 'tool_error') {
+        entry.asyncTurn.toolErrors.push({
+          stepIndex: evt.stepIndex,
+          toolName: evt.toolName,
+          summary: evt.summary || '',
+          error: evt.error || '',
+          state: evt.state || 'ERROR',
+        });
       } else if (evt.kind === 'text_delta') {
         entry.asyncTurn.accumulatedText += evt.textDelta;
       }
@@ -363,9 +384,11 @@ export function createAgySessionPool({
           response: (evt.response || finishedAsync.accumulatedText || '').trim(),
           status: evt.status || 'SUCCESS',
           finishedReason: evt.finishedReason || '',
+          error: evt.error || '',
           durationSeconds: (Date.now() - finishedAsync.startedAt) / 1000,
           usage: evt.usage || null,
           toolsUsed: [...finishedAsync.toolsUsed],
+          toolErrors: [...finishedAsync.toolErrors],
           stderr: entry.stderr.trim(),
           exitCode: evt.status && evt.status !== 'SUCCESS' ? 1 : 0,
           aborted: false,
@@ -400,9 +423,11 @@ export function createAgySessionPool({
             response: finishedAsync.accumulatedText.trim(),
             status: 'ERROR',
             finishedReason: err?.message || String(err),
+            error: '',
             durationSeconds: (Date.now() - finishedAsync.startedAt) / 1000,
             usage: null,
             toolsUsed: [...finishedAsync.toolsUsed],
+            toolErrors: [...finishedAsync.toolErrors],
             stderr: entry.stderr.trim() || err?.message || String(err),
             exitCode: 1,
             aborted: false,
@@ -430,9 +455,11 @@ export function createAgySessionPool({
           response: turn.accumulatedText.trim(),
           status: turn.aborted ? 'ABORTED' : exitCode === 0 ? 'SUCCESS' : 'ERROR',
           finishedReason: '',
+          error: '',
           durationSeconds: (Date.now() - turn.startedAt) / 1000,
           usage: null,
           toolsUsed: [...turn.toolsUsed],
+          toolErrors: [...turn.toolErrors],
           stderr: entry.stderr.trim(),
           exitCode: exitCode ?? -1,
           aborted: Boolean(turn.aborted),
@@ -450,9 +477,11 @@ export function createAgySessionPool({
             response: finishedAsync.accumulatedText.trim(),
             status: exitCode === 0 ? 'SUCCESS' : 'ERROR',
             finishedReason: '',
+            error: '',
             durationSeconds: (Date.now() - finishedAsync.startedAt) / 1000,
             usage: null,
             toolsUsed: [...finishedAsync.toolsUsed],
+            toolErrors: [...finishedAsync.toolErrors],
             stderr: entry.stderr.trim(),
             exitCode: exitCode ?? -1,
             aborted: false,
@@ -471,7 +500,7 @@ export function createAgySessionPool({
     prompt,
     cwd,
     conversationId = '',
-    mode = 'accept-edits',
+    mode = 'auto',
     model = '',
     effort = '',
     timeoutSeconds = null,
@@ -483,7 +512,7 @@ export function createAgySessionPool({
   }) => {
     const signature = {
       cwd: cwd || config?.agy?.defaultCwd || process.cwd(),
-      mode: mode || 'accept-edits',
+      mode: mode || 'auto',
       model: model || '',
       effort: effort || '',
     };
@@ -588,6 +617,7 @@ export function createAgySessionPool({
         resolvedConvId: conversationId || entry.conversationId || '',
         accumulatedText: '',
         toolsUsed: [],
+        toolErrors: [],
         aborted: false,
         onEvent,
         settle,

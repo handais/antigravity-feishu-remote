@@ -134,7 +134,7 @@ export const DEFAULT_CONFIG = {
   agy: {
     bin: '',
     defaultCwd: os.homedir(),
-    defaultMode: 'accept-edits',
+    defaultMode: 'auto',
     defaultModel: '',
     defaultEffort: '',
     favoriteDirs: [],

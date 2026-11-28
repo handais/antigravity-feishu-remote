@@ -26,7 +26,7 @@ export function buildAgyArgs({
   prompt = '',
   useStdin = false,
   conversationId = '',
-  mode = 'accept-edits',
+  mode = 'auto',
   model = '',
   effort = '',
   timeoutSeconds = 3600,
@@ -125,6 +125,23 @@ export function parseAgyStreamLine(line) {
         durationSeconds: su.duration_seconds,
       };
     }
+    const upperState = String(state || '').toUpperCase();
+    const rawToolErr = String(su.error || su.error_message || su.tool_info?.error || '').trim();
+    if (
+      stepType === 'tool' &&
+      (['ERROR', 'FAILED', 'DENIED', 'CANCELLED', 'CANCELED'].includes(upperState) || (state !== 'ACTIVE' && Boolean(rawToolErr)))
+    ) {
+      const toolName = su.tool_name || su.tool_info?.name || 'tool';
+      return {
+        kind: 'tool_error',
+        stepIndex: su.step_index,
+        toolName,
+        state: upperState || 'ERROR',
+        summary: summarizeToolParameters(toolName, su.tool_info?.parameters),
+        error: rawToolErr,
+        durationSeconds: su.duration_seconds,
+      };
+    }
     if (stepType === 'agent_response' && typeof su.text_delta === 'string') {
       return {
         kind: 'text_delta',
@@ -148,6 +165,7 @@ export function parseAgyStreamLine(line) {
       conversationId: r.conversation_id || '',
       status: r.status || '',
       response: r.response || '',
+      error: String(r.error || r.error_message || '').trim(),
       durationSeconds: r.duration_seconds,
       finishedReason: r.finished_reason || '',
       usage: r.usage || null,
@@ -299,7 +317,7 @@ export function killChildTree(child, sig = 'SIGTERM', useDetached = process.plat
 export function spawnAgyStreamProcess({
   cwd,
   conversationId = '',
-  mode = 'accept-edits',
+  mode = 'auto',
   model = '',
   effort = '',
   timeoutSeconds = 3600,
@@ -330,7 +348,7 @@ export function spawnAgyStreamProcess({
   return { child, useDetached, agyBin };
 }
 
-export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-edits', model = '', effort = '', config, bridgeMeta = {}, onEvent, signal }) {
+export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'auto', model = '', effort = '', config, bridgeMeta = {}, onEvent, signal }) {
   return new Promise((resolve, reject) => {
     let spawned;
     try {
@@ -365,6 +383,7 @@ export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-ed
     let accumulatedText = '';
     let finalResult = null;
     const toolsUsed = [];
+    const toolErrors = [];
     let aborted = false;
     let killTimer = null;
 
@@ -395,6 +414,14 @@ export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-ed
         resolvedConvId = evt.conversationId;
       } else if (evt.kind === 'tool_start') {
         toolsUsed.push(evt.toolName);
+      } else if (evt.kind === 'tool_error') {
+        toolErrors.push({
+          stepIndex: evt.stepIndex,
+          toolName: evt.toolName,
+          summary: evt.summary || '',
+          error: evt.error || '',
+          state: evt.state || 'ERROR',
+        });
       } else if (evt.kind === 'text_delta') {
         accumulatedText += evt.textDelta;
       } else if (evt.kind === 'result') {
@@ -438,9 +465,11 @@ export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-ed
         response: (finalResult?.response || accumulatedText || '').trim(),
         status: aborted ? 'ABORTED' : finalResult?.status || (exitCode === 0 ? 'SUCCESS' : 'ERROR'),
         finishedReason: finalResult?.finishedReason || '',
+        error: finalResult?.error || '',
         durationSeconds: finalResult?.durationSeconds ?? null,
         usage: finalResult?.usage || null,
         toolsUsed,
+        toolErrors,
         stderr: stderr.trim(),
         exitCode: exitCode ?? -1,
         aborted,

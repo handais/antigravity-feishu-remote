@@ -490,7 +490,7 @@ export function recordPanelActionUsage(state, cmd, arg = '', now = Date.now()) {
  */
 export function buildFrequentPanelButtons({
   panelActionUsage,
-  mode = 'accept-edits',
+  mode = 'auto',
   isTempFull = false,
   remainingMin = 0,
   guardEnabled = true,
@@ -641,14 +641,14 @@ export function buildControlPanelCard({
   panelActionUsage = null,
 }) {
   const cwd = chatState?.cwd || config?.agy?.defaultCwd || os.homedir();
-  const mode = chatState?.mode || config?.agy?.defaultMode || 'accept-edits';
+  const mode = chatState?.mode || config?.agy?.defaultMode || 'auto';
   const model = chatState?.model || config?.agy?.defaultModel || '';
   const effort = chatState?.effort || config?.agy?.defaultEffort || '';
   const convId = chatState?.conversationId || '';
   const rawExpiresAt = Number(chatState?.fullExpiresAt || 0);
   const isTempFull = mode === 'full' && rawExpiresAt > Date.now();
   const remainingMin = isTempFull ? Math.max(1, Math.ceil((rawExpiresAt - Date.now()) / 60000)) : 0;
-  const revertMode = chatState?.fullRevertMode || 'accept-edits';
+  const revertMode = chatState?.fullRevertMode || 'auto';
   const quickDirs = discoverQuickDirs(config, cwd);
   const canonicalCwd = canonicalizeDirPath(cwd);
   const favoriteSet = new Set(
@@ -830,13 +830,13 @@ function resolveTimeoutDisplay(chatState, config) {
 
 export function buildNewSessionCard({ chatState, config, threadRootId = '' } = {}) {
   const cwd = chatState?.cwd || config?.agy?.defaultCwd || os.homedir();
-  const mode = chatState?.mode || config?.agy?.defaultMode || 'accept-edits';
+  const mode = chatState?.mode || config?.agy?.defaultMode || 'auto';
   const model = chatState?.model || config?.agy?.defaultModel || '';
   const effort = chatState?.effort || config?.agy?.defaultEffort || '';
   const rawExpiresAt = Number(chatState?.fullExpiresAt || 0);
   const isTempFull = mode === 'full' && rawExpiresAt > Date.now();
   const remainingMin = isTempFull ? Math.max(1, Math.ceil((rawExpiresAt - Date.now()) / 60000)) : 0;
-  const revertMode = chatState?.fullRevertMode || 'accept-edits';
+  const revertMode = chatState?.fullRevertMode || 'auto';
   const modeDisplay = isTempFull
     ? `\`full\`（⏱️ 临时全权，约 ${remainingMin} 分钟后自动切回 \`${revertMode}\`）`
     : `\`${mode}\``;

@@ -320,10 +320,13 @@ export async function handleCommandBoardAction(actionCtx) {
       if (chatState.mode === 'plan') {
         modeSwitched = true;
       }
+      const resumeMode = config?.agy?.defaultMode && config.agy.defaultMode !== 'plan'
+        ? config.agy.defaultMode
+        : 'auto';
       updateState((latest) => {
         const targetChat = getOrCreateChatState(latest, runKey, config);
         if (targetChat.mode === 'plan') {
-          targetChat.mode = 'accept-edits';
+          targetChat.mode = resumeMode;
           targetChat.fullExpiresAt = 0;
           modeSwitched = true;
         }
@@ -344,7 +347,7 @@ export async function handleCommandBoardAction(actionCtx) {
         console.error('[feishu-remote] plan_decision approve error:', err);
       });
       const note = modeSwitched
-        ? '✅ 已切回 accept-edits 并开始按计划执行'
+        ? `✅ 已切回 ${resumeMode} 并开始按计划执行`
         : wasRunning
           ? '📥 已加入队列，将按计划执行'
           : '🚀 已下发：按计划开始执行';
