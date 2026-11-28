@@ -12,8 +12,9 @@ import {
   loadConfig,
   loadState,
   maskSecret,
-  saveConfig,
+  resolveOwnerOpenId,
   stripProcessProxyEnv,
+  updateConfig,
   VALID_NOTIFY_MODES,
 } from './lib/config.mjs';
 import {
@@ -102,157 +103,173 @@ function parseBool(val, fallback) {
 }
 
 function cmdSetup(flags) {
-  const config = loadConfig();
-
-  if (typeof flags['app-id'] === 'string') config.feishu.appId = flags['app-id'].trim();
-  if (typeof flags['app-secret'] === 'string') config.feishu.appSecret = flags['app-secret'].trim();
-  if (typeof flags.domain === 'string') {
-    const d = flags.domain.trim().toLowerCase();
-    if (d !== 'feishu' && d !== 'lark') {
-      throw new Error('--domain must be feishu or lark');
+  let stdinSecret = '';
+  if (flags['app-secret-stdin']) {
+    if (process.stdin.isTTY) {
+      throw new Error(
+        '--app-secret-stdin requires piped stdin (e.g. printf "%s" "$APP_SECRET" | node scripts/cli.mjs setup --app-secret-stdin)',
+      );
     }
-    config.feishu.domain = d;
-  }
-  if (typeof flags['feishu-proxy'] === 'string') {
-    config.feishu.proxy = flags['feishu-proxy'].trim();
+    stdinSecret = fs.readFileSync(0, 'utf8').trim();
   }
 
-  if (typeof flags.cwd === 'string') {
-    const resolvedCwd = flags.cwd === '~'
-      ? os.homedir()
-      : flags.cwd.startsWith('~/')
-        ? path.join(os.homedir(), flags.cwd.slice(2))
-        : path.resolve(flags.cwd);
-    if (!fs.existsSync(resolvedCwd) || !fs.statSync(resolvedCwd).isDirectory()) {
-      throw new Error(`--cwd is not an existing directory: ${resolvedCwd}`);
+  const saved = updateConfig((config) => {
+    if (typeof flags['app-id'] === 'string') config.feishu.appId = flags['app-id'].trim();
+    if (flags['app-secret-stdin']) {
+      if (stdinSecret) {
+        config.feishu.appSecret = stdinSecret;
+      }
+    } else if (typeof flags['app-secret'] === 'string') {
+      config.feishu.appSecret = flags['app-secret'].trim();
+    } else if (!config.feishu.appSecret && process.env.FEISHU_APP_SECRET) {
+      config.feishu.appSecret = String(process.env.FEISHU_APP_SECRET).trim();
     }
-    config.agy.defaultCwd = resolvedCwd;
-  }
+    if (typeof flags.domain === 'string') {
+      const d = flags.domain.trim().toLowerCase();
+      if (d !== 'feishu' && d !== 'lark') {
+        throw new Error('--domain must be feishu or lark');
+      }
+      config.feishu.domain = d;
+    }
+    if (typeof flags['feishu-proxy'] === 'string') {
+      config.feishu.proxy = flags['feishu-proxy'].trim();
+    }
 
-  if (typeof flags.mode === 'string') {
-    if (!VALID_MODES.includes(flags.mode)) {
-      throw new Error(`--mode must be one of: ${VALID_MODES.join(', ')}`);
+    if (typeof flags.cwd === 'string') {
+      const resolvedCwd = flags.cwd === '~'
+        ? os.homedir()
+        : flags.cwd.startsWith('~/')
+          ? path.join(os.homedir(), flags.cwd.slice(2))
+          : path.resolve(flags.cwd);
+      if (!fs.existsSync(resolvedCwd) || !fs.statSync(resolvedCwd).isDirectory()) {
+        throw new Error(`--cwd is not an existing directory: ${resolvedCwd}`);
+      }
+      config.agy.defaultCwd = resolvedCwd;
     }
-    config.agy.defaultMode = flags.mode;
-  }
 
-  if (typeof flags.model === 'string') {
-    config.agy.defaultModel = flags.model === 'default' ? '' : flags.model.trim();
-  }
+    if (typeof flags.mode === 'string') {
+      if (!VALID_MODES.includes(flags.mode)) {
+        throw new Error(`--mode must be one of: ${VALID_MODES.join(', ')}`);
+      }
+      config.agy.defaultMode = flags.mode;
+    }
 
-  if (typeof flags.effort === 'string') {
-    const e = flags.effort.trim().toLowerCase();
-    if (e === 'default' || e === 'auto' || e === 'reset' || e === '') {
-      config.agy.defaultEffort = '';
-    } else if (!VALID_EFFORTS.includes(e)) {
-      throw new Error(`--effort must be one of: default, ${VALID_EFFORTS.join(', ')}`);
-    } else {
-      config.agy.defaultEffort = e;
+    if (typeof flags.model === 'string') {
+      config.agy.defaultModel = flags.model === 'default' ? '' : flags.model.trim();
     }
-  }
 
-  if (typeof flags['agy-bin'] === 'string') {
-    config.agy.bin = flags['agy-bin'].trim();
-  } else if (!config.agy.bin) {
-    config.agy.bin = detectAgyBin();
-  }
+    if (typeof flags.effort === 'string') {
+      const e = flags.effort.trim().toLowerCase();
+      if (e === 'default' || e === 'auto' || e === 'reset' || e === '') {
+        config.agy.defaultEffort = '';
+      } else if (!VALID_EFFORTS.includes(e)) {
+        throw new Error(`--effort must be one of: default, ${VALID_EFFORTS.join(', ')}`);
+      } else {
+        config.agy.defaultEffort = e;
+      }
+    }
 
-  if (flags['no-proxy']) {
-    config.agy.proxy = '';
-  } else if (typeof flags.proxy === 'string') {
-    config.agy.proxy = flags.proxy.trim();
-  } else if (!config.agy.proxy) {
-    config.agy.proxy = detectLocalProxy();
-  }
+    if (typeof flags['agy-bin'] === 'string') {
+      config.agy.bin = flags['agy-bin'].trim();
+    } else if (!config.agy.bin) {
+      config.agy.bin = detectAgyBin();
+    }
 
-  if (typeof flags.timeout === 'string') {
-    const t = Number(flags.timeout);
-    if (!Number.isFinite(t) || t < 0) {
-      throw new Error('--timeout must be a non-negative number of seconds');
+    if (flags['no-proxy']) {
+      config.agy.proxy = '';
+    } else if (typeof flags.proxy === 'string') {
+      config.agy.proxy = flags.proxy.trim();
+    } else if (!config.agy.proxy) {
+      config.agy.proxy = detectLocalProxy();
     }
-    config.agy.timeoutSeconds = Math.floor(t);
-  }
 
-  if (typeof flags['max-concurrent'] === 'string') {
-    const mc = Number(flags['max-concurrent']);
-    if (!Number.isFinite(mc) || mc < 1 || mc > 10) {
-      throw new Error('--max-concurrent must be between 1 and 10');
+    if (typeof flags.timeout === 'string') {
+      const t = Number(flags.timeout);
+      if (!Number.isFinite(t) || t < 0) {
+        throw new Error('--timeout must be a non-negative number of seconds');
+      }
+      config.agy.timeoutSeconds = Math.floor(t);
     }
-    config.agy.maxConcurrentRuns = Math.floor(mc);
-  }
 
-  if (flags['allow-open-id'] !== undefined) {
-    const rawList = Array.isArray(flags['allow-open-id'])
-      ? flags['allow-open-id']
-      : [flags['allow-open-id']];
-    const cleanIds = [...new Set(rawList.map((s) => String(s).trim()).filter(Boolean))];
-    config.security.allowedOpenIds = cleanIds;
-    if (cleanIds.length > 0 && flags['auto-bind'] === undefined) {
-      config.security.autoBindFirstUser = false;
+    if (typeof flags['max-concurrent'] === 'string') {
+      const mc = Number(flags['max-concurrent']);
+      if (!Number.isFinite(mc) || mc < 1 || mc > 10) {
+        throw new Error('--max-concurrent must be between 1 and 10');
+      }
+      config.agy.maxConcurrentRuns = Math.floor(mc);
     }
-    if (!config.notifications.defaultReceiveId && cleanIds[0]) {
-      config.notifications.defaultReceiveId = cleanIds[0];
-      config.notifications.defaultReceiveIdType = 'open_id';
-    }
-  }
 
-  if (flags['auto-bind'] !== undefined) {
-    config.security.autoBindFirstUser = parseBool(flags['auto-bind'], config.security.autoBindFirstUser);
-  }
+    if (flags['allow-open-id'] !== undefined) {
+      const rawList = Array.isArray(flags['allow-open-id'])
+        ? flags['allow-open-id']
+        : [flags['allow-open-id']];
+      const cleanIds = [...new Set(rawList.map((s) => String(s).trim()).filter(Boolean))];
+      config.security.allowedOpenIds = cleanIds;
+      if (cleanIds.length > 0 && flags['auto-bind'] === undefined) {
+        config.security.autoBindFirstUser = false;
+      }
+      if (!config.notifications.defaultReceiveId && cleanIds[0]) {
+        config.notifications.defaultReceiveId = cleanIds[0];
+        config.notifications.defaultReceiveIdType = 'open_id';
+      }
+    }
 
-  if (typeof flags['group-policy'] === 'string') {
-    if (!['mention', 'off', 'all'].includes(flags['group-policy'])) {
-      throw new Error('--group-policy must be mention, off, or all');
+    if (flags['auto-bind'] !== undefined) {
+      config.security.autoBindFirstUser = parseBool(flags['auto-bind'], config.security.autoBindFirstUser);
     }
-    config.security.groupPolicy = flags['group-policy'];
-  }
 
-  if (typeof flags['receive-id'] === 'string') {
-    config.notifications.defaultReceiveId = flags['receive-id'].trim();
-  }
-  if (typeof flags['receive-id-type'] === 'string') {
-    config.notifications.defaultReceiveIdType = flags['receive-id-type'].trim();
-  }
-  if (flags['stop-hook'] !== undefined) {
-    const enabled = parseBool(flags['stop-hook'], config.notifications.stopHookEnabled);
-    config.notifications.stopHookEnabled = enabled;
-    if (!enabled) {
-      config.notifications.stopNotifyMode = 'off';
-    } else if (config.notifications.stopNotifyMode === 'off') {
-      config.notifications.stopNotifyMode = 'on';
+    if (typeof flags['group-policy'] === 'string') {
+      if (!['mention', 'off', 'all'].includes(flags['group-policy'])) {
+        throw new Error('--group-policy must be mention, off, or all');
+      }
+      config.security.groupPolicy = flags['group-policy'];
     }
-  }
-  if (typeof flags['notify-mode'] === 'string') {
-    const m = flags['notify-mode'].trim().toLowerCase();
-    if (!VALID_NOTIFY_MODES.includes(m)) {
-      throw new Error(`--notify-mode must be one of: ${VALID_NOTIFY_MODES.join(', ')}`);
-    }
-    config.notifications.stopNotifyMode = m;
-    config.notifications.stopHookEnabled = m !== 'off';
-  }
-  if (typeof flags['away-seconds'] === 'string') {
-    const sec = Number(flags['away-seconds']);
-    if (!Number.isFinite(sec) || sec < 10 || sec > 3600) {
-      throw new Error('--away-seconds must be between 10 and 3600');
-    }
-    config.notifications.awayIdleSeconds = Math.floor(sec);
-  }
-  if (typeof flags['risky-approval'] === 'string') {
-    const val = flags['risky-approval'].trim().toLowerCase();
-    if (val !== 'on' && val !== 'off') {
-      throw new Error('--risky-approval must be on or off');
-    }
-    config.security.riskyCommandApproval = val;
-  }
-  if (typeof flags['approval-timeout'] === 'string') {
-    const sec = Number(flags['approval-timeout']);
-    if (!Number.isFinite(sec) || sec < 15 || sec > 160) {
-      throw new Error('--approval-timeout must be between 15 and 160');
-    }
-    config.security.approvalTimeoutSeconds = Math.floor(sec);
-  }
 
-  const saved = saveConfig(config);
+    if (typeof flags['receive-id'] === 'string') {
+      config.notifications.defaultReceiveId = flags['receive-id'].trim();
+    }
+    if (typeof flags['receive-id-type'] === 'string') {
+      config.notifications.defaultReceiveIdType = flags['receive-id-type'].trim();
+    }
+    if (flags['stop-hook'] !== undefined) {
+      const enabled = parseBool(flags['stop-hook'], config.notifications.stopHookEnabled);
+      config.notifications.stopHookEnabled = enabled;
+      if (!enabled) {
+        config.notifications.stopNotifyMode = 'off';
+      } else if (config.notifications.stopNotifyMode === 'off') {
+        config.notifications.stopNotifyMode = 'on';
+      }
+    }
+    if (typeof flags['notify-mode'] === 'string') {
+      const m = flags['notify-mode'].trim().toLowerCase();
+      if (!VALID_NOTIFY_MODES.includes(m)) {
+        throw new Error(`--notify-mode must be one of: ${VALID_NOTIFY_MODES.join(', ')}`);
+      }
+      config.notifications.stopNotifyMode = m;
+      config.notifications.stopHookEnabled = m !== 'off';
+    }
+    if (typeof flags['away-seconds'] === 'string') {
+      const sec = Number(flags['away-seconds']);
+      if (!Number.isFinite(sec) || sec < 10 || sec > 3600) {
+        throw new Error('--away-seconds must be between 10 and 3600');
+      }
+      config.notifications.awayIdleSeconds = Math.floor(sec);
+    }
+    if (typeof flags['risky-approval'] === 'string') {
+      const val = flags['risky-approval'].trim().toLowerCase();
+      if (val !== 'on' && val !== 'off') {
+        throw new Error('--risky-approval must be on or off');
+      }
+      config.security.riskyCommandApproval = val;
+    }
+    if (typeof flags['approval-timeout'] === 'string') {
+      const sec = Number(flags['approval-timeout']);
+      if (!Number.isFinite(sec) || sec < 15 || sec > 160) {
+        throw new Error('--approval-timeout must be between 15 and 160');
+      }
+      config.security.approvalTimeoutSeconds = Math.floor(sec);
+    }
+  });
   console.log(JSON.stringify({
     ok: true,
     configPath: getConfigPath(),
@@ -371,21 +388,30 @@ function cmdPack(flags) {
   const parentDir = path.dirname(pluginRoot);
   const folderName = path.basename(pluginRoot);
 
+  const skipDirNames = new Set(['node_modules', '.git', '.github', 'tests']);
+  const marketingAssetFiles = new Set(['keynote-demo.gif', 'hero-banner.svg', 'architecture-flow.svg']);
+  const sensitiveLocalFiles = new Set(['config.json', 'state.json', 'user-auth.json']);
+  const isExcludedPackFile = (name, relPath) => (
+    name === '.DS_Store' ||
+    name === '.env' ||
+    name.startsWith('.env.') ||
+    sensitiveLocalFiles.has(name) ||
+    /\.tmp\./i.test(name) ||
+    /\.(?:zip|log|pem|key|db|sqlite|sqlite3)$/i.test(name) ||
+    (relPath.startsWith('assets/') && marketingAssetFiles.has(name))
+  );
+
   if (process.platform === 'win32') {
     const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-remote-pack-'));
     const stageDir = path.join(stageRoot, folderName);
-    const skipDirNames = new Set(['node_modules', '.git', '.github', 'tests']);
-    const isExcludedFile = (name) =>
-      name === '.DS_Store' ||
-      name === '.env' ||
-      name.startsWith('.env.') ||
-      /\.(?:zip|log|pem|key)$/i.test(name);
     try {
       fs.cpSync(pluginRoot, stageDir, {
         recursive: true,
         filter: (src) => {
+          if (src === pluginRoot) return true;
           const base = path.basename(src);
-          if (src !== pluginRoot && (skipDirNames.has(base) || isExcludedFile(base))) {
+          const relPosix = path.relative(pluginRoot, src).replace(/\\/g, '/');
+          if (skipDirNames.has(base) || isExcludedPackFile(base, relPosix)) {
             return false;
           }
           return true;
@@ -415,10 +441,20 @@ function cmdPack(flags) {
         `${folderName}/.github/**`,
         `${folderName}/tests/*`,
         `${folderName}/tests/**`,
+        `${folderName}/assets/keynote-demo.gif`,
+        `${folderName}/assets/hero-banner.svg`,
+        `${folderName}/assets/architecture-flow.svg`,
         `${folderName}/*.zip`,
         '**/*.zip',
         '**/.env',
         '**/.env.*',
+        '**/*.tmp.*',
+        '**/config.json',
+        '**/state.json',
+        '**/user-auth.json',
+        '**/*.db',
+        '**/*.sqlite',
+        '**/*.sqlite3',
         '**/*.log',
         '**/*.pem',
         '**/*.key',
@@ -429,9 +465,11 @@ function cmdPack(flags) {
     );
   }
 
+  const sizeBytes = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
   console.log(JSON.stringify({
     ok: true,
     archive: outPath,
+    sizeBytes,
     configDirExcluded: getConfigDir(),
   }, null, 2));
 }
@@ -576,11 +614,10 @@ async function cmdWriteDoc(flags) {
   const config = loadConfig();
   stripProcessProxyEnv(config.feishu.proxy);
   const client = createFeishuClient(config, { quiet: true });
-  const grantOpenId =
-    (typeof flags['grant-open-id'] === 'string' && flags['grant-open-id'].trim()) ||
-    config.notifications.defaultReceiveId ||
-    config.security.allowedOpenIds?.[0] ||
-    '';
+  const grantOpenId = resolveOwnerOpenId(
+    config,
+    typeof flags['grant-open-id'] === 'string' ? flags['grant-open-id'].trim() : '',
+  );
   const doc = await writeFeishuDoc(client, {
     title: typeof flags.title === 'string' ? flags.title.trim() : '',
     markdown,
@@ -712,7 +749,7 @@ async function cmdTaskCreate(positionals, flags) {
     description: typeof flags.desc === 'string' ? flags.desc : '',
     due: typeof flags.due === 'string' ? flags.due : '',
     tasklistGuid: typeof flags.tasklist === 'string' ? flags.tasklist : '',
-    assigneeOpenId: config.notifications.defaultReceiveId || config.security.allowedOpenIds?.[0] || '',
+    assigneeOpenId: resolveOwnerOpenId(config),
   });
   console.log(JSON.stringify({ ok: true, task }, null, 2));
 }
@@ -731,7 +768,7 @@ function printHelp() {
   console.log(`Usage: node scripts/cli.mjs <command> [options]
 
 Commands:
-  setup         Configure Feishu app credentials, proxy, and defaults
+  setup         Configure Feishu app credentials (--app-secret-stdin / FEISHU_APP_SECRET), proxy, and defaults
   auth          Authorize Feishu User OAuth for Task v2 (--status|--logout|--url|--no-browser)
   start         Start and register background daemon (launchd / systemd)
   stop          Stop background daemon

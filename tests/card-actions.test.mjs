@@ -18,13 +18,17 @@ const { classifyCommandRisk, createApprovalRequest, readApprovalDecision } = awa
 const {
   PENDING_COMMAND_TTL_MS,
   buildAgySkillsCard,
+  buildCard,
   computePanelActionScore,
   consumePendingCommand,
   discoverLocalSkills,
   discoverQuickDirs,
+  replyCard,
+  stampCardThreadRoot,
 } = await import('../scripts/lib/feishu-api.mjs');
 const { isSensitiveFilePath } = await import('../scripts/lib/actions/artifacts.mjs');
 const { buildHandoffCard, readMobileSession, writeHandoffSnapshot } = await import('../scripts/lib/mobile-handoff.mjs');
+const { maintainRuntimeStorage } = await import('../scripts/lib/media.mjs');
 const { createBackupSnapshot, getBackupsDir, runPreflightCheckAsync } = await import('../scripts/lib/self-ops.mjs');
 const { handleBotMenuEvent, handleCardAction } = await import('../scripts/lib/card-actions.mjs');
 
@@ -185,7 +189,12 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
     assert.equal(badSendRes.toast.type, 'error');
 
     const sendRes = await handleCardAction(ctx, makeEvent({ cmd: 'turn_send_file', arg: '0' }, 'ou_test_owner', 'oc_art_1'));
-    assert.equal(sendRes.toast.type, 'success');
+    assert.equal(sendRes.toast.type, 'info');
+    assert.ok(sendRes.toast.content.includes('out.md'));
+    const uploadDeadline = Date.now() + 500;
+    while (Date.now() < uploadDeadline && calls.uploadedFiles.length < 1) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
     assert.equal(calls.uploadedFiles.length, 1);
 
     // Approval decision + idempotency + guard toggle
@@ -472,11 +481,11 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
     assert.equal(slowRes.card?.data?.schema, '2.0');
     assert.ok(elapsed < 1500, `Expected bounded callback latency < 1500ms, got ${elapsed}ms`);
 
-    // 4. Async preflight check passes and checks all 30 scripts
+    // 4. Async preflight check passes and checks all scripts dynamically
     const asyncCheck = await runPreflightCheckAsync();
     assert.equal(asyncCheck.ok, true);
     assert.equal(asyncCheck.errors.length, 0);
-    assert.equal(asyncCheck.checkedFiles.length, 30);
+    assert.ok(asyncCheck.checkedFiles.length >= 30, `Expected >= 30 checked files, got ${asyncCheck.checkedFiles.length}`);
   });
 
   it('tracks frequent panel actions, renders ⭐ 常用操作 as 2nd section (max 4), decays old clicks, and supports reset', async () => {
@@ -990,5 +999,245 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
     const r4 = consumePendingCommand(cs4, '过期的消息', { hasAttachments: false, now: now + PENDING_COMMAND_TTL_MS + 1000 });
     assert.deepEqual(r4, { applied: false, expired: true, superseded: false, stateChanged: true, prefix: '' });
     assert.equal(cs4.pendingCommand, null);
+
+    // 8. Non-inplace cmd:'new' and bot menu 'menu_new' send enriched new-session status card
+    const { client: newClient, calls: newCalls } = createMockFeishuClient();
+    const newCtx = createBridgeContext({ client: newClient });
+    const stNew = loadState();
+    stNew.chats.oc_arm_p2p.model = 'gemini-4-neon-high';
+    stNew.chats.oc_arm_p2p.effort = 'high';
+    stNew.chats.oc_arm_p2p.conversationId = 'conv-old-123';
+    saveState(stNew);
+
+    const newCardRes = await handleCardAction(newCtx, makeEvent({ cmd: 'new' }, 'ou_test_owner', 'oc_arm_p2p'));
+    assert.equal(newCardRes.toast.type, 'success');
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(newCalls.sentCards.length, 1);
+    const sentNewCard = newCalls.sentCards[0].card;
+    const sentNewJson = JSON.stringify(sentNewCard);
+    assert.equal(sentNewCard.header.title.content, '🆕 已开启新对话');
+    assert.ok(sentNewJson.includes('工作目录'));
+    assert.ok(sentNewJson.includes('执行模式'));
+    assert.ok(sentNewJson.includes('gemini-4-neon-high'));
+    assert.ok(sentNewJson.includes('high'));
+    assert.ok(sentNewJson.includes('单轮超时'));
+    assert.ok(sentNewJson.includes('📁 切换目录'));
+    assert.ok(sentNewJson.includes('🧠 模型'));
+    assert.ok(sentNewJson.includes('🎛️ 强度'));
+    for (const el of sentNewCard.body.elements) {
+      if (el.tag === 'column_set') {
+        assert.ok(el.columns.length <= 5, `column_set exceeded 5 columns: ${el.columns.length}`);
+      }
+    }
+
+    await handleBotMenuEvent(newCtx, {
+      operator: { operator_id: { open_id: 'ou_test_owner' } },
+      event_key: 'menu_new',
+    });
+    assert.equal(newCalls.sentCards.length, 2);
+    assert.ok(JSON.stringify(newCalls.sentCards[1].card).includes('gemini-4-neon-high'));
+  });
+
+  it('stamps threadRootId into topic card buttons so post-restart clicks route back to thread in 0ms', async () => {
+    const { client, calls } = createMockFeishuClient();
+    let msgGetCalled = false;
+    client.im.v1.message.get = async () => {
+      msgGetCalled = true;
+      throw new Error('Should not call message.get when threadRootId is embedded');
+    };
+
+    const rawCard = buildCard({
+      title: '完成',
+      markdown: 'ok',
+      buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+    });
+    const stamped = stampCardThreadRoot(rawCard, 'om_topic_root_99');
+    assert.equal(rawCard.body.elements[1].columns[0].elements[0].behaviors[0].value.threadRootId, undefined);
+    assert.equal(stamped.body.elements[1].columns[0].elements[0].behaviors[0].value.threadRootId, 'om_topic_root_99');
+
+    await replyCard(client, {
+      messageId: 'om_topic_root_99',
+      card: rawCard,
+      replyInThread: true,
+    });
+    assert.equal(calls.repliedCards[0].card.body.elements[1].columns[0].elements[0].behaviors[0].value.threadRootId, 'om_topic_root_99');
+
+    // Simulate post-restart empty cardThreadMap: clicking button with embedded threadRootId routes to topic thread
+    const ctx = createBridgeContext({ client });
+    const res = await handleCardAction(ctx, {
+      operator: { open_id: 'ou_test_owner' },
+      context: { open_chat_id: 'oc_topic_after_restart', open_message_id: 'om_old_card_1' },
+      action: { value: { cmd: 'panel', threadRootId: 'om_topic_root_99' } },
+    });
+    assert.equal(res.toast.type, 'info');
+    assert.equal(msgGetCalled, false, 'Must short-circuit message.get when threadRootId is stamped');
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(calls.repliedCards.at(-1).parentMessageId, 'om_topic_root_99');
+    assert.equal(calls.repliedCards.at(-1).replyInThread, true);
+
+    // In-place card refresh also retains threadRootId on all returned buttons
+    const inplaceRes = await handleCardAction(ctx, {
+      operator: { open_id: 'ou_test_owner' },
+      context: { open_chat_id: 'oc_topic_after_restart', open_message_id: 'om_old_card_1' },
+      action: { value: { cmd: 'panel', inplace: true, threadRootId: 'om_topic_root_99' } },
+    });
+    const inplaceJson = JSON.stringify(inplaceRes.card?.data);
+    assert.ok(inplaceJson.includes('"threadRootId":"om_topic_root_99"'));
+  });
+
+  it('releases persistent session & clears pendingCommand on takeover, stamps threadRootId on models patch & topic root card, and avoids empty fenced chunks', async () => {
+    const { splitMarkdownChunks } = await import('../scripts/lib/feishu-api.mjs');
+    const chunks = splitMarkdownChunks('```text\n' + 'A'.repeat(250) + '\n```', 120);
+    assert.ok(chunks.every((c) => !/```text\n```/.test(c)), 'Must not emit empty fenced blocks');
+
+    seedFakeGeminiStores(env.geminiDir, {
+      desktopRows: [
+        {
+          id: 'desk-takeover-clean',
+          title: 'Clean Takeover Test',
+          stepCount: 2,
+          modified: '2026-11-28T01:00:00Z',
+          workspaces: JSON.stringify([`file://${env.workDir}`]),
+        },
+      ],
+    });
+    const st = loadState();
+    st.chats.oc_takeover_clean = {
+      cwd: env.workDir,
+      mode: 'accept-edits',
+      conversationId: 'old-conv',
+      persistentSession: true,
+      pendingCommand: { prefix: '/plan', kind: 'builtin', armedAt: Date.now() },
+      recentConversations: [],
+    };
+    saveState(st);
+
+    const releasedKeys = [];
+    const patchedCalls = [];
+    const { client, calls } = createMockFeishuClient();
+    client.im.v1.message.patch = async ({ path: p, data }) => {
+      patchedCalls.push({ messageId: p.message_id, card: JSON.parse(data.content) });
+      return { code: 0 };
+    };
+    const ctx = createBridgeContext({
+      client,
+      runner: {
+        releasePersistentSession: (k) => { releasedKeys.push(k); return true; },
+        getQueueForChat: () => [],
+        totalQueuedCount: () => 0,
+      },
+    });
+
+    await handleCardAction(ctx, makeEvent({ cmd: 'takeover', arg: 'desk-takeover-clean' }, 'ou_test_owner', 'oc_takeover_clean'));
+    assert.deepEqual(releasedKeys, ['oc_takeover_clean']);
+    assert.equal(loadState().chats.oc_takeover_clean.persistentSession, false);
+    assert.equal(loadState().chats.oc_takeover_clean.pendingCommand, null);
+
+    // takeover_new_topic patches rootCard with rootMessageId threadRootId
+    const { saveConfig: persistCfg } = await import('../scripts/lib/config.mjs');
+    const cfg = loadConfig();
+    cfg.notifications.defaultTopicChatId = 'oc_topic_hub_99';
+    persistCfg(cfg);
+    await handleCardAction(ctx, makeEvent({ cmd: 'takeover_new_topic', arg: 'desk-takeover-clean' }, 'ou_test_owner', 'oc_takeover_clean'));
+    await new Promise((r) => setTimeout(r, 25));
+    const rootMsgId = calls.sentCards.at(-1).messageId;
+    assert.ok(patchedCalls.some((p) => p.messageId === rootMsgId && JSON.stringify(p.card).includes(rootMsgId)));
+
+    // models async patch inside topic thread stamps threadRootId
+    const { createFakeAgyBin: mkFakeAgyBin } = await import('./helpers.mjs');
+    const prevBin = cfg.agy.bin;
+    cfg.agy.bin = mkFakeAgyBin(
+      env.root,
+      `if (process.argv.includes('models')) { console.log('gemini-4-neon-high'); process.exit(0); }\n`,
+    );
+    persistCfg(cfg);
+    try {
+      await handleCardAction(ctx, {
+        operator: { open_id: 'ou_test_owner' },
+        context: { open_chat_id: 'oc_topic_hub_99', open_message_id: 'om_panel_in_thread' },
+        action: { value: { cmd: 'models', inplace: true, threadRootId: 'om_thread_models_root' } },
+      });
+      const deadline = Date.now() + 3000;
+      while (
+        Date.now() < deadline &&
+        !patchedCalls.some((p) => p.messageId === 'om_panel_in_thread' && JSON.stringify(p.card).includes('om_thread_models_root'))
+      ) {
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      assert.ok(patchedCalls.some((p) => p.messageId === 'om_panel_in_thread' && JSON.stringify(p.card).includes('om_thread_models_root')));
+    } finally {
+      cfg.agy.bin = prevBin;
+      persistCfg(cfg);
+    }
+  });
+
+  it('sends turn_send_file asynchronously without blocking callback, posts error card on failure, and tightens log perms to 0600', async () => {
+    const sampleFile = path.join(env.workDir, 'async-artifact.txt');
+    fs.writeFileSync(sampleFile, 'hello async upload\n', 'utf8');
+
+    const st = loadState();
+    st.chats.oc_async_send = {
+      conversationId: 'cli-sess-async',
+      cwd: env.workDir,
+      mode: 'accept-edits',
+      lastTurnArtifacts: { conversationId: 'cli-sess-async', cwd: env.workDir, files: [sampleFile], updatedAt: Date.now() },
+      recentConversations: [],
+    };
+    saveState(st);
+
+    // 1. Slow upload returns toast immediately (< 80ms) while upload completes in background
+    const { client: slowClient, calls: slowCalls } = createMockFeishuClient();
+    const origCreate = slowClient.im.v1.file.create;
+    slowClient.im.v1.file.create = async (args) => {
+      await new Promise((r) => setTimeout(r, 120));
+      return origCreate(args);
+    };
+    const slowCtx = createBridgeContext({ client: slowClient });
+    const t0 = Date.now();
+    const res = await handleCardAction(slowCtx, makeEvent({ cmd: 'turn_send_file', arg: '0' }, 'ou_test_owner', 'oc_async_send'));
+    const elapsedMs = Date.now() - t0;
+    assert.equal(res.toast.type, 'info');
+    assert.ok(res.toast.content.includes('async-artifact.txt'));
+    assert.ok(elapsedMs < 80, `Expected non-blocking toast under 80ms, got ${elapsedMs}ms`);
+    assert.equal(slowCalls.uploadedFiles.length, 0);
+
+    const deadline = Date.now() + 800;
+    while (Date.now() < deadline && slowCalls.uploadedFiles.length < 1) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(slowCalls.uploadedFiles.length, 1);
+
+    // 2. Background upload failure sends a red error card fallback to the target chat
+    const { client: failClient, calls: failCalls } = createMockFeishuClient();
+    failClient.im.v1.file.create = async () => {
+      throw new Error('mock upload timeout');
+    };
+    const failCtx = createBridgeContext({ client: failClient });
+    const failRes = await handleCardAction(failCtx, makeEvent({ cmd: 'turn_send_file', arg: '0' }, 'ou_test_owner', 'oc_async_send'));
+    assert.equal(failRes.toast.type, 'info');
+
+    const failDeadline = Date.now() + 800;
+    while (Date.now() < failDeadline && failCalls.sentCards.length < 1) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(failCalls.sentCards.length, 1);
+    const errCardJson = JSON.stringify(failCalls.sentCards[0].card);
+    assert.ok(errCardJson.includes('文件发送失败'));
+    assert.ok(errCardJson.includes('mock upload timeout'));
+
+    // 3. maintainRuntimeStorage tightens 0644 daemon logs to 0600 on POSIX
+    if (process.platform !== 'win32') {
+      const cfgDir = getConfigDir();
+      const outLog = path.join(cfgDir, 'daemon.log');
+      const errLog = path.join(cfgDir, 'daemon.err.log');
+      fs.writeFileSync(outLog, 'stdout\n', { mode: 0o644 });
+      fs.writeFileSync(errLog, 'stderr\n', { mode: 0o644 });
+      fs.chmodSync(outLog, 0o644);
+      fs.chmodSync(errLog, 0o644);
+
+      maintainRuntimeStorage();
+      assert.equal(fs.statSync(outLog).mode & 0o777, 0o600);
+      assert.equal(fs.statSync(errLog).mode & 0o777, 0o600);
+    }
   });
 });

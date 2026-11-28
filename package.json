@@ -12,6 +12,20 @@
     "test": "npm run check && npm run test:smoke && npm run test:suite"
   },
   "description": "Feishu WebSocket remote control bridge, MCP server, and completion hook for Antigravity",
+  "files": [
+    "plugin.json",
+    "mcp_config.json",
+    "hooks.json",
+    "LICENSE",
+    "README.md",
+    "README_EN.md",
+    "CHANGELOG.md",
+    "assets/logo.svg",
+    "rules/",
+    "skills/",
+    "scripts/",
+    "!scripts/smoke-test.mjs"
+  ],
   "engines": {
     "node": ">=22.5.0"
   },

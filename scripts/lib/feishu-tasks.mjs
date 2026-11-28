@@ -1,7 +1,23 @@
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
-import { loadUserAuth, saveUserAuth, stripProcessProxyEnv } from './config.mjs';
+import path from 'node:path';
+import { getPluginRoot, loadUserAuth, saveUserAuth, stripProcessProxyEnv } from './config.mjs';
+
+function syncFeishuProxyEnv(feishuProxy = '') {
+  const desired = String(feishuProxy || '').trim();
+  const curHttp = String(process.env.http_proxy || process.env.HTTP_PROXY || '').trim();
+  const curHttps = String(process.env.https_proxy || process.env.HTTPS_PROXY || '').trim();
+  const hasAll = Boolean(process.env.all_proxy || process.env.ALL_PROXY);
+  if (!hasAll && curHttp === desired && curHttps === desired) {
+    return;
+  }
+  stripProcessProxyEnv(desired);
+}
+
+function getCliCommandHint() {
+  return `node ${path.join(getPluginRoot(), 'scripts', 'cli.mjs')} auth`;
+}
 
 export const DEFAULT_OAUTH_PORT = 18923;
 export const DEFAULT_OAUTH_REDIRECT_URI = `http://127.0.0.1:${DEFAULT_OAUTH_PORT}/callback`;
@@ -130,7 +146,7 @@ export async function exchangeOAuthCode(config, { code, redirectUri = DEFAULT_OA
 
   const domain = String(config?.feishu?.domain || 'feishu').trim().toLowerCase() === 'lark' ? 'lark' : 'feishu';
   const { apiBase } = getOAuthEndpoints(domain);
-  stripProcessProxyEnv(config?.feishu?.proxy);
+  syncFeishuProxyEnv(config?.feishu?.proxy);
 
   const resp = await fetch(`${apiBase}/open-apis/authen/v2/oauth/token`, {
     method: 'POST',
@@ -177,7 +193,7 @@ export async function refreshUserAccessToken(config, existingAuth = loadUserAuth
     }
     if (!auth?.refreshToken) {
       throw makeAuthRequiredError(
-        '缺少 refresh_token，请重新运行 `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs auth` 完成飞书用户授权。',
+        `缺少 refresh_token，请重新运行 \`${getCliCommandHint()}\` 完成飞书用户授权。`,
       );
     }
     const appId = String(config?.feishu?.appId || '').trim();
@@ -189,7 +205,7 @@ export async function refreshUserAccessToken(config, existingAuth = loadUserAuth
       ? 'lark'
       : 'feishu';
     const { apiBase } = getOAuthEndpoints(domain);
-    stripProcessProxyEnv(config?.feishu?.proxy);
+    syncFeishuProxyEnv(config?.feishu?.proxy);
 
     try {
       const resp = await fetch(`${apiBase}/open-apis/authen/v2/oauth/token`, {
@@ -234,7 +250,7 @@ export async function getValidUserAccessToken(config, { forceRefresh = false } =
   const auth = loadUserAuth();
   if (!auth || !auth.accessToken) {
     throw makeAuthRequiredError(
-      '尚未完成飞书用户授权（Task v2 个人/话题待办需要 user_access_token）。请先在飞书开放平台添加重定向 URL `http://127.0.0.1:18923/callback` 并开通 `offline_access`、`task:task:read`、`task:task:write`、`task:tasklist:read`，再执行 `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs auth`。',
+      `尚未完成飞书用户授权（Task v2 个人/话题待办需要 user_access_token）。请先在飞书开放平台添加重定向 URL \`http://127.0.0.1:18923/callback\` 并开通 \`offline_access\`、\`task:task:read\`、\`task:task:write\`、\`task:tasklist:read\`，再执行 \`${getCliCommandHint()}\`。`,
     );
   }
   const now = Date.now();
@@ -246,16 +262,26 @@ export async function getValidUserAccessToken(config, { forceRefresh = false } =
     return refreshed.accessToken;
   }
   throw makeAuthRequiredError(
-    '飞书用户授权已过期，请重新执行 `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs auth` 授权。',
+    `飞书用户授权已过期，请重新执行 \`${getCliCommandHint()}\` 授权。`,
   );
 }
 
 function tryOpenBrowser(url) {
   try {
+    if (!/^https?:\/\//i.test(String(url || ''))) return;
     if (process.platform === 'darwin') {
       spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
     } else if (process.platform === 'win32') {
-      spawn('cmd', ['/c', 'start', '', url], { detached: true, windowsHide: true, stdio: 'ignore' }).unref();
+      spawn(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', 'Start-Process -FilePath $env:FEISHU_OAUTH_URL'],
+        {
+          detached: true,
+          windowsHide: true,
+          stdio: 'ignore',
+          env: { ...process.env, FEISHU_OAUTH_URL: url },
+        },
+      ).unref();
     } else {
       spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
     }
@@ -335,12 +361,7 @@ export async function runInteractiveOAuthFlow(
         }
         if (state !== expectedState) {
           res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-          res.end('<!doctype html><html><body style="font-family:sans-serif;padding:24px;"><h2>State 校验失败</h2><p>请关闭页面重试。</p></body></html>');
-          if (!settled) {
-            settled = true;
-            cleanup(server);
-            reject(new Error('OAuth state mismatch.'));
-          }
+          res.end('<!doctype html><html><body style="font-family:sans-serif;padding:24px;"><h2>State 校验失败</h2><p>请使用最新打开的授权页面继续。</p></body></html>');
           return;
         }
 
@@ -392,7 +413,7 @@ export async function runInteractiveOAuthFlow(
 async function callUserApi(config, method, apiPath, { query = null, body = undefined } = {}) {
   const domain = String(config?.feishu?.domain || 'feishu').trim().toLowerCase() === 'lark' ? 'lark' : 'feishu';
   const { apiBase } = getOAuthEndpoints(domain);
-  stripProcessProxyEnv(config?.feishu?.proxy);
+  syncFeishuProxyEnv(config?.feishu?.proxy);
 
   const url = new URL(`${apiBase}${apiPath}`);
   if (query && typeof query === 'object') {

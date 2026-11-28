@@ -2,9 +2,9 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import {
   loadConfig,
   loadState,
-  saveConfig,
-  saveState,
   stripProcessProxyEnv,
+  updateConfig,
+  updateState,
 } from './lib/config.mjs';
 import {
   buildCard,
@@ -70,6 +70,7 @@ const cardThreadMap = new Map(); // cardMessageId -> { sessionKey, threadRootId,
 const chatModeCache = new Map(); // chatId -> 'topic' | 'group' | ...
 let cachedBotOpenId = '';
 let botInfoFetchedAt = 0;
+let autoBindInProgress = false;
 
 async function getBotOpenId() {
   if (cachedBotOpenId) return cachedBotOpenId;
@@ -154,6 +155,11 @@ function stopWsForRestart() {
       // Ignore
     }
   }
+  try {
+    runner.sessionPool?.disposeAll?.({ immediate: true });
+  } catch {
+    // Ignore
+  }
   chatQueues.clear();
   try {
     wsClient.close({ force: true });
@@ -213,27 +219,52 @@ async function handleIncomingMessage(rawEvent) {
       const mentions = Array.isArray(message.mentions) ? message.mentions : [];
       if (mentions.length === 0) return;
       const botId = await getBotOpenId();
-      if (botId) {
-        const mentionedBot = mentions.some((m) => (m?.id?.open_id || m?.open_id || '') === botId);
-        if (!mentionedBot) return;
+      if (!botId) {
+        console.warn('[feishu-remote] Skipping group mention check: unable to resolve bot open_id (fail-closed)');
+        return;
       }
+      const mentionedBot = mentions.some((m) => (m?.id?.open_id || m?.open_id || '') === botId);
+      if (!mentionedBot) return;
     }
   }
 
   const { supported, text: rawText, msgType, attachments } = extractInboundMessage(message);
   const text = stripMentions(rawText, message.mentions);
 
-  const allowed = config.security.allowedOpenIds || [];
+  let allowed = config.security.allowedOpenIds || [];
   let justBound = false;
 
   if (allowed.length === 0 && config.security.autoBindFirstUser && chatType === 'p2p') {
-    config.security.allowedOpenIds = [openId];
-    config.security.autoBindFirstUser = false;
-    if (!config.notifications.defaultReceiveId) {
-      config.notifications.defaultReceiveId = openId;
-      config.notifications.defaultReceiveIdType = 'open_id';
+    if (autoBindInProgress) return;
+    autoBindInProgress = true;
+    let boundNow = false;
+    try {
+      const updatedCfg = updateConfig((latestCfg) => {
+        const latestAllowed = latestCfg.security?.allowedOpenIds || [];
+        if (latestAllowed.length === 0 && latestCfg.security?.autoBindFirstUser) {
+          latestCfg.security.allowedOpenIds = [openId];
+          latestCfg.security.autoBindFirstUser = false;
+          if (!latestCfg.notifications.defaultReceiveId) {
+            latestCfg.notifications.defaultReceiveId = openId;
+            latestCfg.notifications.defaultReceiveIdType = 'open_id';
+          }
+          boundNow = true;
+        }
+      });
+      allowed = updatedCfg.security?.allowedOpenIds || [];
+      config.security = updatedCfg.security;
+      config.notifications = updatedCfg.notifications;
+    } finally {
+      autoBindInProgress = false;
     }
-    saveConfig(config);
+    if (!boundNow) {
+      await replySimpleCard(client, messageId, {
+        title: '🔒 未授权访问',
+        template: 'grey',
+        markdown: `当前机器人已由其他用户绑定或已关闭自动绑定。\n你的 \`open_id\` 为：\`${openId}\``,
+      });
+      return;
+    }
     justBound = true;
     console.error(`[feishu-remote] Auto-bound first p2p user open_id=${maskIdentifier(openId)}`);
 
@@ -250,11 +281,11 @@ async function handleIncomingMessage(rawEvent) {
 
     const greetingWords = new Set(['你好', 'hi', 'hello', 'hey', '/bind', '/start', '开始']);
     if (attachments.length === 0 && (!supported || !text || greetingWords.has(text.toLowerCase()))) {
-      const stateAfterBind = loadState();
-      if (stateAfterBind.lastP2pChatByOpenId[openId] !== chatId) {
-        stateAfterBind.lastP2pChatByOpenId[openId] = chatId;
-        saveState(stateAfterBind);
-      }
+      updateState((s) => {
+        if (s.lastP2pChatByOpenId[openId] !== chatId) {
+          s.lastP2pChatByOpenId[openId] = chatId;
+        }
+      });
       return;
     }
   } else if (!openId || allowed.length === 0 || !allowed.includes(openId)) {
@@ -278,20 +309,18 @@ async function handleIncomingMessage(rawEvent) {
       }
       chatModeCache.set(chatId, 'p2p');
     }
-    const p2pState = loadState();
-    if (p2pState.lastP2pChatByOpenId[openId] !== chatId) {
-      p2pState.lastP2pChatByOpenId[openId] = chatId;
-      saveState(p2pState);
+    if (loadState().lastP2pChatByOpenId?.[openId] !== chatId) {
+      updateState((s) => {
+        s.lastP2pChatByOpenId[openId] = chatId;
+      });
     }
   }
 
   const { isTopicThread, threadRootId, sessionKey } = await resolveTopicContext(message, chatId, chatType);
-  if (isTopicThread && chatId) {
-    const topicState = loadState();
-    if (topicState.lastTopicChatId !== chatId) {
-      topicState.lastTopicChatId = chatId;
-      saveState(topicState);
-    }
+  if (isTopicThread && chatId && loadState().lastTopicChatId !== chatId) {
+    updateState((s) => {
+      s.lastTopicChatId = chatId;
+    });
   }
   const runKey = sessionKey || chatId || openId;
   const replyTargetId = isTopicThread ? (threadRootId || messageId) : messageId;
@@ -391,14 +420,13 @@ async function handleIncomingMessage(rawEvent) {
     }
   }
 
-  const pendingState = loadState();
-  const pendingChatState = getOrCreateChatState(pendingState, runKey, config);
-  const pendingResult = consumePendingCommand(pendingChatState, text, {
-    hasAttachments: attachments.length > 0 || downloaded.length > 0,
+  let pendingResult = { applied: false, prefix: '' };
+  updateState((pendingState) => {
+    const pendingChatState = getOrCreateChatState(pendingState, runKey, config);
+    pendingResult = consumePendingCommand(pendingChatState, text, {
+      hasAttachments: attachments.length > 0 || downloaded.length > 0,
+    });
   });
-  if (pendingResult.stateChanged) {
-    saveState(pendingState);
-  }
   const appliedPrefix = pendingResult.applied ? pendingResult.prefix : '';
 
   const hasContext = Boolean(
@@ -514,18 +542,27 @@ process.on('unhandledRejection', (reason) => {
 
 setInterval(() => {
   try {
-    const currentState = loadState();
     const currentConfig = loadConfig();
-    let dirty = false;
-    for (const [key, chatInfo] of Object.entries(currentState.chats || {})) {
-      if (activeRuns.has(key)) continue;
-      const exp = enforceTempFullExpiry(currentState, chatInfo);
-      if (!exp.expired) continue;
-      dirty = true;
-      const { chatId: parsedChatId, threadRootId } = parseSessionKey(key);
+    const notifications = [];
+    updateState((currentState) => {
+      for (const [key, chatInfo] of Object.entries(currentState.chats || {})) {
+        if (activeRuns.has(key)) continue;
+        const exp = enforceTempFullExpiry(currentState, chatInfo);
+        if (!exp.expired) continue;
+        chatInfo.persistentSession = false;
+        notifications.push({
+          key,
+          revertedTo: chatInfo.mode,
+          lastP2pChatByOpenId: currentState.lastP2pChatByOpenId || {},
+        });
+      }
+    });
+    for (const item of notifications) {
+      runner.releasePersistentSession?.(item.key);
+      const { chatId: parsedChatId, threadRootId } = parseSessionKey(item.key);
       const targetChatId = parsedChatId.startsWith('oc_')
         ? parsedChatId
-        : (currentState.lastP2pChatByOpenId?.[parsedChatId] || '');
+        : (item.lastP2pChatByOpenId?.[parsedChatId] || '');
       const targetOpenId = parsedChatId.startsWith('ou_')
         ? parsedChatId
         : (currentConfig.notifications.defaultReceiveId || currentConfig.security.allowedOpenIds?.[0] || '');
@@ -537,19 +574,16 @@ setInterval(() => {
         card: buildCard({
           title: '🛡️ 临时全权限已到期',
           template: 'grey',
-          markdown: `临时全权限已到期，系统已自动切回 \`${chatInfo.mode}\` 安全模式。`,
+          markdown: `临时全权限已到期，系统已自动切回 \`${item.revertedTo}\` 安全模式。`,
           buttonRows: [[{ label: '⚙️ 打开控制面板', value: { cmd: 'panel' } }]],
         }),
       })
         .then((sentId) => {
           if (threadRootId && sentId) {
-            recordCardThread(sentId, { sessionKey: key, threadRootId, chatId: targetChatId });
+            recordCardThread(sentId, { sessionKey: item.key, threadRootId, chatId: targetChatId });
           }
         })
         .catch(() => {});
-    }
-    if (dirty) {
-      saveState(currentState);
     }
   } catch (err) {
     console.error('[feishu-remote] Temp-full watcher error:', err?.message || err);

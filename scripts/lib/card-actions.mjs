@@ -3,8 +3,8 @@ import {
   loadConfig,
   loadState,
   resolveRiskyApprovalEnabled,
-  saveConfig,
-  saveState,
+  updateConfig,
+  updateState,
 } from './config.mjs';
 import {
   buildAgySkillsCard,
@@ -14,12 +14,15 @@ import {
   buildDirsCard,
   buildEffortCard,
   buildGitStatusCard,
+  buildNewSessionCard,
   buildNotifyCard,
   buildQueueListCard,
   buildScopesCard,
   buildTasksCard,
   getActivePendingCommand,
+  patchCard,
   recordPanelActionUsage,
+  stampCardThreadRoot,
 } from './feishu-api.mjs';
 import { listDesktopSessions } from './desktop-sessions.mjs';
 import { queryAppScopes } from './feishu-docs.mjs';
@@ -53,12 +56,21 @@ import { handleArtifactAction } from './actions/artifacts.mjs';
 import { handleOpsAction } from './actions/ops.mjs';
 import { handleTaskAndQueueAction } from './actions/tasks.mjs';
 import { handleWorkspaceAndSessionAction } from './actions/workspace.mjs';
+import { handleCommandBoardAction } from './actions/command-boards.mjs';
+import {
+  buildGoalBoardCard,
+  buildPlanBoardCard,
+  buildScheduleBoardCard,
+  buildSwarmBoardCard,
+  inspectCommandBoardTelemetry,
+} from './command-boards.mjs';
 
 const ACTION_HANDLERS = [
   handleDesktopAction,
   handleArtifactAction,
   handleOpsAction,
   handleTaskAndQueueAction,
+  handleCommandBoardAction,
   handleWorkspaceAndSessionAction,
 ];
 
@@ -84,6 +96,78 @@ function cacheNonThreadCard(cardThreadMap, openMessageId, chatId) {
     if (oldest !== undefined) cardThreadMap.delete(oldest);
   }
   cardThreadMap.set(openMessageId, { sessionKey: '', threadRootId: '', chatId });
+}
+
+export async function runWithinCallbackBudget({
+  client,
+  openMessageId = '',
+  inplace = false,
+  threadRootId = '',
+  sendToTarget,
+  pendingToast = '⏳ 正在处理...',
+  workFn,
+  budgetMs = 1800,
+}) {
+  let timedOut = false;
+  const workPromise = Promise.resolve().then(() => workFn());
+  const budgetSymbol = Symbol('budget');
+  let timer = null;
+
+  const outcome = await Promise.race([
+    workPromise.then((res) => ({ kind: 'result', res })),
+    new Promise((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        resolve({ kind: budgetSymbol });
+      }, Math.max(50, Number(budgetMs) || 1800));
+      timer.unref?.();
+    }),
+  ]);
+  if (timer !== null) {
+    clearTimeout(timer);
+    timer = null;
+  }
+
+  if (outcome.kind !== budgetSymbol) {
+    return outcome.res;
+  }
+
+  void workPromise
+    .then(async (res) => {
+      if (!timedOut) return;
+      if (res?.card?.data) {
+        const stampedCard = threadRootId ? stampCardThreadRoot(res.card.data, threadRootId) : res.card.data;
+        if (inplace && openMessageId) {
+          try {
+            await patchCard(client, { messageId: openMessageId, card: stampedCard });
+            return;
+          } catch {
+            // Fall back to sending a new card
+          }
+        }
+        await sendToTarget(stampedCard);
+      } else if (res?.toast?.type === 'error' && res?.toast?.text) {
+        await sendToTarget(buildCard({
+          title: '❌ 操作处理失败',
+          template: 'red',
+          markdown: String(res.toast.text),
+        }));
+      }
+    })
+    .catch(async (err) => {
+      console.error('[feishu-remote] Deferred card action failed:', err?.message || err);
+      try {
+        await sendToTarget(buildCard({
+          title: '❌ 操作处理失败',
+          template: 'red',
+          markdown: String(err?.message || err),
+        }));
+      } catch {
+        // Ignore error card delivery failures
+      }
+    });
+
+  return toastCardResponse('info', pendingToast);
 }
 
 export async function handleCardAction(ctx, rawEvent) {
@@ -127,14 +211,22 @@ export async function handleCardAction(ctx, rawEvent) {
   );
   const hasCachedThreadMeta = Boolean(openMessageId && cardThreadMap && cardThreadMap.has(openMessageId));
   let threadMeta = hasCachedThreadMeta ? cardThreadMap.get(openMessageId) : null;
-  if (!hasCachedThreadMeta && !isKnownP2pChat && openMessageId && chatId && chatId.startsWith('oc_')) {
+  const embeddedThreadRootId = String(value?.threadRootId || '').trim();
+  if (!threadMeta && embeddedThreadRootId && chatId) {
+    threadMeta = {
+      sessionKey: makeSessionKey(chatId, embeddedThreadRootId),
+      threadRootId: embeddedThreadRootId,
+      chatId,
+    };
+    recordCardThread(openMessageId, threadMeta);
+  } else if (!hasCachedThreadMeta && !isKnownP2pChat && openMessageId && chatId && chatId.startsWith('oc_')) {
     try {
       const msgRes = await withTimeout(
         client.im.v1.message.get({ path: { message_id: openMessageId } }),
-        800,
+        1000,
       );
       const msgItem = msgRes?.data?.items?.[0];
-      if (msgItem?.thread_id) {
+      if (msgItem?.thread_id || msgItem?.root_id) {
         const resolvedRootId = msgItem.root_id || msgItem.message_id;
         threadMeta = {
           sessionKey: makeSessionKey(chatId, resolvedRootId),
@@ -157,8 +249,17 @@ export async function handleCardAction(ctx, rawEvent) {
     makeSessionKey(targetChatId, threadRootId) ||
     targetChatId ||
     openId;
-  const chatState = getOrCreateChatState(state, runKey, config);
-  enforceTempFullExpiry(state, chatState);
+  let chatState = getOrCreateChatState(state, runKey, config);
+  const exp = enforceTempFullExpiry(state, chatState);
+  if (exp.expired) {
+    runner?.releasePersistentSession?.(runKey);
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      enforceTempFullExpiry(latest, targetChat);
+      targetChat.persistentSession = false;
+      chatState = { ...targetChat };
+    });
+  }
 
   const cmd = String(value?.cmd || '').toLowerCase();
   const arg = value?.arg !== undefined ? String(value.arg) : '';
@@ -178,6 +279,16 @@ export async function handleCardAction(ctx, rawEvent) {
     }
     return sentId;
   };
+  const runWithinBudget = (pendingToast, workFn, budgetMs = 1800) => runWithinCallbackBudget({
+    client,
+    openMessageId,
+    inplace,
+    threadRootId,
+    sendToTarget,
+    pendingToast,
+    workFn,
+    budgetMs,
+  });
 
   const renderPanel = () => buildControlPanelCard({
     chatState,
@@ -190,8 +301,6 @@ export async function handleCardAction(ctx, rawEvent) {
     maxConcurrentRuns: config.agy.maxConcurrentRuns || 4,
     panelActionUsage: state.panelActionUsage,
   });
-
-  const usageRecorded = recordPanelActionUsage(state, cmd, arg);
 
   const actionCtx = {
     ctx,
@@ -220,14 +329,26 @@ export async function handleCardAction(ctx, rawEvent) {
     isRunning,
     anyBusy,
     sendToTarget,
+    runWithinBudget,
     renderPanel,
   };
 
   for (const handler of ACTION_HANDLERS) {
     const res = await handler(actionCtx);
     if (res !== null && res !== undefined) {
-      if (usageRecorded && res?.toast?.type !== 'error') {
-        saveState(state);
+      if (res?.toast?.type !== 'error') {
+        updateState((latest) => {
+          recordPanelActionUsage(latest, cmd, arg);
+        });
+      }
+      if (threadRootId && res?.card?.data) {
+        return {
+          ...res,
+          card: {
+            ...res.card,
+            data: stampCardThreadRoot(res.card.data, threadRootId),
+          },
+        };
       }
       return res;
     }
@@ -249,13 +370,19 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
     return;
   }
 
-  const state = loadState();
+  let state = loadState();
   const chatId = state.lastP2pChatByOpenId[openId] || '';
   const stateKey = chatId || openId;
-  const chatState = getOrCreateChatState(state, stateKey, config);
+  let chatState = getOrCreateChatState(state, stateKey, config);
   const expiryInfo = enforceTempFullExpiry(state, chatState);
   if (expiryInfo.expired) {
-    saveState(state);
+    runner?.releasePersistentSession?.(stateKey);
+    state = updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, stateKey, config);
+      enforceTempFullExpiry(latest, targetChat);
+      targetChat.persistentSession = false;
+      chatState = targetChat;
+    });
   }
   const isRunning = Boolean(stateKey && activeRuns.has(stateKey));
   const anyBusy = () => activeRuns.size > 0 || runner.totalQueuedCount() > 0;
@@ -303,6 +430,7 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
     writePendingRestartNotice({
       chatId,
       openId,
+      sessionKey: stateKey,
       action: 'restart',
       snapshotId: '',
       previousHash: bootCodeHash,
@@ -317,7 +445,7 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
         '',
         '预计 1~3 秒后自动上线，上线后会推送确认卡片。',
       ].join('\n'),
-      footer: '如长时间未收到上线通知，请在 Mac 终端查看 cli.mjs logs',
+      footer: '如长时间未收到上线通知，请在本机终端查看 cli.mjs logs',
     }));
     scheduleDaemonSelfRestart({ delayMs: 700, onBeforeExit: stopWsForRestart });
     return;
@@ -395,8 +523,10 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
 
   if (key === 'guard' || key === 'approval') {
     const nextEnabled = !resolveRiskyApprovalEnabled(config);
+    updateConfig((c) => {
+      c.security.riskyCommandApproval = nextEnabled ? 'on' : 'off';
+    });
     config.security.riskyCommandApproval = nextEnabled ? 'on' : 'off';
-    saveConfig(config);
     await sendPanel();
     return;
   }
@@ -431,21 +561,19 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
   }
 
   if (key === 'new') {
-    chatState.conversationId = '';
-    chatState.pendingHandoff = null;
-    chatState.pendingCommand = null;
-    chatState.originDesktopSession = null;
-    chatState.lastTurnArtifacts = null;
-    saveState(state);
-    await sendToTarget(buildCard({
-      title: '🆕 已开启新对话',
-      template: 'green',
-      markdown: `下条消息将在 \`${chatState.cwd}\` 下开启全新上下文。`,
-      buttonRows: [[
-        { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
-        { label: '🧩 命令', value: { cmd: 'skills_menu' } },
-      ]],
-    }));
+    runner?.releasePersistentSession?.(stateKey);
+    state = updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, stateKey, config);
+      targetChat.conversationId = '';
+      targetChat.persistentSession = false;
+      targetChat.pendingHandoff = null;
+      targetChat.pendingCommand = null;
+      targetChat.originDesktopSession = null;
+      targetChat.lastTurnArtifacts = null;
+      targetChat.topicClosed = false;
+      chatState = targetChat;
+    });
+    await sendToTarget(buildNewSessionCard({ chatState, config }));
     return;
   }
 
@@ -462,8 +590,11 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
   }
 
   if (key === 'sessions') {
-    chatState.lastSessionsScope = 'all';
-    saveState(state);
+    state = updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, stateKey, config);
+      targetChat.lastSessionsScope = 'all';
+      chatState = targetChat;
+    });
     await sendToTarget(buildSessionsCard(chatState, { state, sessionKey: stateKey, scope: 'all' }));
     return;
   }
@@ -494,15 +625,20 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
   }
 
   if (key === 'mode_temp_full') {
-    chatState.fullRevertMode =
-      chatState.mode && chatState.mode !== 'full'
-        ? chatState.mode
-        : chatState.fullRevertMode && chatState.fullRevertMode !== 'full'
-          ? chatState.fullRevertMode
-          : 'accept-edits';
-    chatState.mode = 'full';
-    chatState.fullExpiresAt = Date.now() + 30 * 60_000;
-    saveState(state);
+    runner?.releasePersistentSession?.(stateKey);
+    state = updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, stateKey, config);
+      targetChat.fullRevertMode =
+        targetChat.mode && targetChat.mode !== 'full'
+          ? targetChat.mode
+          : targetChat.fullRevertMode && targetChat.fullRevertMode !== 'full'
+            ? targetChat.fullRevertMode
+            : 'accept-edits';
+      targetChat.mode = 'full';
+      targetChat.fullExpiresAt = Date.now() + 30 * 60_000;
+      targetChat.persistentSession = false;
+      chatState = targetChat;
+    });
     await sendPanel();
     return;
   }
@@ -514,15 +650,61 @@ export async function handleBotMenuEvent(ctx, rawEvent) {
     mode_plan: 'plan',
   };
   if (modeMap[key]) {
-    chatState.mode = modeMap[key];
-    chatState.fullExpiresAt = 0;
-    saveState(state);
+    runner?.releasePersistentSession?.(stateKey);
+    state = updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, stateKey, config);
+      targetChat.mode = modeMap[key];
+      targetChat.fullExpiresAt = 0;
+      targetChat.persistentSession = false;
+      chatState = targetChat;
+    });
     await sendPanel();
     return;
   }
 
   if (key === 'commands' || key === 'skills' || key === 'agy' || key === 'slash') {
     await sendToTarget(buildAgySkillsCard({ pendingCommand: getActivePendingCommand(chatState) }));
+    return;
+  }
+
+  if (key === 'goal') {
+    await sendToTarget(buildGoalBoardCard({
+      chatState,
+      config,
+      isRunning,
+      telemetry: inspectCommandBoardTelemetry(chatState.conversationId),
+    }));
+    return;
+  }
+
+  if (key === 'swarm' || key === 'teamwork') {
+    await sendToTarget(buildSwarmBoardCard({
+      chatState,
+      config,
+      isRunning,
+      keepAliveActive: Boolean(runner?.hasPersistentSession?.(stateKey)),
+      telemetry: inspectCommandBoardTelemetry(chatState.conversationId),
+    }));
+    return;
+  }
+
+  if (key === 'schedule') {
+    await sendToTarget(buildScheduleBoardCard({
+      chatState,
+      config,
+      isRunning,
+      telemetry: inspectCommandBoardTelemetry(chatState.conversationId),
+    }));
+    return;
+  }
+
+  if (key === 'plan' || key === 'grill_me' || key === 'grill-me') {
+    await sendToTarget(buildPlanBoardCard({
+      chatState,
+      config,
+      isRunning,
+      telemetry: inspectCommandBoardTelemetry(chatState.conversationId),
+    }));
     return;
   }
 

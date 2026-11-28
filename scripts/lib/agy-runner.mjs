@@ -5,6 +5,18 @@ import { detectAgyBin } from './config.mjs';
 
 export const VALID_MODES = ['accept-edits', 'plan', 'auto', 'full', 'default'];
 export const VALID_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const SAFE_MODEL_NAME_RE = /^[a-zA-Z0-9._:/@+-]{1,128}$/;
+const SAFE_CONV_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
+
+export function isValidModelName(model) {
+  const clean = String(model || '').trim();
+  return Boolean(clean && SAFE_MODEL_NAME_RE.test(clean));
+}
+
+export function isSafeCliConversationId(id) {
+  const clean = String(id || '').trim();
+  return Boolean(clean && clean !== '.' && clean !== '..' && SAFE_CONV_ID_RE.test(clean));
+}
 
 export function buildAgyStreamInputLine(prompt) {
   return `${JSON.stringify({ event: 'user', message: { content: String(prompt ?? '') } })}\n`;
@@ -23,6 +35,9 @@ export function buildAgyArgs({
     ? ['--input-format', 'stream-json', '--output-format', 'stream-json']
     : ['-p', prompt, '--output-format', 'stream-json'];
   if (conversationId) {
+    if (!isSafeCliConversationId(conversationId)) {
+      throw new Error(`Invalid conversationId rejected: ${conversationId}`);
+    }
     args.push('--conversation', conversationId);
   }
   if (mode === 'plan' || mode === 'accept-edits' || mode === 'auto') {
@@ -31,6 +46,9 @@ export function buildAgyArgs({
     args.push('--dangerously-skip-permissions');
   }
   if (model && model !== 'default') {
+    if (!isValidModelName(model)) {
+      throw new Error(`Invalid model name rejected: ${model}`);
+    }
     args.push('--model', model);
   }
   if (effort && VALID_EFFORTS.includes(effort)) {
@@ -42,17 +60,25 @@ export function buildAgyArgs({
   return args;
 }
 
+function cleanSummaryText(val, maxLen = 80) {
+  return String(val || '')
+    .replace(/\s+/g, ' ')
+    .replace(/`/g, "'")
+    .trim()
+    .slice(0, maxLen);
+}
+
 function summarizeToolParameters(toolName, params = {}) {
   if (!params || typeof params !== 'object') return '';
-  if (params.CommandLine) return String(params.CommandLine).slice(0, 80);
-  if (params.Path) return String(params.Path).slice(0, 80);
-  if (params.query) return String(params.query).slice(0, 80);
-  if (params.Prompt) return String(params.Prompt).slice(0, 60);
+  if (params.CommandLine) return cleanSummaryText(params.CommandLine, 80);
+  if (params.Path) return cleanSummaryText(params.Path, 80);
+  if (params.query) return cleanSummaryText(params.query, 80);
+  if (params.Prompt) return cleanSummaryText(params.Prompt, 60);
   const firstKey = Object.keys(params)[0];
   if (firstKey && params[firstKey] !== undefined) {
-    return `${firstKey}=${String(params[firstKey]).slice(0, 60)}`;
+    return cleanSummaryText(`${firstKey}=${params[firstKey]}`, 72);
   }
-  return toolName || '';
+  return cleanSummaryText(toolName || '', 40);
 }
 
 export function parseAgyStreamLine(line) {
@@ -195,6 +221,18 @@ export function buildChildEnv(config, agyBin, bridgeMeta = {}) {
   if (!isWin && process.env.TMPDIR) {
     env.TMPDIR = process.env.TMPDIR;
   }
+  for (const safeKey of [
+    'SSH_AUTH_SOCK',
+    'XDG_RUNTIME_DIR',
+    'DBUS_SESSION_BUS_ADDRESS',
+    'XDG_CONFIG_HOME',
+    'LC_ALL',
+    'LC_CTYPE',
+  ]) {
+    if (process.env[safeKey]) {
+      env[safeKey] = process.env[safeKey];
+    }
+  }
 
   if (process.env.ANTIGRAVITY_API_KEY) {
     env.ANTIGRAVITY_API_KEY = process.env.ANTIGRAVITY_API_KEY;
@@ -212,42 +250,105 @@ export function buildChildEnv(config, agyBin, bridgeMeta = {}) {
   return env;
 }
 
-function getWindowsSpawnOpts(binPath) {
+export function getWindowsSpawnOpts(binPath) {
   if (process.platform !== 'win32') {
     return {};
   }
   return {
     windowsHide: true,
-    ...( /\.(cmd|bat)$/i.test(String(binPath || '')) ? { shell: true } : {}),
+    ...(/\.(cmd|bat)$/i.test(String(binPath || '')) ? { shell: true } : {}),
   };
+}
+
+export function killChildTree(child, sig = 'SIGTERM', useDetached = process.platform !== 'win32') {
+  if (!child) return;
+  if (process.platform === 'win32') {
+    if (sig === 'SIGKILL' && child.pid) {
+      try {
+        spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        }).unref();
+        return;
+      } catch {
+        // Fall back to child.kill
+      }
+    }
+    try {
+      child.kill(sig);
+    } catch {
+      // Ignore
+    }
+    return;
+  }
+  if (useDetached && child.pid) {
+    try {
+      process.kill(-child.pid, sig);
+      return;
+    } catch {
+      // Fall back to direct child signal
+    }
+  }
+  try {
+    child.kill(sig);
+  } catch {
+    // Ignore
+  }
+}
+
+export function spawnAgyStreamProcess({
+  cwd,
+  conversationId = '',
+  mode = 'accept-edits',
+  model = '',
+  effort = '',
+  timeoutSeconds = 3600,
+  config,
+  bridgeMeta = {},
+}) {
+  const agyBin = config?.agy?.bin?.trim() || detectAgyBin();
+  if (!agyBin) {
+    throw new Error('Could not find `agy` binary. Set `agy.bin` in config or check PATH.');
+  }
+  const args = buildAgyArgs({
+    useStdin: true,
+    conversationId,
+    mode,
+    model,
+    effort,
+    timeoutSeconds,
+  });
+  const env = buildChildEnv(config, agyBin, bridgeMeta);
+  const useDetached = process.platform !== 'win32';
+  const child = spawn(agyBin, args, {
+    cwd: cwd || config?.agy?.defaultCwd || process.cwd(),
+    env,
+    detached: useDetached,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    ...getWindowsSpawnOpts(agyBin),
+  });
+  return { child, useDetached, agyBin };
 }
 
 export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-edits', model = '', effort = '', config, bridgeMeta = {}, onEvent, signal }) {
   return new Promise((resolve, reject) => {
-    const agyBin = config?.agy?.bin?.trim() || detectAgyBin();
-    if (!agyBin) {
-      reject(new Error('Could not find `agy` binary. Set `agy.bin` in config or check PATH.'));
+    let spawned;
+    try {
+      spawned = spawnAgyStreamProcess({
+        cwd,
+        conversationId,
+        mode,
+        model,
+        effort,
+        timeoutSeconds: config?.agy?.timeoutSeconds ?? 3600,
+        config,
+        bridgeMeta,
+      });
+    } catch (err) {
+      reject(err);
       return;
     }
-
-    const args = buildAgyArgs({
-      useStdin: true,
-      conversationId,
-      mode,
-      model,
-      effort,
-      timeoutSeconds: config?.agy?.timeoutSeconds ?? 3600,
-    });
-    const env = buildChildEnv(config, agyBin, bridgeMeta);
-    const useDetached = process.platform !== 'win32';
-
-    const child = spawn(agyBin, args, {
-      cwd: cwd || config?.agy?.defaultCwd || process.cwd(),
-      env,
-      detached: useDetached,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      ...getWindowsSpawnOpts(agyBin),
-    });
+    const { child, useDetached } = spawned;
 
     child.stdin.on('error', () => {
       // Ignore EPIPE if child exits before stdin completes
@@ -267,47 +368,12 @@ export function runAgyTurn({ prompt, cwd, conversationId = '', mode = 'accept-ed
     let aborted = false;
     let killTimer = null;
 
-    const killChildTree = (sig) => {
-      if (process.platform === 'win32') {
-        if (sig === 'SIGKILL' && child.pid) {
-          try {
-            spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
-              windowsHide: true,
-              stdio: 'ignore',
-            }).unref();
-            return;
-          } catch {
-            // Fall back to child.kill
-          }
-        }
-        try {
-          child.kill(sig);
-        } catch {
-          // Ignore
-        }
-        return;
-      }
-      if (useDetached && child.pid) {
-        try {
-          process.kill(-child.pid, sig);
-          return;
-        } catch {
-          // Fall back to direct child signal
-        }
-      }
-      try {
-        child.kill(sig);
-      } catch {
-        // Ignore
-      }
-    };
-
     const handleAbort = () => {
       aborted = true;
       if (!child.killed) {
-        killChildTree('SIGTERM');
+        killChildTree(child, 'SIGTERM', useDetached);
         killTimer = setTimeout(() => {
-          killChildTree('SIGKILL');
+          killChildTree(child, 'SIGKILL', useDetached);
         }, 3000);
         killTimer.unref();
       }

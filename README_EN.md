@@ -138,7 +138,8 @@ Follow README_EN.md: install into the global Antigravity plugin directory (~/.ge
    ```bash
    node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup \
      --app-id "<APP_ID>" \
-     --app-secret "<APP_SECRET>" \
+     --app-secret-stdin \
+     --allow-open-id "<YOUR_OPEN_ID>" \
      --domain feishu \
      --cwd "$HOME" \
      --mode accept-edits \
@@ -147,13 +148,13 @@ Follow README_EN.md: install into the global Antigravity plugin directory (~/.ge
    node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs start
    node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs status
    ```
-   *(Use `--domain lark` for international Lark workspaces.)*
+   *(Use `--domain lark` for international Lark workspaces. For backwards compatibility, `--auto-bind true` can opt in to first-P2P auto-binding; by default `autoBindFirstUser` is `false` / fail-closed unless `--allow-open-id` is set.)*
 5. Under **Events & Callbacks**:
    - **Events**: Select **Receive events via persistent connection (WebSocket)** and subscribe to `im.message.receive_v1` and `application.bot.menu_v6`.
    - **Callbacks**: Select **Receive callbacks via persistent connection (WebSocket)** and subscribe to `card.action.trigger`.
-6. *(Optional)* Under **Bot Custom Menu**, add menu buttons pushing event keys `menu_panel`, `menu_commands`, `menu_new`, `menu_stop` (also supports `menu_skills`, `menu_dirs`, `menu_effort`, `menu_git`, `menu_scopes`, `menu_queue`, `menu_mode_temp_full`, `menu_ops`, `menu_reload`, `menu_sessions`, `menu_models`, `menu_mode_full`, `menu_help`).
+6. *(Optional)* Under **Bot Custom Menu**, add menu buttons pushing event keys `menu_panel`, `menu_commands`, `menu_new`, `menu_stop` (also supports `menu_skills`, `menu_dirs`, `menu_effort`, `menu_git`, `menu_scopes`, `menu_queue`, `menu_mode_temp_full`, `menu_ops`, `menu_reload`, `menu_sessions`, `menu_models`, `menu_mode_full`, `menu_goal`, `menu_swarm`, `menu_schedule`, `menu_plan`, `menu_help`).
 7. Under **Version Management & Release**, create and publish a version (can be scoped to yourself or test users).
-8. Message your bot once in private chat (e.g. `hi` or `/help`) to auto-bind your `open_id` and receive the welcome card.
+8. Message your bot once in private chat (e.g. `hi` or `/help`) to verify the welcome/control panel.
 
 ---
 
@@ -161,18 +162,21 @@ Follow README_EN.md: install into the global Antigravity plugin directory (~/.ge
 
 | Command | Description |
 | :--- | :--- |
-| `setup` | Save Feishu/Lark credentials, proxy, default cwd/mode/model/effort, and notify mode to `~/.config/antigravity-feishu/config.json` |
+| `setup` | Save Feishu/Lark credentials (`--app-secret-stdin` or `FEISHU_APP_SECRET` recommended), proxy, allowlist (`--allow-open-id`), default cwd/mode/model/effort, and notify mode to `~/.config/antigravity-feishu/config.json` |
+| `auth` | Authorize Feishu User OAuth for Task v2 (`--status\|--logout\|--url\|--no-browser`) |
 | `start` / `stop` / `restart` | Manage background daemon (`launchd` / `systemd --user` / Windows PID) |
 | `check` | Two-stage syntax (`node --check`) and ESM import/export verification |
 | `safe-restart` | Run `check`, save a snapshot, and restart only if validation passes |
 | `snapshot` / `backups` / `rollback` | Manage deduplicated code snapshots in `~/.config/antigravity-feishu/backups/` (max 5) |
 | `status` / `logs [--lines N]` | Inspect daemon status, masked config, and stdout/stderr logs |
 | `test-send [--panel\|--dirs]` | Send a test or interactive control card to the bound user |
-| `send-file <path> [--as-file]` | Upload and send a local image or file to Feishu/Lark |
+| `send-file <path> [--as-file]` | Upload and send a local image or file to Feishu/Lark (sensitive paths blocked) |
 | `scopes` | Query Feishu Open Platform scope grant status |
 | `read-doc` / `write-doc` | Read (including comments) or create/append Feishu Docx/Wiki documents |
+| `tasks` / `task-create` / `task-done` | Manage Feishu Task v2 tasks via User OAuth (`cli.mjs auth`) |
 | `desktop [--query kw]` | Read-only scan & FTS5 search of local CLI and Desktop conversations |
-| `pack [--out path.zip]` | Build a clean shareable `.zip` (excludes `node_modules`, `.git`, logs/envs/zips, and all user credentials) |
+| `handoff [--conv <id>\|--copy cli\|desktop]` | Inspect or copy mobile session handoff snippets & resume commands |
+| `pack [--out path.zip]` | Build a lean shareable `.zip` (excludes `node_modules`, `.git`, tests, README marketing GIF/banners, logs/envs/dbs/zips, and all user credentials) |
 
 Run verification locally at any time:
 
@@ -185,10 +189,11 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/smoke-test.mjs
 
 ## Feishu Chat Commands
 
-- **Control & Navigation**: `/panel` (interactive control panel), `/dirs [-a]` (browse/pin directories, toggle hidden dot-directories), `/cd <path|keyword>`, `/pin`, `/` or `/skills` (built-in `agy` commands & local skills), `/status`, `/help`
-- **Execution Controls**: `/mode [accept-edits|plan|auto|full|default|full 30m]`, `/model [id|default]`, `/effort [low|medium|high|xhigh|max|default]`, `/timeout [minutes|0]`, `/queue`, `/stop`
-- **Sessions & Handoff**: `/new`, `/sessions`, `/use <index|id>`, `/desktop [keyword]` (`/pc` — preview & take over local CLI/Desktop sessions)
-- **Files, Docs & Ops**: `/send <path> [--file]`, `/doc ...`, `/tasks` (`/todo` — list, create, complete, or run Feishu Task v2 tasks via User OAuth), `/git`, `/scopes`, `/notify [on|away [min]|off]`, `/ops`, `/check`, `/reload`, `/snapshot`, `/rollback`
+- **Control & Navigation**: `/panel` (interactive control panel), `/dirs [-a]` (browse/pin directories, toggle hidden dot-directories), `/cd <path|keyword>`, `/pin`, `/` or `/skills` (built-in `agy` commands, command boards & local skills), `/status`, `/help`
+- **Command Dashboards**: `/goal`, `/swarm` / `/teamwork`, `/schedule`, `/plan` / `/grill-me` (open dedicated launch, live team/step telemetry, cron preset, and plan-approval dashboards when invoked without arguments)
+- **Execution Controls**: `/mode [accept-edits|plan|auto|full|default|full 30m]`, `/model [id|default]`, `/effort [low|medium|high|xhigh|max|default]`, `/timeout [minutes|0]`, `/guard [on|off]`, `/queue`, `/stop`
+- **Sessions & Handoff**: `/new`, `/sessions [all|here]`, `/use <index|id>`, `/desktop [keyword]` (`/pc` — preview & take over local CLI/Desktop sessions), `/topic [set|clear]`, `/unlink`, `/handoff [cli|desktop]` (`/back`)
+- **Files, Docs & Ops**: `/send <path> [--file]` (sensitive paths blocked), `/doc ...`, `/tasks` (`/todo`), `/git`, `/scopes`, `/notify [on|away [min]|off]`, `/ops`, `/check`, `/reload`, `/snapshot`, `/rollback`
 
 ---
 
@@ -201,8 +206,10 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/smoke-test.mjs
   - `feishu_read_doc` / `feishu_write_doc` — read (including inline/whole comments) or create/append Docx & Wiki pages
   - `feishu_list_tasks` / `feishu_create_task` / `feishu_complete_task` — list, create, and complete Feishu Task v2 tasks via User OAuth (`cli.mjs auth`)
   - `feishu_bridge_status` / `feishu_manage_bridge` — inspect masked config and start/stop/restart/read daemon logs
-- **Lifecycle Hook (`hooks.json` -> `feishu-stop-notify`)**:
-  - Fires on `Stop` when local desktop/CLI Antigravity sessions finish, sending a completion card with **Take Over Session** and **Switch Directory** buttons (respecting `on` / `away` / `off` notify modes and skipping child sessions).
+  - `feishu_list_mobile_sessions` / `feishu_read_mobile_session` — sync recent mobile Feishu CLI transcripts and modified files back to Desktop App
+- **Lifecycle Hooks (`hooks.json`)**:
+  - `feishu-stop-notify` (`Stop`): fires when local desktop/CLI Antigravity sessions finish, sending a completion card with **Take Over Session** and **Switch Directory** buttons (respecting `on` / `away` / `off` notify modes and skipping child sessions).
+  - `feishu-risky-command-guard` (`PreToolUse` on `run_command`, `write_file`, `edit_file`): evaluates risky shell commands or writes targeting sensitive directories in bridge-spawned runs, sending a fail-closed Feishu approval card when enabled (`/guard on|off`).
 - **Skill (`skills/feishu-remote/SKILL.md`)** & **Rules (`rules/AGENTS.md`)**:
   - Guides Antigravity on setup, troubleshooting, packaging, and strict credential isolation.
 

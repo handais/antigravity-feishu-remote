@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  getPluginRoot,
   resolveRiskyApprovalEnabled,
   resolveStopNotifyMode,
 } from './config.mjs';
@@ -11,6 +12,59 @@ export function sanitizeForFeishuMarkdown(text) {
   return String(text)
     .replace(/\0/g, '')
     .replace(/\[([^\]]+)\]\(file:\/\/[^)]+\)/g, '`$1`');
+}
+
+function stampElementThreadRoot(el, threadRootId) {
+  if (!el || typeof el !== 'object') return el;
+  if (el.tag === 'button' && Array.isArray(el.behaviors)) {
+    return {
+      ...el,
+      behaviors: el.behaviors.map((b) => {
+        if (b?.type === 'callback' && b.value && typeof b.value === 'object' && !Array.isArray(b.value) && !b.value.threadRootId) {
+          return { ...b, value: { ...b.value, threadRootId } };
+        }
+        return b;
+      }),
+    };
+  }
+  if (el.tag === 'column_set' && Array.isArray(el.columns)) {
+    return {
+      ...el,
+      columns: el.columns.map((col) => (
+        col && Array.isArray(col.elements)
+          ? { ...col, elements: col.elements.map((child) => stampElementThreadRoot(child, threadRootId)) }
+          : col
+      )),
+    };
+  }
+  if (Array.isArray(el.elements)) {
+    return {
+      ...el,
+      elements: el.elements.map((child) => stampElementThreadRoot(child, threadRootId)),
+    };
+  }
+  return el;
+}
+
+/**
+ * Stamp `threadRootId` into all callback button payloads on a Feishu card without mutating the input.
+ */
+export function stampCardThreadRoot(card, threadRootId) {
+  const cleanRoot = String(threadRootId || '').trim();
+  if (!cleanRoot || !card || typeof card !== 'object') {
+    return card;
+  }
+  const body = card.body;
+  if (!body || !Array.isArray(body.elements)) {
+    return card;
+  }
+  return {
+    ...card,
+    body: {
+      ...body,
+      elements: body.elements.map((el) => stampElementThreadRoot(el, cleanRoot)),
+    },
+  };
 }
 
 function updateFenceState(line, activeFence) {
@@ -87,8 +141,9 @@ export function splitMarkdownChunks(text, maxLen = 7000, { maxUtf8Bytes = 22_000
     const fenceReserveChars = activeFence ? activeFence.len + 2 : 0;
     const fenceReserveBytes = activeFence ? activeFence.len + 4 : 0;
     const lineBytes = Buffer.byteLength(line, 'utf8');
+    const hasChunkContent = currentLines.length > (activeFence ? 1 : 0);
     if (
-      currentLines.length > 0 &&
+      hasChunkContent &&
       (currentLen + line.length + 1 + fenceReserveChars > maxLen ||
         currentBytes + lineBytes + 1 + fenceReserveBytes > byteLimit)
     ) {
@@ -507,8 +562,10 @@ export const PENDING_COMMAND_TTL_MS = 30 * 60 * 1000;
 
 export const AGY_PRESET_COMMANDS = [
   { prefix: '/plan', icon: '🧭' },
+  { prefix: '/grill-me', icon: '🎤' },
   { prefix: '/boost', icon: '🚀' },
   { prefix: '/goal', icon: '🎯' },
+  { prefix: '/schedule', icon: '⏰' },
   { prefix: '/browser', icon: '🌐' },
   { prefix: '/learn', icon: '📝' },
   { prefix: '/teamwork', icon: '🤝' },
@@ -536,10 +593,12 @@ export function getActivePendingCommand(chatState, now = Date.now()) {
   if (armedAt > 0 && now - armedAt > PENDING_COMMAND_TTL_MS) {
     return null;
   }
+  const template = typeof pending.template === 'string' ? pending.template.trim().slice(0, 48) : '';
   return {
     prefix,
     kind: pending.kind === 'skill' ? 'skill' : 'builtin',
     armedAt,
+    ...(template ? { template } : {}),
   };
 }
 
@@ -564,7 +623,8 @@ export function consumePendingCommand(chatState, rawText, { hasAttachments = fal
     chatState.pendingCommand = original;
     return { applied: false, expired: false, superseded: false, stateChanged: false, prefix: '' };
   }
-  return { applied: true, expired: false, superseded: false, stateChanged: true, prefix: active.prefix };
+  const composedPrefix = active.template ? `${active.prefix} ${active.template}` : active.prefix;
+  return { applied: true, expired: false, superseded: false, stateChanged: true, prefix: composedPrefix };
 }
 
 export function buildControlPanelCard({
@@ -739,6 +799,58 @@ export function buildControlPanelCard({
   });
 }
 
+export function buildNewSessionCard({ chatState, config, threadRootId = '' } = {}) {
+  const cwd = chatState?.cwd || config?.agy?.defaultCwd || os.homedir();
+  const mode = chatState?.mode || config?.agy?.defaultMode || 'accept-edits';
+  const model = chatState?.model || config?.agy?.defaultModel || '';
+  const effort = chatState?.effort || config?.agy?.defaultEffort || '';
+  const rawExpiresAt = Number(chatState?.fullExpiresAt || 0);
+  const isTempFull = mode === 'full' && rawExpiresAt > Date.now();
+  const remainingMin = isTempFull ? Math.max(1, Math.ceil((rawExpiresAt - Date.now()) / 60000)) : 0;
+  const revertMode = chatState?.fullRevertMode || 'accept-edits';
+  const modeDisplay = isTempFull
+    ? `\`full\`（⏱️ 临时全权，约 ${remainingMin} 分钟后自动切回 \`${revertMode}\`）`
+    : `\`${mode}\``;
+  const rawTimeoutSec = chatState?.timeoutSeconds !== undefined && chatState?.timeoutSeconds !== null
+    ? chatState.timeoutSeconds
+    : (config?.agy?.timeoutSeconds ?? 3600);
+  const timeoutSec = Number(rawTimeoutSec);
+  const timeoutLabel = !timeoutSec || timeoutSec <= 0
+    ? '不限时'
+    : timeoutSec >= 60
+      ? `${Math.round(timeoutSec / 60)} 分钟（${Math.floor(timeoutSec)}s）`
+      : `${Math.floor(timeoutSec)} 秒`;
+
+  const lines = [
+    threadRootId ? `- **所属话题**：\`${threadRootId.slice(0, 12)}\`（独立并行会话）` : '',
+    `- **工作目录**：\`${cwd}\``,
+    `- **执行模式**：${modeDisplay}`,
+    `- **当前模型**：\`${model || 'default (随 CLI 配置)'}\``,
+    `- **推理强度**：\`${effort || 'default (随 CLI 配置)'}\``,
+    `- **单轮超时**：\`${timeoutLabel}\``,
+    '',
+    '下条消息将以上述配置开启全新上下文。',
+  ].filter((line, idx, arr) => line !== '' || (idx > 0 && arr[idx - 1] !== ''));
+
+  return buildCard({
+    title: '🆕 已开启新对话',
+    template: 'green',
+    markdown: lines.join('\n'),
+    buttonRows: [
+      [
+        { label: '📁 切换目录', value: { cmd: 'dirs' } },
+        { label: '🧠 模型', value: { cmd: 'models' } },
+        { label: '🎛️ 强度', value: { cmd: 'effort_menu' } },
+      ],
+      [
+        { label: '🧩 命令', value: { cmd: 'skills_menu' } },
+        { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
+      ],
+    ],
+    footer: '目录或模型不对可直接点上方按钮调整，然后发送任务',
+  });
+}
+
 export function buildSystemSettingsCard({ config, isRunning = false, uptimeText = '' } = {}) {
   const guardEnabled = resolveRiskyApprovalEnabled(config);
   const timeoutSec = Math.max(15, Math.min(160, Number(config?.security?.approvalTimeoutSeconds || 120)));
@@ -869,7 +981,21 @@ function readSkillMeta(skillMdPath, fallbackName) {
   };
 }
 
+const SKILLS_CACHE_TTL_MS = 30_000;
+const skillsCache = new Map();
+
+export function clearSkillsCache() {
+  skillsCache.clear();
+}
+
 export function discoverLocalSkills({ homeDir = os.homedir(), maxSkills = 20 } = {}) {
+  const cappedMax = Math.max(1, Math.min(40, Number(maxSkills) || 20));
+  const cacheKey = `${path.resolve(homeDir || os.homedir())}:${cappedMax}`;
+  const cached = skillsCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < SKILLS_CACHE_TTL_MS) {
+    return cached.items;
+  }
+
   const candidates = [];
   const collectSkillDirs = (parentDir, source) => {
     try {
@@ -911,9 +1037,12 @@ export function discoverLocalSkills({ homeDir = os.homedir(), maxSkills = 20 } =
     }
   }
 
-  return [...byKey.values()]
+  const discovered = [...byKey.values()]
+    .filter((item) => isValidCommandPrefix(`/${item.name}`))
     .sort((a, b) => a.name.localeCompare(b.name))
-    .slice(0, Math.max(1, Math.min(40, Number(maxSkills) || 20)));
+    .slice(0, cappedMax);
+  skillsCache.set(cacheKey, { ts: Date.now(), items: discovered });
+  return discovered;
 }
 
 export function buildAgySkillsCard({
@@ -923,7 +1052,8 @@ export function buildAgySkillsCard({
   skillPage = 0,
   skillPageSize = 9,
 } = {}) {
-  const resolvedSkills = Array.isArray(skills) ? skills : discoverLocalSkills({ homeDir });
+  const resolvedSkills = (Array.isArray(skills) ? skills : discoverLocalSkills({ homeDir }))
+    .filter((item) => item?.name && isValidCommandPrefix(`/${item.name}`));
   const activePending = pendingCommand && typeof pendingCommand === 'object'
     ? getActivePendingCommand({ pendingCommand })
     : null;
@@ -937,9 +1067,10 @@ export function buildAgySkillsCard({
 
   const lines = [];
   if (activePrefix) {
+    const armedFull = activePending?.template ? `${activePrefix} ${activePending.template}` : activePrefix;
     lines.push(
-      `🎯 **已预选命令前缀**：\`${sanitizeForFeishuMarkdown(activePrefix)}\``,
-      `> 直接发文字、语音、截图或引用消息，插件会自动拼成 \`${sanitizeForFeishuMarkdown(activePrefix)} <你的内容>\` 执行；再点一次按钮或点「❌ 取消预选」可取消。`,
+      `🎯 **已预选命令前缀**：\`${sanitizeForFeishuMarkdown(armedFull)}\``,
+      `> 直接发文字、语音、截图或引用消息，插件会自动拼成 \`${sanitizeForFeishuMarkdown(armedFull)} <你的内容>\` 执行；再点一次按钮或点「❌ 取消预选」可取消。`,
       '',
     );
   }
@@ -947,21 +1078,25 @@ export function buildAgySkillsCard({
   lines.push(
     '**⚡ agy 常用内置命令（点击下方按钮直接预选前缀，免复制）：**',
     '- `/compact`：压缩当前对话上下文（长对话提速省 token，点击立即执行）',
-    '- `/plan <任务>`：先只读调研规划再动手执行',
+    '- `/plan <任务>`：先只读调研规划再动手执行（配专属审批看板）',
+    '- `/grill-me <需求>`：交互式追问对齐需求细节与架构取舍',
     '- `/boost <复杂任务>`：深度思考、多角度规划与严格校验',
-    '- `/goal <长耗时任务>`：持续推进直到目标达成（建议先 `/timeout 0`）',
+    '- `/goal <长耗时任务>`：持续推进直到目标达成（配启动检查 & 进度看板）',
+    '- `/schedule <定时任务>`：设置一次性提醒或周期性 cron（配调度看板）',
     '- `/browser <网页任务>`：操控浏览器搜索或操作网页',
     '- `/learn <规则>`：把本次踩坑或偏好沉淀为长期规则',
-    '- `/teamwork` / `/swarm <任务>`：多 Agent 分工协同（建议在话题楼使用）',
+    '- `/teamwork` / `/swarm <任务>`：多 Agent 分工协同（配成员状态看板，建议话题楼使用）',
     '- `/agy /<命令>`：强制透传与飞书插件重名的 `agy` 原始命令（如 `/agy /help`）',
     '',
-    `**🧩 本机已安装技能（Skills，共 ${resolvedSkills.length} 个）：**`,
+    totalPages > 1
+      ? `**🧩 本机已安装技能（Skills，共 ${resolvedSkills.length} 个 · 第 ${safePage + 1}/${totalPages} 页）：**`
+      : `**🧩 本机已安装技能（Skills，共 ${resolvedSkills.length} 个）：**`,
   );
 
   if (resolvedSkills.length === 0) {
     lines.push('- _（暂未扫描到本地 SKILL.md，可检查 `~/.gemini/config/skills/` 或 `~/.agents/skills/`）_');
   } else {
-    for (const s of resolvedSkills) {
+    for (const s of visibleSkills) {
       const desc = s.description ? `：${sanitizeForFeishuMarkdown(s.description)}` : '';
       lines.push(`- \`/${sanitizeForFeishuMarkdown(s.name)}\`${desc}`);
     }
@@ -969,7 +1104,7 @@ export function buildAgySkillsCard({
 
   lines.push(
     '',
-    '💡 用法：点下方任意命令/技能按钮即可预选前缀，然后直接发送任务内容（支持文字、语音、截图）；需跑命令/MCP 的技能建议先点控制面板「⚡ 30m全权」。',
+    '💡 用法：点下方任意命令/技能按钮即可预选前缀，或打开「📊 专属命令看板」进行启动配置、进度追踪与方案审批。',
   );
 
   const builtinButtons = [
@@ -993,6 +1128,16 @@ export function buildAgySkillsCard({
       title: '⚡ 常用命令（点选预填前缀，/compact 直接执行）',
       divider: true,
       rows: chunkButtons(builtinButtons, 4),
+    },
+    {
+      title: '📊 专属命令看板（启动配置 / 进度监控 / 审批闭环）',
+      divider: true,
+      rows: [[
+        { label: '🎯 Goal 看板', value: { cmd: 'cmd_board', board: 'goal', inplace: true } },
+        { label: '🐝 Swarm 看板', value: { cmd: 'cmd_board', board: 'swarm', inplace: true } },
+        { label: '⏰ 定时看板', value: { cmd: 'cmd_board', board: 'schedule', inplace: true } },
+        { label: '🧭 Plan 看板', value: { cmd: 'cmd_board', board: 'plan', inplace: true } },
+      ]],
     },
   ];
 
@@ -1925,9 +2070,9 @@ export function buildTasksCard({
       '**一次性授权步骤（3 步）：**',
       '1. 飞书开放平台 → **安全设置 → 重定向 URL**：添加 `http://127.0.0.1:18923/callback`',
       '2. 飞书开放平台 → **权限管理** 开通权限：`offline_access`、`task:task:read`、`task:task:write`、`task:tasklist:read` 并发布新版本',
-      '3. 在 Mac/本机终端运行一次（会自动启动本机回调服务并弹出带 state 校验的安全授权页）：',
+      '3. 在本机终端运行一次（会自动启动本机回调服务并弹出带 state 校验的安全授权页）：',
       '```bash',
-      'node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs auth',
+      `node ${path.join(getPluginRoot(), 'scripts', 'cli.mjs')} auth`,
       '```',
     ].filter(Boolean);
 

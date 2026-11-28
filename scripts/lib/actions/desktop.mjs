@@ -1,12 +1,14 @@
 import fs from 'node:fs';
-import { saveState } from '../config.mjs';
+import { updateState } from '../config.mjs';
 import {
   buildCard,
   buildDesktopSessionPreviewCard,
   buildDesktopSessionsCard,
   deliverFinalCard,
+  patchCard,
   sanitizeForFeishuMarkdown,
   sendCard,
+  stampCardThreadRoot,
 } from '../feishu-api.mjs';
 import {
   buildDesktopHandoffContext,
@@ -50,6 +52,8 @@ export function applyDesktopTakeover({
   const mode = detail?.takeoverMode === 'handoff' ? 'handoff' : 'native';
   const title = detail?.title || fallbackSummary || '(电脑端接管对话)';
   chatState.topicClosed = false;
+  chatState.persistentSession = false;
+  chatState.pendingCommand = null;
   if (mode === 'handoff' && detail) {
     chatState.conversationId = '';
     chatState.lastTurnArtifacts = null;
@@ -167,13 +171,19 @@ export async function handleDesktopAction(actionCtx) {
     }
     const rawCwd = String(value?.cwd || '').trim();
     const summary = String(value?.summary || '').trim();
-    const { mode, detail, resolvedId, title } = applyDesktopTakeover({
-      chatState,
-      convId,
-      fallbackCwd: rawCwd,
-      fallbackSummary: summary,
+    runner?.releasePersistentSession?.(runKey);
+    let takeoverInfo;
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      takeoverInfo = applyDesktopTakeover({
+        chatState: targetChat,
+        convId,
+        fallbackCwd: rawCwd,
+        fallbackSummary: summary,
+      });
+      Object.assign(chatState, targetChat);
     });
-    saveState(state);
+    const { mode, detail, resolvedId, title } = takeoverInfo;
     const pushedReply = pushDesktopLastReply(replyOpts, detail, title);
 
     const buttonRow = [
@@ -268,8 +278,14 @@ export async function handleDesktopAction(actionCtx) {
       return toastCardResponse('error', '缺少要接管的会话 ID');
     }
     const summarize = Boolean(value?.summarize);
-    const { mode, detail, resolvedId, title } = applyDesktopTakeover({ chatState, convId });
-    saveState(state);
+    runner?.releasePersistentSession?.(runKey);
+    let takeoverInfo;
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      takeoverInfo = applyDesktopTakeover({ chatState: targetChat, convId });
+      Object.assign(chatState, targetChat);
+    });
+    const { mode, detail, resolvedId, title } = takeoverInfo;
     const pushedReply = !summarize ? pushDesktopLastReply(replyOpts, detail, title) : false;
 
     let summarizeQueuedMsg = '';
@@ -388,17 +404,26 @@ export async function handleDesktopAction(actionCtx) {
     if (!rootMessageId) {
       return toastCardResponse('error', '在话题群新开话题失败：未返回消息 ID');
     }
+    void patchCard(client, {
+      messageId: rootMessageId,
+      card: stampCardThreadRoot(rootCard, rootMessageId),
+    }).catch(() => {});
 
     const newSessionKey = makeSessionKey(topicChatId, rootMessageId);
-    const newChatState = getOrCreateChatState(state, newSessionKey, config);
-    const { mode } = applyDesktopTakeover({
-      chatState: newChatState,
-      convId,
-      fallbackCwd: rawCwd,
-      fallbackSummary: summary,
+    let newChatState = {};
+    let mode = 'native';
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, newSessionKey, config);
+      const res = applyDesktopTakeover({
+        chatState: targetChat,
+        convId,
+        fallbackCwd: rawCwd,
+        fallbackSummary: summary,
+      });
+      mode = res.mode;
+      latest.lastTopicChatId = topicChatId;
+      newChatState = { ...targetChat };
     });
-    state.lastTopicChatId = topicChatId;
-    saveState(state);
     recordCardThread(rootMessageId, {
       sessionKey: newSessionKey,
       threadRootId: rootMessageId,
@@ -451,10 +476,13 @@ export async function handleDesktopAction(actionCtx) {
   }
 
   if (cmd === 'unlink_topic') {
-    chatState.topicClosed = true;
-    chatState.originDesktopSession = null;
-    chatState.pendingHandoff = null;
-    saveState(state);
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      targetChat.topicClosed = true;
+      targetChat.originDesktopSession = null;
+      targetChat.pendingHandoff = null;
+      Object.assign(chatState, targetChat);
+    });
     const card = buildCard({
       title: '🔓 已结束本话题与电脑端的自动回流追踪',
       template: 'grey',
@@ -473,26 +501,29 @@ export async function handleDesktopAction(actionCtx) {
     if (!detail) {
       return toastCardResponse('error', '未找到原电脑端对话记录');
     }
-    chatState.topicClosed = false;
-    chatState.originDesktopSession = {
-      ...(chatState.originDesktopSession || {}),
-      id: detail.id,
-      title: detail.title || chatState.originDesktopSession?.title || '',
-      source: detail.source || chatState.originDesktopSession?.source || 'desktop',
-      workspace: chatState.cwd,
-      takenOverAt: chatState.originDesktopSession?.takenOverAt || Date.now(),
-      desktopLastModifiedMs: detail.lastModifiedMs || 0,
-      desktopStepCount: detail.stepCount || 0,
-    };
-    chatState.pendingHandoff = {
-      id: detail.id,
-      title: detail.title,
-      source: detail.source,
-      cwd: chatState.cwd,
-      contextBlock: buildDesktopHandoffContext(detail),
-      createdAt: Date.now(),
-    };
-    saveState(state);
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      targetChat.topicClosed = false;
+      targetChat.originDesktopSession = {
+        ...(targetChat.originDesktopSession || {}),
+        id: detail.id,
+        title: detail.title || targetChat.originDesktopSession?.title || '',
+        source: detail.source || targetChat.originDesktopSession?.source || 'desktop',
+        workspace: targetChat.cwd,
+        takenOverAt: targetChat.originDesktopSession?.takenOverAt || Date.now(),
+        desktopLastModifiedMs: detail.lastModifiedMs || 0,
+        desktopStepCount: detail.stepCount || 0,
+      };
+      targetChat.pendingHandoff = {
+        id: detail.id,
+        title: detail.title,
+        source: detail.source,
+        cwd: targetChat.cwd,
+        contextBlock: buildDesktopHandoffContext(detail),
+        createdAt: Date.now(),
+      };
+      Object.assign(chatState, targetChat);
+    });
 
     const pushed = pushDesktopLastReply(replyOpts, detail, detail.title);
     const card = buildCard({
@@ -516,42 +547,47 @@ export async function handleDesktopAction(actionCtx) {
   }
 
   if (cmd === 'handoff' || cmd === 'handoff_copy') {
-    const targetConvId = arg.trim() || chatState.conversationId || '';
-    const session = readMobileSession({
-      conversationId: targetConvId,
-      cwd: chatState.cwd,
-      originDesktopId: chatState.originDesktopSession?.id || '',
-    });
-    if (!session.found) {
-      return toastCardResponse('info', session.error || '当前暂无可交回电脑的手机端会话');
-    }
-    const target = String(value?.target || 'cli').toLowerCase() === 'desktop' ? 'desktop' : 'cli';
-    const textToCopy = target === 'desktop' ? session.desktopHandoffPrompt : session.cliResumeCommand;
-    const clipboardResult = await copyToSystemClipboardAsync(textToCopy);
-    const snap = writeHandoffSnapshot({
-      conversationId: session.conversationId,
-      cwd: session.cwd,
-      cliResumeCommand: session.cliResumeCommand,
-      desktopHandoffPrompt: session.desktopHandoffPrompt,
-      modifiedFiles: session.modifiedFiles,
-      originDesktopSession: session.originDesktopSession,
-    });
-    const card = buildHandoffCard({
-      session,
-      clipboardResult,
-      copiedTarget: target,
-      snapshotPath: snap.latestPath,
-    });
-    const toastMsg = clipboardResult.ok
-      ? (target === 'desktop' ? '📋 已复制桌面交接提示词' : '📋 已复制终端恢复命令')
-      : '💻 已生成交接信息（剪贴板未写入，请直接复制卡片命令）';
-    if (inplace) {
-      return toastCardResponse(clipboardResult.ok ? 'success' : 'info', toastMsg, card);
-    }
-    void sendToTarget(card).catch((err) => {
-      console.error('[feishu-remote] send handoff card error:', err.message);
-    });
-    return toastCardResponse(clipboardResult.ok ? 'success' : 'info', toastMsg);
+    const runHandoff = async () => {
+      const targetConvId = arg.trim() || chatState.conversationId || '';
+      const session = readMobileSession({
+        conversationId: targetConvId,
+        cwd: chatState.cwd,
+        originDesktopId: chatState.originDesktopSession?.id || '',
+      });
+      if (!session.found) {
+        return toastCardResponse('info', session.error || '当前暂无可交回电脑的手机端会话');
+      }
+      const target = String(value?.target || 'cli').toLowerCase() === 'desktop' ? 'desktop' : 'cli';
+      const textToCopy = target === 'desktop' ? session.desktopHandoffPrompt : session.cliResumeCommand;
+      const clipboardResult = await copyToSystemClipboardAsync(textToCopy);
+      const snap = writeHandoffSnapshot({
+        conversationId: session.conversationId,
+        cwd: session.cwd,
+        cliResumeCommand: session.cliResumeCommand,
+        desktopHandoffPrompt: session.desktopHandoffPrompt,
+        modifiedFiles: session.modifiedFiles,
+        originDesktopSession: session.originDesktopSession,
+      });
+      const card = buildHandoffCard({
+        session,
+        clipboardResult,
+        copiedTarget: target,
+        snapshotPath: snap.latestPath,
+      });
+      const toastMsg = clipboardResult.ok
+        ? (target === 'desktop' ? '📋 已复制桌面交接提示词' : '📋 已复制终端恢复命令')
+        : '💻 已生成交接信息（剪贴板未写入，请直接复制卡片命令）';
+      if (inplace) {
+        return toastCardResponse(clipboardResult.ok ? 'success' : 'info', toastMsg, card);
+      }
+      void sendToTarget(card).catch((err) => {
+        console.error('[feishu-remote] send handoff card error:', err.message);
+      });
+      return toastCardResponse(clipboardResult.ok ? 'success' : 'info', toastMsg);
+    };
+    return typeof actionCtx.runWithinBudget === 'function'
+      ? actionCtx.runWithinBudget('💻 正在生成交接卡片...', runHandoff)
+      : runHandoff();
   }
 
   return null;

@@ -1,12 +1,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { listAgyModels, VALID_EFFORTS, VALID_MODES } from './agy-runner.mjs';
+import {
+  isSafeCliConversationId,
+  isValidModelName,
+  listAgyModels,
+  VALID_EFFORTS,
+  VALID_MODES,
+} from './agy-runner.mjs';
 import {
   loadState,
+  resolveOwnerOpenId,
   resolveRiskyApprovalEnabled,
   resolveStopNotifyMode,
-  saveConfig,
-  saveState,
+  updateConfig,
+  updateState,
 } from './config.mjs';
 import {
   buildAgySkillsCard,
@@ -16,6 +23,7 @@ import {
   buildDirsCard,
   buildEffortCard,
   buildGitStatusCard,
+  buildNewSessionCard,
   buildNotifyCard,
   buildQueueListCard,
   buildScopesCard,
@@ -64,7 +72,15 @@ import {
   parseTimeoutArg,
   replySimpleCard,
   resolveDefaultTopicChatId,
+  resolveEffectiveTimeoutSeconds,
 } from './bridge-helpers.mjs';
+import {
+  buildGoalBoardCard,
+  buildPlanBoardCard,
+  buildScheduleBoardCard,
+  buildSwarmBoardCard,
+  inspectCommandBoardTelemetry,
+} from './command-boards.mjs';
 
 export async function handleSlashCommand(
   ctx,
@@ -80,16 +96,39 @@ export async function handleSlashCommand(
   },
 ) {
   const { client, startedAt, bootCodeHash, activeRuns, runner, stopWsForRestart, recordCardThread = () => {} } = ctx;
-  const [rawCmd, ...rest] = text.trim().split(/\s+/);
+  const trimmedInput = String(text || '').trim();
+  const wsIdx = trimmedInput.search(/\s/);
+  const rawCmd = wsIdx === -1 ? trimmedInput : trimmedInput.slice(0, wsIdx);
   const cmd = rawCmd.toLowerCase();
-  const arg = rest.join(' ').trim();
+  const arg = wsIdx === -1 ? '' : trimmedInput.slice(wsIdx + 1).trim();
   const runKey = sessionKey || chatId || openId;
-  const state = loadState();
-  const chatState = getOrCreateChatState(state, runKey, config);
-  const expiryInfo = enforceTempFullExpiry(state, chatState);
-  if (expiryInfo.expired) {
-    saveState(state);
+  let state = loadState();
+  let chatState = getOrCreateChatState(state, runKey, config);
+  let expiryInfo = { expired: false };
+  if (
+    chatState.mode === 'full' &&
+    Number(chatState.fullExpiresAt || 0) > 0 &&
+    Date.now() >= Number(chatState.fullExpiresAt)
+  ) {
+    state = updateState((latest) => {
+      const latestChat = getOrCreateChatState(latest, runKey, config);
+      expiryInfo = enforceTempFullExpiry(latest, latestChat);
+      if (expiryInfo.expired) {
+        latestChat.persistentSession = false;
+      }
+      chatState = latestChat;
+    });
+    if (expiryInfo.expired) {
+      runner?.releasePersistentSession?.(runKey);
+    }
   }
+  const persistChatMutation = (mutator) => {
+    state = updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      mutator(targetChat, latest);
+      chatState = targetChat;
+    });
+  };
   const isRunning = Boolean(runKey && activeRuns.has(runKey));
   const queueLength = runner.getQueueForChat(runKey).length;
   const anyBusy = () => activeRuns.size > 0 || runner.totalQueuedCount() > 0;
@@ -117,6 +156,60 @@ export async function handleSlashCommand(
     await replyCard(client, {
       messageId,
       card: buildAgySkillsCard({ pendingCommand: getActivePendingCommand(chatState) }),
+    });
+    return true;
+  }
+
+  if (!arg && cmd === '/goal') {
+    await replyCard(client, {
+      messageId,
+      card: buildGoalBoardCard({
+        chatState,
+        config,
+        isRunning,
+        telemetry: inspectCommandBoardTelemetry(chatState.conversationId),
+      }),
+    });
+    return true;
+  }
+
+  if (!arg && (cmd === '/swarm' || cmd === '/teamwork')) {
+    await replyCard(client, {
+      messageId,
+      card: buildSwarmBoardCard({
+        chatState,
+        config,
+        isRunning,
+        threadRootId,
+        keepAliveActive: Boolean(runner?.hasPersistentSession?.(runKey)),
+        telemetry: inspectCommandBoardTelemetry(chatState.conversationId),
+      }),
+    });
+    return true;
+  }
+
+  if (!arg && cmd === '/schedule') {
+    await replyCard(client, {
+      messageId,
+      card: buildScheduleBoardCard({
+        chatState,
+        config,
+        isRunning,
+        telemetry: inspectCommandBoardTelemetry(chatState.conversationId),
+      }),
+    });
+    return true;
+  }
+
+  if (!arg && (cmd === '/plan' || cmd === '/grill-me')) {
+    await replyCard(client, {
+      messageId,
+      card: buildPlanBoardCard({
+        chatState,
+        config,
+        isRunning,
+        telemetry: inspectCommandBoardTelemetry(chatState.conversationId),
+      }),
     });
     return true;
   }
@@ -237,7 +330,7 @@ export async function handleSlashCommand(
         '',
         '预计 1~3 秒后自动上线，上线后会推送确认卡片。',
       ].join('\n'),
-      footer: '如长时间未收到上线通知，请在 Mac 终端查看 cli.mjs logs',
+      footer: '如长时间未收到上线通知，请在本机终端查看 cli.mjs logs',
     });
     scheduleDaemonSelfRestart({ delayMs: 700, onBeforeExit: stopWsForRestart });
     return true;
@@ -264,11 +357,13 @@ export async function handleSlashCommand(
   if (cmd === '/dirs') {
     const subArg = arg.trim().toLowerCase();
     if (['-a', 'all', 'hidden', 'show', 'on'].includes(subArg)) {
-      chatState.showHiddenDirs = true;
-      saveState(state);
+      persistChatMutation((c) => {
+        c.showHiddenDirs = true;
+      });
     } else if (['hide', 'off', 'nohidden', 'normal'].includes(subArg)) {
-      chatState.showHiddenDirs = false;
-      saveState(state);
+      persistChatMutation((c) => {
+        c.showHiddenDirs = false;
+      });
     }
     await replyCard(client, {
       messageId,
@@ -309,7 +404,7 @@ export async function handleSlashCommand(
       threadRootId ? `- **所属话题**：\`${threadRootId.slice(0, 12)}\`（独立并行会话）` : '',
       `- **工作目录**：\`${chatState.cwd}\``,
       `- **执行模式**：${modeText}`,
-      `- **单轮超时**：\`${formatTimeoutLabel(config.agy.timeoutSeconds)}\``,
+      `- **单轮超时**：\`${formatTimeoutLabel(resolveEffectiveTimeoutSeconds(chatState, config))}\``,
       `- **当前模型**：\`${chatState.model || 'default (随 CLI 配置)'}\``,
       `- **推理强度**：\`${chatState.effort || config.agy.defaultEffort || 'default (随 CLI 配置)'}\``,
       `- **高危命令审批**：${resolveRiskyApprovalEnabled(config) ? '🛡️ 已开启' : '⚪ 已关闭'}`,
@@ -343,27 +438,29 @@ export async function handleSlashCommand(
   }
 
   if (cmd === '/new') {
-    chatState.conversationId = '';
-    chatState.pendingHandoff = null;
-    chatState.pendingCommand = null;
-    chatState.originDesktopSession = null;
-    chatState.lastTurnArtifacts = null;
-    chatState.topicClosed = false;
-    saveState(state);
-    await replySimple({
-      title: '🆕 已开启新对话',
-      template: 'green',
-      markdown: `下条消息将在 \`${chatState.cwd}\` 下开启全新上下文。`,
-      buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+    runner?.releasePersistentSession?.(runKey);
+    persistChatMutation((c) => {
+      c.conversationId = '';
+      c.persistentSession = false;
+      c.pendingHandoff = null;
+      c.pendingCommand = null;
+      c.originDesktopSession = null;
+      c.lastTurnArtifacts = null;
+      c.topicClosed = false;
+    });
+    await replyCard(client, {
+      messageId,
+      card: buildNewSessionCard({ chatState, config, threadRootId }),
     });
     return true;
   }
 
   if (cmd === '/unlink' || cmd === '/close') {
-    chatState.topicClosed = true;
-    chatState.originDesktopSession = null;
-    chatState.pendingHandoff = null;
-    saveState(state);
+    persistChatMutation((c) => {
+      c.topicClosed = true;
+      c.originDesktopSession = null;
+      c.pendingHandoff = null;
+    });
     await replySimple({
       title: '🔓 已结束当前对话的电脑端自动回流追踪',
       template: 'grey',
@@ -384,10 +481,13 @@ export async function handleSlashCommand(
         });
         return true;
       }
+      updateConfig((c) => {
+        c.notifications.defaultTopicChatId = chatId;
+      });
       config.notifications.defaultTopicChatId = chatId;
-      saveConfig(config);
-      state.lastTopicChatId = chatId;
-      saveState(state);
+      state = updateState((s) => {
+        s.lastTopicChatId = chatId;
+      });
       await replySimple({
         title: '🧵 已绑定默认接管话题群',
         template: 'green',
@@ -396,8 +496,10 @@ export async function handleSlashCommand(
       return true;
     }
     if (sub === 'clear' || sub === 'reset') {
+      updateConfig((c) => {
+        c.notifications.defaultTopicChatId = '';
+      });
       config.notifications.defaultTopicChatId = '';
-      saveConfig(config);
       await replySimple({
         title: '🧹 已清除手动指定的默认话题群',
         template: 'grey',
@@ -461,11 +563,15 @@ export async function handleSlashCommand(
   if (cmd === '/guard' || cmd === '/approval') {
     const sub = arg.trim().toLowerCase();
     if (sub === 'on' || sub === 'enable' || sub === '开') {
+      updateConfig((c) => {
+        c.security.riskyCommandApproval = 'on';
+      });
       config.security.riskyCommandApproval = 'on';
-      saveConfig(config);
     } else if (sub === 'off' || sub === 'disable' || sub === '关') {
+      updateConfig((c) => {
+        c.security.riskyCommandApproval = 'off';
+      });
       config.security.riskyCommandApproval = 'off';
-      saveConfig(config);
     } else if (sub) {
       await replySimple({
         title: '⚠️ /guard 用法提示',
@@ -502,8 +608,9 @@ export async function handleSlashCommand(
     const scope = ['current', 'here', 'local', 'topic', 'this', '本话题', '本窗口', '当前'].includes(sub)
       ? 'current'
       : 'all';
-    chatState.lastSessionsScope = scope;
-    saveState(state);
+    persistChatMutation((c) => {
+      c.lastSessionsScope = scope;
+    });
     await replyCard(client, {
       messageId,
       card: buildSessionsCard(chatState, { state, sessionKey: runKey, scope }),
@@ -560,24 +667,38 @@ export async function handleSlashCommand(
       });
       return true;
     }
-    chatState.conversationId = targetId;
-    chatState.pendingHandoff = null;
-    chatState.pendingCommand = null;
-    chatState.originDesktopSession = null;
-    chatState.lastTurnArtifacts = null;
-    chatState.topicClosed = false;
+    if (!isSafeCliConversationId(targetId)) {
+      await replySimple({
+        title: '❌ 无效会话 ID 格式',
+        template: 'red',
+        markdown: '会话 ID 仅允许字母、数字、`.`、`_`、`-`。',
+        buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+      });
+      return true;
+    }
+    runner?.releasePersistentSession?.(runKey);
     let cwdSynced = '';
     if (matched && matched.sourceKind !== 'current' && matched.cwd) {
       try {
         if (fs.existsSync(matched.cwd) && fs.statSync(matched.cwd).isDirectory()) {
-          chatState.cwd = matched.cwd;
           cwdSynced = matched.cwd;
         }
       } catch {
         // Ignore inaccessible cwd
       }
     }
-    saveState(state);
+    persistChatMutation((c) => {
+      c.conversationId = targetId;
+      c.persistentSession = false;
+      c.pendingHandoff = null;
+      c.pendingCommand = null;
+      c.originDesktopSession = null;
+      c.lastTurnArtifacts = null;
+      c.topicClosed = false;
+      if (cwdSynced) {
+        c.cwd = cwdSynced;
+      }
+    });
     const mdLines = [`当前对话已绑定到 \`${targetId}\`。`];
     if (cwdSynced) {
       mdLines.push(`- **已同步工作目录**：\`${cwdSynced}\``);
@@ -612,11 +733,12 @@ export async function handleSlashCommand(
       directIsDir = false;
     }
     if (directIsDir) {
-      chatState.cwd = targetDir;
-      if (threadRootId && chatId) {
-        getOrCreateChatState(state, chatId, config).cwd = targetDir;
-      }
-      saveState(state);
+      persistChatMutation((c, s) => {
+        c.cwd = targetDir;
+        if (threadRootId && chatId) {
+          getOrCreateChatState(s, chatId, config).cwd = targetDir;
+        }
+      });
       await replySimple({
         title: '📂 已切换工作目录',
         template: 'green',
@@ -631,11 +753,12 @@ export async function handleSlashCommand(
 
     const matches = searchDirsFuzzy(arg, { config, currentCwd: chatState.cwd });
     if (matches.length === 1) {
-      chatState.cwd = matches[0];
-      if (threadRootId && chatId) {
-        getOrCreateChatState(state, chatId, config).cwd = matches[0];
-      }
-      saveState(state);
+      persistChatMutation((c, s) => {
+        c.cwd = matches[0];
+        if (threadRootId && chatId) {
+          getOrCreateChatState(s, chatId, config).cwd = matches[0];
+        }
+      });
       await replySimple({
         title: '📂 已模糊匹配并切换工作目录',
         template: 'green',
@@ -730,8 +853,10 @@ export async function handleSlashCommand(
       nextFavorites = [resolved, ...existing];
       actionLabel = '已收藏到控制面板快捷目录';
     }
+    updateConfig((c) => {
+      c.agy.favoriteDirs = nextFavorites;
+    });
     config.agy.favoriteDirs = nextFavorites;
-    saveConfig(config);
     await replySimple({
       title: '📌 快捷目录已更新',
       template: 'green',
@@ -768,15 +893,18 @@ export async function handleSlashCommand(
       (first === 'full' && tokens[1] && /^\d+(?:m|min)?$/i.test(tokens[1]));
     if (isTempTrigger && (!tokens[1] || /^\d+(?:m|min)?$/i.test(tokens[1]))) {
       const minutes = normalizeTempMinutes(tokens[1], 30);
-      chatState.fullRevertMode =
-        chatState.mode && chatState.mode !== 'full'
-          ? chatState.mode
-          : chatState.fullRevertMode && chatState.fullRevertMode !== 'full'
-            ? chatState.fullRevertMode
-            : 'accept-edits';
-      chatState.mode = 'full';
-      chatState.fullExpiresAt = Date.now() + minutes * 60_000;
-      saveState(state);
+      runner?.releasePersistentSession?.(runKey);
+      persistChatMutation((c) => {
+        c.fullRevertMode =
+          c.mode && c.mode !== 'full'
+            ? c.mode
+            : c.fullRevertMode && c.fullRevertMode !== 'full'
+              ? c.fullRevertMode
+              : 'accept-edits';
+        c.mode = 'full';
+        c.fullExpiresAt = Date.now() + minutes * 60_000;
+        c.persistentSession = false;
+      });
       await replySimple({
         title: '⚡ 已开启临时全权限',
         template: 'orange',
@@ -798,9 +926,12 @@ export async function handleSlashCommand(
       });
       return true;
     }
-    chatState.mode = first;
-    chatState.fullExpiresAt = 0;
-    saveState(state);
+    runner?.releasePersistentSession?.(runKey);
+    persistChatMutation((c) => {
+      c.mode = first;
+      c.fullExpiresAt = 0;
+      c.persistentSession = false;
+    });
     await replySimple({
       title: '🛡️ 已切换执行模式',
       template: 'green',
@@ -816,7 +947,7 @@ export async function handleSlashCommand(
         title: '⏱️ 单轮任务超时设置',
         template: 'blue',
         markdown: [
-          `- **当前超时**：\`${formatTimeoutLabel(config.agy.timeoutSeconds)}\``,
+          `- **当前超时**：\`${formatTimeoutLabel(resolveEffectiveTimeoutSeconds(chatState, config))}\``,
           '',
           '**调整用法（下条任务起实时生效）：**',
           '- `/timeout 60`（或 `/timeout 120m`）：设为 60 / 120 分钟',
@@ -839,8 +970,10 @@ export async function handleSlashCommand(
       return true;
     }
 
+    updateConfig((c) => {
+      c.agy.timeoutSeconds = seconds;
+    });
     config.agy.timeoutSeconds = seconds;
-    saveConfig(config);
     await replySimple({
       title: '⏱️ 已更新单轮超时设置',
       template: 'green',
@@ -866,8 +999,9 @@ export async function handleSlashCommand(
     }
     const normalized = arg.trim().toLowerCase();
     if (normalized === 'default' || normalized === 'auto' || normalized === 'reset' || normalized === 'off') {
-      chatState.effort = '';
-      saveState(state);
+      persistChatMutation((c) => {
+        c.effort = '';
+      });
       await replySimple({
         title: '🎛️ 已切换推理强度',
         template: 'green',
@@ -885,8 +1019,9 @@ export async function handleSlashCommand(
       });
       return true;
     }
-    chatState.effort = normalized;
-    saveState(state);
+    persistChatMutation((c) => {
+      c.effort = normalized;
+    });
     await replySimple({
       title: '🎛️ 已切换推理强度',
       template: 'green',
@@ -898,16 +1033,22 @@ export async function handleSlashCommand(
 
   if (cmd === '/notify' || cmd === '/mute' || cmd === '/unmute') {
     if (cmd === '/mute') {
+      updateConfig((c) => {
+        c.notifications.stopNotifyMode = 'off';
+        c.notifications.stopHookEnabled = false;
+      });
       config.notifications.stopNotifyMode = 'off';
       config.notifications.stopHookEnabled = false;
-      saveConfig(config);
       await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
       return true;
     }
     if (cmd === '/unmute') {
+      updateConfig((c) => {
+        c.notifications.stopNotifyMode = 'on';
+        c.notifications.stopHookEnabled = true;
+      });
       config.notifications.stopNotifyMode = 'on';
       config.notifications.stopHookEnabled = true;
-      saveConfig(config);
       await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
       return true;
     }
@@ -918,20 +1059,27 @@ export async function handleSlashCommand(
     const parts = arg.trim().toLowerCase().split(/\s+/);
     const modeArg = parts[0];
     if (modeArg === 'on' || modeArg === 'always' || modeArg === '开') {
+      updateConfig((c) => {
+        c.notifications.stopNotifyMode = 'on';
+        c.notifications.stopHookEnabled = true;
+      });
       config.notifications.stopNotifyMode = 'on';
       config.notifications.stopHookEnabled = true;
-      saveConfig(config);
       await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
       return true;
     }
     if (modeArg === 'off' || modeArg === 'mute' || modeArg === '关') {
+      updateConfig((c) => {
+        c.notifications.stopNotifyMode = 'off';
+        c.notifications.stopHookEnabled = false;
+      });
       config.notifications.stopNotifyMode = 'off';
       config.notifications.stopHookEnabled = false;
-      saveConfig(config);
       await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
       return true;
     }
     if (modeArg === 'away' || modeArg === 'auto' || modeArg === '离开') {
+      let nextAway = config.notifications.awayIdleSeconds;
       if (parts[1]) {
         const minRaw = parts[1].replace(/m(?:in)?$/i, '');
         const minNum = Number(minRaw);
@@ -943,11 +1091,16 @@ export async function handleSlashCommand(
           });
           return true;
         }
-        config.notifications.awayIdleSeconds = Math.max(30, Math.round(minNum * 60));
+        nextAway = Math.max(30, Math.round(minNum * 60));
       }
+      updateConfig((c) => {
+        c.notifications.awayIdleSeconds = nextAway;
+        c.notifications.stopNotifyMode = 'away';
+        c.notifications.stopHookEnabled = true;
+      });
+      config.notifications.awayIdleSeconds = nextAway;
       config.notifications.stopNotifyMode = 'away';
       config.notifications.stopHookEnabled = true;
-      saveConfig(config);
       await replyCard(client, { messageId, card: buildNotifyCard({ config }) });
       return true;
     }
@@ -1033,7 +1186,7 @@ export async function handleSlashCommand(
           title: isCreate ? left : '',
           documentId: isWrite ? left : '',
           markdown: right,
-          grantOpenId: openId || config.notifications.defaultReceiveId || config.security.allowedOpenIds?.[0] || '',
+          grantOpenId: resolveOwnerOpenId(config, openId),
           domain: config.feishu.domain,
         });
         const lines = [
@@ -1222,8 +1375,18 @@ export async function handleSlashCommand(
       });
       return true;
     }
-    chatState.model = arg === 'default' ? '' : arg;
-    saveState(state);
+    if (arg !== 'default' && !isValidModelName(arg)) {
+      await replySimple({
+        title: '❌ 无效模型名称',
+        template: 'red',
+        markdown: '模型名称仅允许字母、数字及 `. _ : / @ + -` 字符。',
+        buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+      });
+      return true;
+    }
+    persistChatMutation((c) => {
+      c.model = arg === 'default' ? '' : arg;
+    });
     await replySimple({
       title: '🧠 已更新模型设置',
       template: 'green',
@@ -1255,8 +1418,9 @@ export async function handleSlashCommand(
     if (!running) {
       const activePending = getActivePendingCommand(chatState);
       if (activePending) {
-        chatState.pendingCommand = null;
-        saveState(state);
+        persistChatMutation((c) => {
+          c.pendingCommand = null;
+        });
         await replySimple({
           title: '✅ 已取消预选命令',
           template: 'green',

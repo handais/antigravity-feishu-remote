@@ -1,7 +1,12 @@
 import path from 'node:path';
-import { loadState, saveState } from './config.mjs';
+import { updateState } from './config.mjs';
 import { buildCard, chunkButtons, replyCard } from './feishu-api.mjs';
 import { runAgyTurn } from './agy-runner.mjs';
+import {
+  ASYNC_ORCHESTRATION_TOOLS,
+  createAgySessionPool,
+  isAsyncWorkflowPrompt,
+} from './agy-session-pool.mjs';
 import {
   addMessageReaction,
   createStreamingCardSession,
@@ -12,9 +17,15 @@ import {
   getOrCreateChatState,
   makeSessionKey,
   recordRecentConversation,
+  resolveEffectiveTimeoutSeconds,
   sendCardToTarget,
 } from './bridge-helpers.mjs';
 import { checkOriginDesktopDrift } from './mobile-handoff.mjs';
+import {
+  detectTurnCommandBoard,
+  hasAsyncSessionActivity,
+  hasRunningChildSubagents,
+} from './command-boards.mjs';
 
 const FILE_MODIFY_TOOL_RE = /^(?:write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content|create_file|apply_patch|notebook_edit)$/i;
 
@@ -70,7 +81,10 @@ export function formatToolStatusMarkdown({
     lines.push('', '**执行步骤：**');
     for (const entry of toolEntries.slice(-6)) {
       const icon = entry.done ? '✅' : '🔧';
-      const detail = entry.summary ? ` \`${entry.summary}\`` : '';
+      const safeSummary = entry.summary
+        ? String(entry.summary).replace(/\s+/g, ' ').replace(/`/g, "'").trim()
+        : '';
+      const detail = safeSummary ? ` \`${safeSummary}\`` : '';
       const dur = entry.done
         ? ` (${entry.durationSeconds ? `${entry.durationSeconds.toFixed(1)}s` : 'done'})`
         : '...';
@@ -139,7 +153,193 @@ export function createTaskRunner({
   chatQueues,
   lastTaskByChat,
   recordCardThread = () => {},
+  sessionPool: providedPool = null,
 }) {
+  const sessionPool = providedPool || createAgySessionPool();
+  const asyncStreamStates = new Map();
+
+  const handleAsyncSessionEvent = ({ type, runKey, entry, evt, result }) => {
+    let stateEntry = asyncStreamStates.get(runKey);
+    if (!stateEntry) {
+      stateEntry = {
+        chain: Promise.resolve(),
+        session: null,
+        toolEntries: [],
+        liveText: '',
+        lastTextStepIndex: null,
+        startedAt: Date.now(),
+      };
+      asyncStreamStates.set(runKey, stateEntry);
+    }
+
+    const meta = entry?.meta || {};
+    const cfg = meta.config || {};
+    const chatId = meta.chatId || '';
+    const openId = meta.openId || '';
+    const threadRootId = meta.threadRootId || '';
+    const replyInThread = Boolean(meta.replyInThread && threadRootId);
+
+    stateEntry.chain = stateEntry.chain.then(async () => {
+      const refreshAsyncStatus = () => {
+        if (!stateEntry.session) return;
+        stateEntry.session.updateStatus(
+          formatToolStatusMarkdown({
+            cwd: entry?.signature?.cwd || process.cwd(),
+            mode: entry?.signature?.mode || 'accept-edits',
+            effort: entry?.signature?.effort || '',
+            attachmentNote: '🔔 来自后台子代理 / 定时器的异步回信',
+            toolEntries: stateEntry.toolEntries,
+          }),
+        );
+      };
+
+      if (type === 'start') {
+        stateEntry.toolEntries = [];
+        stateEntry.liveText = '';
+        stateEntry.lastTextStepIndex = null;
+        stateEntry.startedAt = Date.now();
+        stateEntry.session = await createStreamingCardSession(client, {
+          replyTargetMessageId: threadRootId,
+          replyInThread,
+          chatId,
+          openId,
+          title: '🔔 后台协作 / 定时任务有新进展',
+          template: 'wathet',
+          initialStatus: formatToolStatusMarkdown({
+            cwd: entry?.signature?.cwd || process.cwd(),
+            mode: entry?.signature?.mode || 'accept-edits',
+            effort: entry?.signature?.effort || '',
+            attachmentNote: '🔔 来自后台子代理 / 定时器的异步回信',
+            toolEntries: [],
+          }),
+          initialStream: '_正在整理异步进展..._',
+          footer: '🟢 后台保活监听中',
+          stopButton: false,
+        });
+        if (threadRootId && stateEntry.session?.replyMessageId) {
+          recordCardThread(stateEntry.session.replyMessageId, {
+            sessionKey: runKey,
+            threadRootId,
+            chatId,
+          });
+        }
+      }
+
+      if (type === 'start' || type === 'event') {
+        if (!evt) return;
+        if (evt.kind === 'tool_start') {
+          stateEntry.toolEntries.push({
+            stepIndex: evt.stepIndex,
+            toolName: evt.toolName,
+            summary: evt.summary || '',
+            done: false,
+            durationSeconds: null,
+          });
+          refreshAsyncStatus();
+        } else if (evt.kind === 'tool_done') {
+          const target = [...stateEntry.toolEntries].reverse().find(
+            (e) => !e.done && (e.stepIndex === evt.stepIndex || e.toolName === evt.toolName),
+          );
+          if (target) {
+            target.done = true;
+            target.durationSeconds = evt.durationSeconds ?? null;
+          }
+          refreshAsyncStatus();
+        } else if (evt.kind === 'text_delta') {
+          if (
+            stateEntry.lastTextStepIndex !== null &&
+            evt.stepIndex !== stateEntry.lastTextStepIndex &&
+            stateEntry.liveText.trim() &&
+            !stateEntry.liveText.endsWith('\n')
+          ) {
+            stateEntry.liveText += '\n\n';
+          }
+          stateEntry.lastTextStepIndex = evt.stepIndex;
+          stateEntry.liveText += evt.textDelta;
+          stateEntry.session?.updateStream(stateEntry.liveText);
+        }
+        return;
+      }
+
+      if (type === 'result' && result) {
+        const isFailed = result.status !== 'SUCCESS' && result.exitCode !== 0;
+        const convId = result.conversationId || entry?.conversationId || '';
+        const stillRunningBackground = !isFailed && Boolean(convId && hasRunningChildSubagents(convId));
+        const body = isFailed
+          ? (result.response ? `${result.response}\n\n---\n**错误信息：**\n\`\`\`\n${result.stderr || result.finishedReason || `exit code ${result.exitCode}`}\n\`\`\`` : `\`\`\`\n${result.stderr || result.finishedReason || `exit code ${result.exitCode}`}\n\`\`\``)
+          : (result.response || stateEntry.liveText.trim() || '_（后台协作唤醒完成，无附加文本输出）_');
+        const elapsedSec = ((Date.now() - stateEntry.startedAt) / 1000).toFixed(1);
+        const isParked = sessionPool.has(runKey);
+        const footerParts = [`耗时 ${elapsedSec}s`];
+        if (result.toolsUsed?.length > 0) footerParts.push(`工具 ${result.toolsUsed.length} 次`);
+        const usageText = formatUsageSummary(result.usage);
+        if (usageText) footerParts.push(usageText);
+        if (isParked) footerParts.push('🟢 后台保活中');
+        if (result.conversationId) footerParts.push(`会话 ${result.conversationId.slice(0, 8)}`);
+
+        const buttons = [
+          { label: '🐝 Swarm 看板', value: { cmd: 'cmd_board', board: 'swarm' } },
+          ...(isParked ? [{ label: '🔌 释放保活', value: { cmd: 'stop_keepalive' } }] : []),
+          { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
+        ];
+        const cardTitle = isFailed
+          ? '❌ 后台协作异常'
+          : stillRunningBackground
+            ? '🔄 后台协作新进展（进行中）'
+            : '✅ 后台协作新进展（已完成）';
+        const cardTemplate = isFailed ? 'red' : stillRunningBackground ? 'wathet' : 'green';
+        let sentIds = [];
+        if (stateEntry.session) {
+          sentIds = await stateEntry.session.finish({
+            title: cardTitle,
+            template: cardTemplate,
+            markdown: body,
+            footer: footerParts.join(' · '),
+            buttonRows: chunkButtons(buttons, 3),
+            chatId,
+            openId,
+            replyTargetMessageId: threadRootId,
+            replyInThread,
+          });
+          if (threadRootId && Array.isArray(sentIds)) {
+            for (const msgId of sentIds) {
+              if (msgId) {
+                recordCardThread(msgId, { sessionKey: runKey, threadRootId, chatId });
+              }
+            }
+          }
+        }
+        const latestMeta = sessionPool.getMeta(runKey);
+        const pendingUserMessageId = String(latestMeta.pendingUserMessageId || meta.pendingUserMessageId || '');
+        const pendingReactionId = String(latestMeta.pendingReactionId || meta.pendingReactionId || '');
+        if (isFailed) {
+          if (pendingUserMessageId && pendingReactionId) {
+            void removeMessageReaction(client, { messageId: pendingUserMessageId, reactionId: pendingReactionId });
+          }
+          sessionPool.updateMeta(runKey, { pendingUserMessageId: '', pendingReactionId: '' });
+        } else if (!stillRunningBackground) {
+          if (pendingUserMessageId) {
+            sessionPool.updateMeta(runKey, { pendingUserMessageId: '', pendingReactionId: '' });
+            if (pendingReactionId) {
+              await removeMessageReaction(client, { messageId: pendingUserMessageId, reactionId: pendingReactionId });
+            }
+            void addMessageReaction(client, { messageId: pendingUserMessageId, emojiType: 'DONE' });
+          } else if (Array.isArray(sentIds) && sentIds.length > 0) {
+            void addMessageReaction(client, { messageId: sentIds.at(-1), emojiType: 'DONE' });
+          }
+        }
+        asyncStreamStates.delete(runKey);
+      }
+    }).catch((err) => {
+      console.error('[feishu-remote] async stream card error:', err);
+      if (type === 'result') {
+        asyncStreamStates.delete(runKey);
+      }
+    });
+  };
+
+  sessionPool.setOnAsyncEvent(handleAsyncSessionEvent);
+
   const getQueueForChat = (runKey) => {
     if (!runKey) return [];
     return chatQueues.get(runKey) || [];
@@ -227,12 +427,21 @@ export function createTaskRunner({
     let streamSession = null;
 
     try {
-      const state = loadState();
-      chatState = getOrCreateChatState(state, runKey, config);
-      enforceTempFullExpiry(state, chatState);
+      let expiredTempFull = false;
+      updateState((state) => {
+        const latestChat = getOrCreateChatState(state, runKey, config);
+        const exp = enforceTempFullExpiry(state, latestChat);
+        if (exp.expired) {
+          latestChat.persistentSession = false;
+          expiredTempFull = true;
+        }
+        chatState = { ...latestChat };
+      });
+      if (expiredTempFull) {
+        sessionPool.release(runKey, { immediate: true });
+      }
       const pendingHandoff = chatState.pendingHandoff || null;
       const hadConversationId = Boolean(chatState.conversationId);
-      saveState(state);
 
       const promptToRun = resolvePromptWithHandoff(text, pendingHandoff);
 
@@ -275,6 +484,13 @@ export function createTaskRunner({
         toolEntries,
       });
 
+      const usePersistent = Boolean(
+        sessionPool.has(runKey) ||
+        chatState.persistentSession ||
+        isAsyncWorkflowPrompt(text) ||
+        hasAsyncSessionActivity(chatState.conversationId),
+      );
+
       streamSession = await createStreamingCardSession(client, {
         messageId,
         replyTargetMessageId: replyTarget,
@@ -287,6 +503,9 @@ export function createTaskRunner({
         initialStream: '_正在等待模型响应..._',
         footer: '点下方按钮或发送 /stop 可中止',
         stopButton: true,
+        extraButtons: usePersistent
+          ? [{ label: '🐝 看团队进度', value: { cmd: 'cmd_board', board: 'swarm' } }]
+          : [],
       });
       if (threadRootId && streamSession.replyMessageId) {
         recordCardThread(streamSession.replyMessageId, {
@@ -315,82 +534,115 @@ export function createTaskRunner({
         );
       };
 
-      const executeAttempt = (effortValue) =>
-        runAgyTurn({
+      const bridgeMeta = {
+        chatId,
+        openId,
+        sessionKey: runKey,
+        threadRootId,
+        mode: chatState.mode,
+      };
+      const handleTurnEvent = (evt) => {
+        if (evt.kind === 'tool_start') {
+          const modifiedPath = extractModifiedFilePath(evt.toolName, evt.parameters, chatState.cwd);
+          if (modifiedPath) {
+            modifiedFilesSet.add(modifiedPath);
+          }
+          toolEntries.push({
+            stepIndex: evt.stepIndex,
+            toolName: evt.toolName,
+            summary: evt.summary || '',
+            done: false,
+            durationSeconds: null,
+          });
+          refreshStatus();
+        } else if (evt.kind === 'tool_done') {
+          let target = null;
+          for (let i = toolEntries.length - 1; i >= 0; i -= 1) {
+            const candidate = toolEntries[i];
+            if (candidate.stepIndex === evt.stepIndex && !candidate.done) {
+              target = candidate;
+              break;
+            }
+          }
+          if (!target) {
+            for (let i = toolEntries.length - 1; i >= 0; i -= 1) {
+              if (!toolEntries[i].done && toolEntries[i].toolName === evt.toolName) {
+                target = toolEntries[i];
+                break;
+              }
+            }
+          }
+          if (target) {
+            target.done = true;
+            target.durationSeconds = evt.durationSeconds ?? null;
+          } else {
+            toolEntries.push({
+              stepIndex: evt.stepIndex,
+              toolName: evt.toolName,
+              summary: '',
+              done: true,
+              durationSeconds: evt.durationSeconds ?? null,
+            });
+          }
+          refreshStatus();
+        } else if (evt.kind === 'text_delta') {
+          if (
+            lastTextStepIndex !== null &&
+            evt.stepIndex !== lastTextStepIndex &&
+            liveText.trim() &&
+            !liveText.endsWith('\n')
+          ) {
+            liveText += '\n\n';
+          }
+          lastTextStepIndex = evt.stepIndex;
+          liveText += evt.textDelta;
+          streamSession.updateStream(liveText);
+        }
+      };
+
+      const effectiveTimeoutSeconds = resolveEffectiveTimeoutSeconds(chatState, config);
+      const effectiveConfig = effectiveTimeoutSeconds === (config?.agy?.timeoutSeconds ?? 3600)
+        ? config
+        : { ...config, agy: { ...(config?.agy || {}), timeoutSeconds: effectiveTimeoutSeconds } };
+
+      const executeAttempt = (effortValue) => {
+        if (usePersistent) {
+          return sessionPool.runTurn({
+            runKey,
+            prompt: promptToRun,
+            cwd: chatState.cwd,
+            conversationId: chatState.conversationId,
+            mode: chatState.mode,
+            model: chatState.model,
+            effort: effortValue,
+            timeoutSeconds: effectiveTimeoutSeconds,
+            config: effectiveConfig,
+            bridgeMeta,
+            meta: {
+              chatId,
+              openId,
+              sessionKey: runKey,
+              threadRootId,
+              replyInThread,
+              config: effectiveConfig,
+            },
+            signal: controller.signal,
+            onEvent: handleTurnEvent,
+          });
+        }
+        return runAgyTurn({
           prompt: promptToRun,
           cwd: chatState.cwd,
           conversationId: chatState.conversationId,
           mode: chatState.mode,
           model: chatState.model,
           effort: effortValue,
-          config,
-          bridgeMeta: {
-            chatId,
-            openId,
-            sessionKey: runKey,
-            threadRootId,
-            mode: chatState.mode,
-          },
+          config: effectiveConfig,
+          bridgeMeta,
           signal: controller.signal,
-          onEvent: (evt) => {
-            if (evt.kind === 'tool_start') {
-              const modifiedPath = extractModifiedFilePath(evt.toolName, evt.parameters, chatState.cwd);
-              if (modifiedPath) {
-                modifiedFilesSet.add(modifiedPath);
-              }
-              toolEntries.push({
-                stepIndex: evt.stepIndex,
-                toolName: evt.toolName,
-                summary: evt.summary || '',
-                done: false,
-                durationSeconds: null,
-              });
-              refreshStatus();
-            } else if (evt.kind === 'tool_done') {
-              let target = null;
-              for (let i = toolEntries.length - 1; i >= 0; i -= 1) {
-                const candidate = toolEntries[i];
-                if (candidate.stepIndex === evt.stepIndex && !candidate.done) {
-                  target = candidate;
-                  break;
-                }
-              }
-              if (!target) {
-                for (let i = toolEntries.length - 1; i >= 0; i -= 1) {
-                  if (!toolEntries[i].done && toolEntries[i].toolName === evt.toolName) {
-                    target = toolEntries[i];
-                    break;
-                  }
-                }
-              }
-              if (target) {
-                target.done = true;
-                target.durationSeconds = evt.durationSeconds ?? null;
-              } else {
-                toolEntries.push({
-                  stepIndex: evt.stepIndex,
-                  toolName: evt.toolName,
-                  summary: '',
-                  done: true,
-                  durationSeconds: evt.durationSeconds ?? null,
-                });
-              }
-              refreshStatus();
-            } else if (evt.kind === 'text_delta') {
-              if (
-                lastTextStepIndex !== null &&
-                evt.stepIndex !== lastTextStepIndex &&
-                liveText.trim() &&
-                !liveText.endsWith('\n')
-              ) {
-                liveText += '\n\n';
-              }
-              lastTextStepIndex = evt.stepIndex;
-              liveText += evt.textDelta;
-              streamSession.updateStream(liveText);
-            }
-          },
+          onEvent: handleTurnEvent,
         });
+      };
 
       let result = await executeAttempt(actualEffort);
       const attemptErrText = `${result.stderr || ''}\n${result.finishedReason || ''}\n${result.response || ''}`;
@@ -425,55 +677,54 @@ export function createTaskRunner({
         }
       }
 
-      const freshState = loadState();
-      const freshChat = getOrCreateChatState(freshState, runKey, config);
       const modifiedFiles = [...modifiedFilesSet].slice(0, 12);
-      let stateDirty = false;
-      if (pendingHandoff && shouldClearPendingHandoff({ hadConversationId, result })) {
-        freshChat.pendingHandoff = null;
-        stateDirty = true;
-      }
-      if (result.conversationId) {
-        freshChat.conversationId = result.conversationId;
-        recordRecentConversation(freshChat, result.conversationId, summaryText, {
-          cwd: freshChat.cwd,
-          originDesktopId: freshChat.originDesktopSession?.id || '',
-          originDesktopTitle: freshChat.originDesktopSession?.title || '',
-        });
-        stateDirty = true;
-      }
-      if (modifiedFiles.length > 0) {
-        freshChat.lastTurnArtifacts = {
-          conversationId: result.conversationId || freshChat.conversationId || '',
-          cwd: freshChat.cwd,
-          files: modifiedFiles,
-          updatedAt: Date.now(),
-        };
-        stateDirty = true;
-      }
-
-      const drift = freshChat.originDesktopSession?.id
-        ? checkOriginDesktopDrift(freshChat.originDesktopSession)
+      const driftPreview = chatState.originDesktopSession?.id
+        ? checkOriginDesktopDrift(chatState.originDesktopSession)
         : { drifted: false, running: false, detail: null, newSteps: 0 };
+      const usedAsyncTools = Array.isArray(result.toolsUsed) &&
+        result.toolsUsed.some((t) => ASYNC_ORCHESTRATION_TOOLS.has(String(t || '').toLowerCase()));
 
-      if (drift.drifted && drift.detail) {
-        freshChat.originDesktopSession.lastNotifiedModifiedMs = Math.max(
-          Number(freshChat.originDesktopSession.lastNotifiedModifiedMs || 0),
-          Number(drift.detail.lastModifiedMs || 0),
-        );
-        freshChat.originDesktopSession.lastNotifiedStepCount = Math.max(
-          Number(freshChat.originDesktopSession.lastNotifiedStepCount || 0),
-          Number(drift.detail.stepCount || 0),
-        );
-        stateDirty = true;
-      }
-      if (stateDirty) {
-        saveState(freshState);
-      }
+      let freshChat = { ...chatState };
+      updateState((freshState) => {
+        const target = getOrCreateChatState(freshState, runKey, config);
+        if (pendingHandoff && shouldClearPendingHandoff({ hadConversationId, result })) {
+          target.pendingHandoff = null;
+        }
+        if (result.conversationId) {
+          target.conversationId = result.conversationId;
+          recordRecentConversation(target, result.conversationId, summaryText, {
+            cwd: target.cwd,
+            originDesktopId: target.originDesktopSession?.id || '',
+            originDesktopTitle: target.originDesktopSession?.title || '',
+          });
+        }
+        if (modifiedFiles.length > 0) {
+          target.lastTurnArtifacts = {
+            conversationId: result.conversationId || target.conversationId || '',
+            cwd: target.cwd,
+            files: modifiedFiles,
+            updatedAt: Date.now(),
+          };
+        }
+        if (driftPreview.drifted && driftPreview.detail && target.originDesktopSession) {
+          target.originDesktopSession.lastNotifiedModifiedMs = Math.max(
+            Number(target.originDesktopSession.lastNotifiedModifiedMs || 0),
+            Number(driftPreview.detail.lastModifiedMs || 0),
+          );
+          target.originDesktopSession.lastNotifiedStepCount = Math.max(
+            Number(target.originDesktopSession.lastNotifiedStepCount || 0),
+            Number(driftPreview.detail.stepCount || 0),
+          );
+        }
+        if ((usedAsyncTools || isAsyncWorkflowPrompt(text)) && !target.persistentSession) {
+          target.persistentSession = true;
+        }
+        freshChat = { ...target };
+      });
+      const drift = driftPreview;
 
-      const totalSec = result.durationSeconds !== null
-        ? result.durationSeconds.toFixed(1)
-        : ((Date.now() - runStartedAt) / 1000).toFixed(1);
+      const isParkedAlive = sessionPool.has(runKey);
+      const totalSec = Math.max(0, (Date.now() - runStartedAt) / 1000).toFixed(1);
       const shortConv = result.conversationId ? result.conversationId.slice(0, 8) : '-';
       const workspaceName = path.basename(freshChat.cwd) || freshChat.cwd;
       const footerParts = [`耗时 ${totalSec}s`];
@@ -489,6 +740,9 @@ export function createTaskRunner({
         footerParts.push(`强度 ${actualEffort}`);
       } else if (effortFallbackUsed) {
         footerParts.push('强度 default(不支持已自动回退)');
+      }
+      if (isParkedAlive && !result.aborted) {
+        footerParts.push('🟢 后台保活中');
       }
       footerParts.push(`目录 ${workspaceName}`, `会话 ${shortConv}`);
 
@@ -510,6 +764,17 @@ export function createTaskRunner({
         body = result.response ? `${result.response}\n\n---\n**错误信息：**\n\`\`\`\n${errDetail}\n\`\`\`` : `\`\`\`\n${errDetail}\n\`\`\``;
       } else if (!body) {
         body = '_（本次执行没有输出文本回复）_';
+      } else if (isParkedAlive && usedAsyncTools) {
+        const usedSubagentTools = result.toolsUsed.some((t) =>
+          ['send_message', 'invoke_subagent', 'swarm', 'run_workflow'].includes(String(t || '').toLowerCase()),
+        );
+        if (usedSubagentTools) {
+          title = '⏳ 已派发后台协作（保活等待中）';
+          template = 'wathet';
+        } else if (result.toolsUsed.some((t) => String(t || '').toLowerCase() === 'schedule')) {
+          title = '⏰ 定时任务已就绪（保活中）';
+          template = 'wathet';
+        }
       }
 
       if (drift.drifted) {
@@ -517,7 +782,21 @@ export function createTaskRunner({
         body += `\n\n---\n> ⚠️ 检测到原电脑端对话在你接管后有新进展${stepNote}，可点击下方「🔄 同步电脑进展」增量同步。`;
       }
 
+      const turnBoard = !result.aborted && !isFailed
+        ? detectTurnCommandBoard(text, result.toolsUsed)
+        : { kind: '' };
+
       const buttons = [
+        ...(turnBoard.kind === 'plan'
+          ? [
+              { label: '✅ 按计划执行', type: 'primary', value: { cmd: 'plan_decision', decision: 'approve' } },
+              { label: '🧭 Plan 看板', value: { cmd: 'cmd_board', board: 'plan' } },
+            ]
+          : []),
+        ...(turnBoard.kind === 'goal' ? [{ label: '🎯 Goal 看板', value: { cmd: 'cmd_board', board: 'goal' } }] : []),
+        ...(turnBoard.kind === 'swarm' ? [{ label: '🐝 Swarm 看板', value: { cmd: 'cmd_board', board: 'swarm' } }] : []),
+        ...(turnBoard.kind === 'schedule' ? [{ label: '⏰ 定时看板', value: { cmd: 'cmd_board', board: 'schedule' } }] : []),
+        ...(isParkedAlive && !result.aborted ? [{ label: '🔌 释放保活', value: { cmd: 'stop_keepalive' } }] : []),
         ...(isFailed ? [{ label: '🔄 重试', type: 'primary', value: { cmd: 'retry' } }] : []),
         ...(!result.aborted && modifiedFiles.length > 0
           ? [
@@ -535,6 +814,39 @@ export function createTaskRunner({
         { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
         { label: '🗂️ 最近会话', value: { cmd: 'sessions' } },
       ];
+
+      const finalConvId = result.conversationId || freshChat.conversationId || '';
+      const isWaitingOnBackground = Boolean(
+        isParkedAlive &&
+        !result.aborted &&
+        !isFailed &&
+        (usedAsyncTools || (isAsyncWorkflowPrompt(text) && hasRunningChildSubagents(finalConvId))),
+      );
+
+      if (messageId && isWaitingOnBackground) {
+        const prevMeta = sessionPool.getMeta(runKey);
+        if (prevMeta?.pendingUserMessageId && prevMeta?.pendingReactionId && prevMeta.pendingUserMessageId !== messageId) {
+          void removeMessageReaction(client, {
+            messageId: prevMeta.pendingUserMessageId,
+            reactionId: prevMeta.pendingReactionId,
+          });
+        }
+        // Record pendingUserMessageId before asyncCard finish() resolves so fast async wakeups can still swap Typing -> DONE
+        sessionPool.updateMeta(runKey, {
+          pendingUserMessageId: messageId,
+          pendingReactionId: '',
+        });
+        const typingReactionId = await addMessageReaction(client, {
+          messageId,
+          emojiType: 'Typing',
+        });
+        if (typingReactionId && sessionPool.getMeta(runKey)?.pendingUserMessageId === messageId) {
+          sessionPool.updateMeta(runKey, {
+            pendingUserMessageId: messageId,
+            pendingReactionId: typingReactionId,
+          });
+        }
+      }
 
       try {
         const sentIds = await streamSession.finish({
@@ -559,7 +871,7 @@ export function createTaskRunner({
         console.error('[feishu-remote] streamSession.finish error after turn completed:', finishErr);
       }
 
-      if (messageId && !result.aborted && !isFailed) {
+      if (messageId && !result.aborted && !isFailed && !isWaitingOnBackground) {
         void addMessageReaction(client, {
           messageId,
           emojiType: 'DONE',
@@ -730,6 +1042,9 @@ export function createTaskRunner({
   };
 
   return {
+    sessionPool,
+    hasPersistentSession: (runKey) => sessionPool.has(runKey),
+    releasePersistentSession: (runKey) => sessionPool.release(runKey),
     getQueueForChat,
     totalQueuedCount,
     enqueueOrExecutePrompt,

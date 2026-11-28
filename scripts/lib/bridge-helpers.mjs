@@ -219,6 +219,18 @@ export function formatUptime(ms) {
   return `${h}h ${m}m ${s}s`;
 }
 
+export function resolveEffectiveTimeoutSeconds(chatState, config) {
+  const perChat = chatState?.timeoutSeconds;
+  if (perChat !== undefined && perChat !== null && Number.isFinite(Number(perChat)) && Number(perChat) >= 0) {
+    return Math.floor(Number(perChat));
+  }
+  const globalVal = config?.agy?.timeoutSeconds;
+  if (globalVal !== undefined && globalVal !== null && Number.isFinite(Number(globalVal)) && Number(globalVal) >= 0) {
+    return Math.floor(Number(globalVal));
+  }
+  return 3600;
+}
+
 export function formatTimeoutLabel(sec) {
   const n = Number(sec);
   if (!n || n <= 0) return '不限时';
@@ -580,7 +592,7 @@ export async function collectTurnDiffAsync(cwd, files = [], { maxChars = 4200 } 
 
 export function formatHelpMarkdown() {
   return [
-    '直接发送任务描述（支持截图/文件/语音、引用历史消息回复、直接贴飞书文档/知识库链接）即可在 Mac 本机执行。',
+    '直接发送任务描述（支持截图/文件/语音、引用历史消息回复、直接贴飞书文档/知识库链接）即可在本机执行。',
     '',
     '**常用控制指令：**',
     '- `/panel`（或 `/menu`）：打开控制面板（支持一键切换目录/模式/模型/强度、临时全权、Git、权限自检）',

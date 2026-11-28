@@ -1,8 +1,8 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureConfigDir, getApprovalsDir } from './config.mjs';
-import { writePrivateJsonAtomic } from './io-utils.mjs';
+import { ensureConfigDir, getApprovalsDir, getConfigDir } from './config.mjs';
+import { expandHomePath, writePrivateJsonAtomic } from './io-utils.mjs';
 import { buildCard, sanitizeForFeishuMarkdown } from './feishu-api.mjs';
 
 const APPROVAL_ID_RE = /^apr-[a-z0-9-]+$/i;
@@ -12,8 +12,8 @@ const RISKY_COMMAND_RULES = [
   {
     rule: 'recursive-delete',
     level: 'critical',
-    summary: '递归强制删除文件/目录 (rm -rf / rm -r / find -delete / Remove-Item -Recurse)',
-    pattern: /(?:^|[;&|(`]\s*)(?:(?:(?:\/(?:usr\/)?bin\/)|(?:command|env)\s+)?rm\s+(?:[^\n]*\s)?(?:-[^\s]*r[^\s]*f|-[^\s]*f[^\s]*r|--recursive\b|-r\b[^\n]*\s-f\b|-f\b[^\n]*\s-r\b|-[^\s]*[rR](?:\s|$))|rmdir\s+\/s\b|remove-item\b[^\n]*-recurse|find\b[^\n]*\s-delete(?:\s|$))/i,
+    summary: '递归强制删除文件/目录 (rm -rf / rmdir /s / del /s / Remove-Item -Recurse)',
+    pattern: /(?:^|[;&|(`]\s*)(?:(?:(?:\/(?:usr\/)?bin\/)|(?:command|env)\s+)?rm\s+(?:[^\n]*\s)?(?:-[^\s]*r[^\s]*f|-[^\s]*f[^\s]*r|--recursive\b|-r\b[^\n]*\s-f\b|-f\b[^\n]*\s-r\b|-[^\s]*[rR](?:\s|$))|(?:cmd\s+\/c\s+)?rmdir\s+\/s\b|rd\s+\/s\b|del\s+(?:[^\n]*\s)?\/[sfq]\b|remove-item\b[^\n]*-recurse|find\b[^\n]*\s-delete(?:\s|$))/i,
   },
   {
     rule: 'git-force-push',
@@ -48,16 +48,52 @@ const RISKY_COMMAND_RULES = [
   {
     rule: 'pipe-to-shell',
     level: 'high',
-    summary: '远程脚本直接交由 Shell / 解释器执行 (curl/wget | sh/python/node)',
-    pattern: /(?:(?:curl|wget)\b[^\n|]*\|\s*(?:(?:env|command)\s+)?(?:\/(?:usr\/(?:local\/)?)?bin\/)?(?:(?:ba|z|da)?sh|python\d*|node|perl|ruby)\b|(?:(?:ba|z)?sh)\s+<\(\s*(?:curl|wget)\b)/i,
+    summary: '远程脚本直接交由 Shell / 解释器执行 (curl/wget/irm | sh/python/node/iex)',
+    pattern: /(?:(?:curl|wget)\b[^\n|]*\|\s*(?:(?:env|command)\s+)?(?:\/(?:usr\/(?:local\/)?)?bin\/)?(?:(?:ba|z|da)?sh|python\d*|node|perl|ruby)\b|(?:(?:ba|z)?sh)\s+<\(\s*(?:curl|wget)\b|\b(?:irm|invoke-restmethod|iwr|invoke-webrequest)\b[^\n|]*\|\s*(?:iex|invoke-expression)\b)/i,
+  },
+  {
+    rule: 'shell-wrapper-or-eval',
+    level: 'critical',
+    summary: '通过子 Shell / eval / xargs / 解释器内联执行高危操作',
+    pattern: /(?:(?:(?:ba|z|da)?sh)\s+-[a-zA-Z]*c\s+[^\n]*(?:\brm\s+-[^\s]*r|\bsudo\b|\bmkfs\b|\bdd\s+if=|\bgit\s+push\b[^\n]*--force)|\b(?:eval|xargs)\b[^\n]*(?:\brm\s+-[^\s]*r|\bsudo\b|\bmkfs\b|\bdd\s+if=)|\bfind\b[^\n]*-exec\b[^\n]*\brm\s+-[^\s]*r|\bpython\d*\s+-c\b[^\n]*(?:rmtree|unlink|os\.remove|os\.system|popen)|\bnode\s+-e\b[^\n]*(?:rmSync|unlinkSync|execSync))/i,
   },
   {
     rule: 'sensitive-overwrite',
     level: 'critical',
-    summary: '重定向或写入系统目录、SSH 密钥或插件配置目录',
-    pattern: /(?:>{1,2}\s*|\btee(?:\s+-[a-zA-Z]+)*\s+)(?:["'])?(?:\/etc\/|\/System\/|\/dev\/(?!null\b)|(?:~|\$HOME|\$\{HOME\})\/(?:\.ssh|\.config\/antigravity-feishu)\/)/i,
+    summary: '重定向或改写系统目录、SSH 密钥、云凭证或插件配置目录',
+    pattern: /(?:(?:>{1,2}\s*|\b(?:tee(?:\s+-[a-zA-Z]+)*|cp|mv|install|ln(?:\s+-[a-zA-Z]+)*)\b[^\n]*\s)(?:["'])?(?:\/etc\/|\/System\/|\/dev\/(?!null\b)|(?:~|\$HOME|\$\{HOME\}|(?:\/Users|\/home)\/[^/\s"']+)\/(?:\.ssh\/|\.aws\/|\.gnupg\/|\.config\/antigravity-feishu\/|\.npmrc\b|\.netrc\b|\.kube\/config\b)))/i,
   },
 ];
+
+export function classifyWritePathRisk(filePath) {
+  const raw = String(filePath || '').trim();
+  if (!raw) {
+    return { risky: false, level: 'safe', rule: '', summary: '' };
+  }
+  const normalized = path.normalize(expandHomePath(raw)).replace(/\\/g, '/').toLowerCase();
+  let cfgDirNorm = '';
+  try {
+    cfgDirNorm = path.normalize(path.resolve(getConfigDir())).replace(/\\/g, '/').toLowerCase();
+  } catch {
+    cfgDirNorm = '';
+  }
+
+  if (
+    (cfgDirNorm && (normalized === cfgDirNorm || normalized.startsWith(`${cfgDirNorm}/`))) ||
+    normalized.includes('/.config/antigravity-feishu/') ||
+    normalized.includes('/.ssh/') ||
+    normalized.includes('/.aws/') ||
+    normalized.includes('/.gnupg/')
+  ) {
+    return {
+      risky: true,
+      level: 'critical',
+      rule: 'sensitive-file-write',
+      summary: '改写插件运行时配置/状态目录或本机敏感密钥目录',
+    };
+  }
+  return { risky: false, level: 'safe', rule: '', summary: '' };
+}
 
 export function classifyCommandRisk(commandLine) {
   const cmd = String(commandLine || '').trim();

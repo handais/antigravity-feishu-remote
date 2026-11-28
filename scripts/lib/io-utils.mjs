@@ -63,6 +63,67 @@ export function writePrivateFileAtomic(filePath, content, { mode = 0o600, dirMod
 }
 
 /**
+ * Acquire an exclusive advisory lockfile around synchronous read-modify-write transactions.
+ */
+export function withFileLock(lockPath, fn, { timeoutMs = 2000, staleMs = 5000 } = {}) {
+  const dir = path.dirname(lockPath);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + Math.max(50, Number(timeoutMs) || 2000);
+  const staleLimit = Math.max(500, Number(staleMs) || 5000);
+  let acquired = false;
+  let fd = null;
+
+  while (true) {
+    try {
+      fd = fs.openSync(lockPath, 'wx', 0o600);
+      fs.writeFileSync(fd, `${process.pid}\n${Date.now()}\n`, 'utf8');
+      fs.closeSync(fd);
+      fd = null;
+      acquired = true;
+      break;
+    } catch (err) {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Ignore close error
+        }
+        fd = null;
+      }
+      if (err?.code !== 'EEXIST') {
+        throw err;
+      }
+      try {
+        const stat = fs.statSync(lockPath);
+        if (Date.now() - stat.mtimeMs > staleLimit) {
+          fs.rmSync(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        // Lock disappeared concurrently; retry immediately
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out acquiring file lock: ${lockPath}`);
+      }
+      sleepSync(15);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    if (acquired) {
+      try {
+        fs.rmSync(lockPath, { force: true });
+      } catch {
+        // Ignore lock cleanup errors
+      }
+    }
+  }
+}
+
+/**
  * Atomically write a JSON object with 0600 permissions.
  */
 export function writePrivateJsonAtomic(filePath, data) {

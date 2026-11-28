@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { saveConfig, saveState, resolveRiskyApprovalEnabled } from '../config.mjs';
+import { resolveRiskyApprovalEnabled, updateConfig } from '../config.mjs';
 import { filterSensitiveGitDiff, isSensitiveFilePath } from '../security.mjs';
 import {
   buildCard,
@@ -161,29 +161,44 @@ export async function handleArtifactAction(actionCtx) {
       return toastCardResponse('error', '未找到对应的修改文件索引');
     }
     const targetFile = files[idx];
+    const baseName = path.basename(targetFile);
     if (isSensitiveFilePath(targetFile)) {
       return toastCardResponse(
         'warning',
-        `🔒 出于隐私保护，拒绝一键外发敏感文件：${path.basename(targetFile)}（如需发送请核对后手动用 /send）`,
+        `🔒 出于隐私与安全保护，拒绝外发敏感文件：${baseName}`,
       );
     }
     try {
       if (!fs.existsSync(targetFile) || !fs.statSync(targetFile).isFile()) {
-        return toastCardResponse('error', `文件不存在或不是普通文件：${path.basename(targetFile)}`);
+        return toastCardResponse('error', `文件不存在或不是普通文件：${baseName}`);
       }
-      const receiveId = targetChatId || openId;
-      const receiveIdType = targetChatId ? 'chat_id' : 'open_id';
-      const sent = await sendLocalMedia(client, {
-        receiveId,
-        receiveIdType,
-        filePath: targetFile,
-        replyToMessageId: threadRootId,
-        replyInThread: Boolean(threadRootId),
-      });
-      return toastCardResponse('success', `✅ 已发送 ${sent.fileName}`);
     } catch (err) {
-      return toastCardResponse('error', `发送文件失败：${err?.message || err}`);
+      return toastCardResponse('error', `无法读取文件：${err?.message || err}`);
     }
+    const receiveId = targetChatId || openId;
+    const receiveIdType = targetChatId ? 'chat_id' : 'open_id';
+    Promise.resolve()
+      .then(() =>
+        sendLocalMedia(client, {
+          receiveId,
+          receiveIdType,
+          filePath: targetFile,
+          replyToMessageId: threadRootId,
+          replyInThread: Boolean(threadRootId),
+        }),
+      )
+      .catch((err) => {
+        console.error('[feishu-remote] async turn_send_file error:', err?.message || err);
+        const errCard = buildCard({
+          title: '❌ 文件发送失败',
+          template: 'red',
+          markdown: `发送文件 \`${baseName}\` 失败：${err?.message || err}`,
+        });
+        void sendToTarget(errCard).catch((notifyErr) => {
+          console.error('[feishu-remote] async turn_send_file error-card fallback failed:', notifyErr?.message || notifyErr);
+        });
+      });
+    return toastCardResponse('info', `⏳ 正在发送：${baseName}`);
   }
 
   if (cmd === 'approval_decide') {
@@ -258,9 +273,10 @@ export async function handleArtifactAction(actionCtx) {
       : requested === 'off'
         ? false
         : !currentlyEnabled;
+    updateConfig((c) => {
+      c.security.riskyCommandApproval = nextEnabled ? 'on' : 'off';
+    });
     config.security.riskyCommandApproval = nextEnabled ? 'on' : 'off';
-    saveConfig(config);
-    saveState(state);
     return toastCardResponse(
       nextEnabled ? 'success' : 'warning',
       nextEnabled ? '🛡️ 已开启高危命令飞书审批' : '⚪ 已关闭高危命令飞书审批',

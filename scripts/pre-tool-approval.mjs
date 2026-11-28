@@ -3,6 +3,7 @@ import path from 'node:path';
 import {
   loadConfig,
   loadState,
+  resolveOwnerOpenId,
   resolveRiskyApprovalEnabled,
   stripProcessProxyEnv,
 } from './lib/config.mjs';
@@ -10,6 +11,7 @@ import { readStdinWithTimeout } from './lib/io-utils.mjs';
 import {
   buildApprovalCard,
   classifyCommandRisk,
+  classifyWritePathRisk,
   createApprovalRequest,
   updateApprovalRequestMeta,
   waitForApprovalDecision,
@@ -39,9 +41,17 @@ async function run() {
     }
   }
 
-  const commandLine = String(
+  const rawCommandLine = String(
     payload?.toolCall?.args?.CommandLine ?? payload?.toolCall?.args?.command ?? '',
   ).trim();
+  const toolName = String(payload?.toolCall?.name || payload?.toolName || '').trim().toLowerCase();
+  const targetWritePath = String(
+    payload?.toolCall?.args?.Path ?? payload?.toolCall?.args?.TargetFile ?? payload?.toolCall?.args?.file_path ?? '',
+  ).trim();
+  const isWriteTool = !rawCommandLine && Boolean(targetWritePath) && (
+    toolName === 'write_file' || toolName === 'edit_file' || !toolName
+  );
+  const commandLine = rawCommandLine || (isWriteTool ? `[${toolName || 'write_file'}] ${targetWritePath}` : '');
   if (!commandLine) {
     passThrough();
     return;
@@ -53,7 +63,9 @@ async function run() {
     return;
   }
 
-  const risk = classifyCommandRisk(commandLine);
+  const risk = rawCommandLine
+    ? classifyCommandRisk(rawCommandLine)
+    : classifyWritePathRisk(targetWritePath);
   if (!risk.risky) {
     passThrough();
     return;
@@ -62,18 +74,14 @@ async function run() {
   if (String(process.env.FEISHU_REMOTE_MODE || '').trim().toLowerCase() === 'plan') {
     writeDecision({
       decision: 'deny',
-      reason: 'Risky command blocked in read-only plan mode (fail-closed).',
+      reason: 'Risky operation blocked in read-only plan mode (fail-closed).',
     });
     return;
   }
 
   const cwd = String(payload?.cwd || process.cwd());
   const state = loadState();
-  const openId =
-    process.env.FEISHU_REMOTE_OPEN_ID ||
-    config.notifications?.defaultReceiveId ||
-    config.security?.allowedOpenIds?.[0] ||
-    '';
+  const openId = resolveOwnerOpenId(config, process.env.FEISHU_REMOTE_OPEN_ID || '');
   const chatId =
     process.env.FEISHU_REMOTE_CHAT_ID ||
     (openId ? state.lastP2pChatByOpenId?.[openId] : '') ||

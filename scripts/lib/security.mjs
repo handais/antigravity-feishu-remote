@@ -4,7 +4,7 @@ import { getConfigDir } from './config.mjs';
 import { expandHomePath } from './io-utils.mjs';
 
 const SAFE_ENV_TEMPLATE_NAMES = new Set(['.env.example', '.env.sample', '.env.template', '.env.dist']);
-const SENSITIVE_EXT_RE = /\.(?:pem|key|p12|pfx|jks|keystore)$/i;
+const SENSITIVE_EXT_RE = /\.(?:pem|key|p12|pfx|jks|keystore|p8|kdbx)$/i;
 const SSH_KEY_BASENAME_RE = /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)(?:\.ppk)?$/i;
 const CONFIG_SENSITIVE_FILES = new Set([
   'config.json',
@@ -35,7 +35,8 @@ function checkNormalizedPathSensitivity(normalized, cfgDirNormalized) {
     base === 'user-auth.json' ||
     base === 'credentials.json' ||
     base === 'application_default_credentials.json' ||
-    /^.*secret.*\.json$/i.test(base)
+    /^.*secret.*\.json$/i.test(base) ||
+    /^secrets?\.(?:ya?ml|toml|ini|json)$/i.test(base)
   ) {
     return true;
   }
@@ -43,6 +44,15 @@ function checkNormalizedPathSensitivity(normalized, cfgDirNormalized) {
     normalized.includes('/.ssh/') ||
     normalized.includes('/.aws/') ||
     normalized.includes('/.gnupg/') ||
+    normalized.includes('/.gemini/') ||
+    normalized.includes('/.config/gcloud/') ||
+    normalized.includes('/library/keychains/') ||
+    normalized.endsWith('/.git-credentials') ||
+    normalized.endsWith('/.bash_history') ||
+    normalized.endsWith('/.zsh_history') ||
+    normalized.endsWith('/.sh_history') ||
+    normalized.endsWith('/.node_repl_history') ||
+    normalized.endsWith('/.python_history') ||
     normalized.endsWith('/.npmrc') ||
     normalized.endsWith('/.netrc') ||
     normalized.endsWith('/.pypirc') ||

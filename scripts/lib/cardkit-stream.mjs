@@ -8,6 +8,7 @@ import {
   sanitizeForFeishuMarkdown,
   sendCard,
   splitMarkdownChunks,
+  stampCardThreadRoot,
   unwrapLarkError,
 } from './feishu-api.mjs';
 
@@ -51,6 +52,13 @@ export async function removeMessageReaction(client, { messageId, reactionId }) {
   }
 }
 
+function buildStreamingActionButtons(stopButton = true, extraButtons = []) {
+  return [
+    ...(stopButton ? [{ label: '🛑 立即中止', type: 'danger', value: { cmd: 'stop' } }] : []),
+    ...(Array.isArray(extraButtons) ? extraButtons : []),
+  ].slice(0, 4);
+}
+
 export function buildStreamingCardJson({
   title = '⏳ Antigravity 处理中...',
   template = 'blue',
@@ -58,6 +66,7 @@ export function buildStreamingCardJson({
   initialStream = '_正在等待模型响应..._',
   footer = '',
   stopButton = true,
+  extraButtons = [],
   statusElementId = 'md_status',
   streamElementId = 'md_stream',
 } = {}) {
@@ -74,34 +83,33 @@ export function buildStreamingCardJson({
     },
   ];
 
-  if (stopButton) {
+  const actionButtons = buildStreamingActionButtons(stopButton, extraButtons);
+  if (actionButtons.length > 0) {
     elements.push({
       tag: 'column_set',
       flex_mode: 'flow',
       horizontal_spacing: 'small',
-      columns: [
-        {
-          tag: 'column',
-          width: 'auto',
-          elements: [
-            {
-              tag: 'button',
-              text: {
-                tag: 'plain_text',
-                content: '🛑 立即中止',
-              },
-              type: 'danger',
-              size: 'small',
-              behaviors: [
-                {
-                  type: 'callback',
-                  value: { cmd: 'stop' },
-                },
-              ],
+      columns: actionButtons.map((btn) => ({
+        tag: 'column',
+        width: 'auto',
+        elements: [
+          {
+            tag: 'button',
+            text: {
+              tag: 'plain_text',
+              content: btn.label,
             },
-          ],
-        },
-      ],
+            type: btn.type || 'default',
+            size: 'small',
+            behaviors: [
+              {
+                type: 'callback',
+                value: btn.value || {},
+              },
+            ],
+          },
+        ],
+      })),
     });
   }
 
@@ -162,15 +170,20 @@ export async function createStreamingCardSession(
     initialStream = '_已接收指令，正在启动处理..._',
     footer = '点下方按钮或发送 /stop 可中止',
     stopButton = true,
+    extraButtons = [],
     minWriteIntervalMs = 350,
   } = {},
 ) {
   const STATUS_ID = 'md_status';
   const STREAM_ID = 'md_stream';
+  const actionButtons = buildStreamingActionButtons(stopButton, extraButtons);
+  const actionRows = actionButtons.length > 0 ? [actionButtons] : [];
   let mode = 'patch';
   let cardId = '';
   let replyMessageId = '';
   const effectiveReplyTarget = replyTargetMessageId || messageId;
+  const withThread = (card, root = effectiveReplyTarget, inThread = replyInThread) =>
+    inThread && root ? stampCardThreadRoot(card, root) : card;
 
   const canUseCardKit = Boolean(
     client?.cardkit?.v1?.card?.create &&
@@ -181,16 +194,17 @@ export async function createStreamingCardSession(
 
   if (canUseCardKit) {
     try {
-      const cardJson = buildStreamingCardJson({
+      const cardJson = withThread(buildStreamingCardJson({
         title,
         template,
         initialStatus,
         initialStream,
         footer,
         stopButton,
+        extraButtons,
         statusElementId: STATUS_ID,
         streamElementId: STREAM_ID,
-      });
+      }));
       const createRes = await client.cardkit.v1.card.create({
         data: {
           type: 'card_json',
@@ -246,7 +260,7 @@ export async function createStreamingCardSession(
       template,
       markdown: fallbackBody,
       footer,
-      buttonRows: stopButton ? [[{ label: '🛑 立即中止', type: 'danger', value: { cmd: 'stop' } }]] : [],
+      buttonRows: actionRows,
     });
     try {
       if (effectiveReplyTarget) {
@@ -317,13 +331,15 @@ export async function createStreamingCardSession(
           card: {
             type: 'card_json',
             data: JSON.stringify(
-              buildCard({
-                title: '⏳ Antigravity 持续执行中...',
-                template,
-                markdown: combined,
-                footer,
-                buttonRows: stopButton ? [[{ label: '🛑 立即中止', type: 'danger', value: { cmd: 'stop' } }]] : [],
-              }),
+              withThread(
+                buildCard({
+                  title: '⏳ Antigravity 持续执行中...',
+                  template,
+                  markdown: combined,
+                  footer,
+                  buttonRows: actionRows,
+                }),
+              ),
             ),
           },
           sequence: ++sequence,
@@ -426,13 +442,15 @@ export async function createStreamingCardSession(
     try {
       await patchCard(client, {
         messageId: replyMessageId,
-        card: buildCard({
-          title: '⏳ Antigravity 执行中...',
-          template,
-          markdown: combined,
-          footer,
-          buttonRows: stopButton ? [[{ label: '🛑 立即中止', type: 'danger', value: { cmd: 'stop' } }]] : [],
-        }),
+        card: withThread(
+          buildCard({
+            title: '⏳ Antigravity 执行中...',
+            template,
+            markdown: combined,
+            footer,
+            buttonRows: actionRows,
+          }),
+        ),
       });
     } catch (err) {
       console.error('[feishu-remote] patchCard error:', err?.message || err);
@@ -588,13 +606,17 @@ export async function createStreamingCardSession(
         const part0Title = chunks.length > 1 ? `${finalTitle} (1/${chunks.length})` : finalTitle;
         const part0Footer = chunks.length === 1 ? finalFooter : '';
         const part0Buttons = chunks.length === 1 ? buttonRows : [];
-        const finalCard0 = buildCard({
-          title: part0Title,
-          template: finalTemplate,
-          markdown: chunks[0],
-          footer: part0Footer,
-          buttonRows: part0Buttons,
-        });
+        const finalCard0 = withThread(
+          buildCard({
+            title: part0Title,
+            template: finalTemplate,
+            markdown: chunks[0],
+            footer: part0Footer,
+            buttonRows: part0Buttons,
+          }),
+          finalReplyTarget,
+          finalReplyInThread,
+        );
 
         let settingsCalled = false;
         if (wasStreamingActive) {

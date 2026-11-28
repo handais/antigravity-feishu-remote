@@ -1,10 +1,12 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   getPluginRoot,
   loadConfig,
   loadState,
   maskSecret,
+  resolveOwnerOpenId,
   stripProcessProxyEnv,
 } from './lib/config.mjs';
 import { expandHomePath } from './lib/io-utils.mjs';
@@ -252,11 +254,22 @@ function toolResult(data, isError = false) {
   };
 }
 
+function getPackageVersion() {
+  try {
+    const pkgPath = path.join(getPluginRoot(), 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    if (pkg?.version) return String(pkg.version).trim();
+  } catch {
+    // Fallback
+  }
+  return '1.1.0';
+}
+
 function createMcpServer({ Server, CallToolRequestSchema, ListToolsRequestSchema }) {
   const server = new Server(
     {
       name: 'feishu-remote-tools',
-      version: '1.0.0',
+      version: getPackageVersion(),
     },
     {
       capabilities: {
@@ -621,11 +634,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!markdown) {
         return toolResult('markdown is required.', true);
       }
-      const grantOpenId =
-        String(args.grant_open_id || '').trim() ||
-        config.notifications.defaultReceiveId ||
-        config.security.allowedOpenIds?.[0] ||
-        '';
+      const grantOpenId = resolveOwnerOpenId(config, String(args.grant_open_id || '').trim());
       if (grantOpenId) {
         assertTargetAuthorized(grantOpenId, 'open_id', config, loadState());
       }
@@ -662,7 +671,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { createFeishuTask } = await loadFeishuTasks();
       const assignToOwner = args.assign_to_owner !== false;
       const assigneeOpenId = assignToOwner
-        ? (config.notifications.defaultReceiveId || config.security.allowedOpenIds?.[0] || '')
+        ? resolveOwnerOpenId(config)
         : '';
       const task = await createFeishuTask(config, {
         summary: String(args.summary || ''),

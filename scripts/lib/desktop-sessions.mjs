@@ -464,6 +464,101 @@ export function extractTranscriptTurns(brainDir, { maxTurns = 6, maxCharsPerTurn
   return turns.slice(-Math.max(1, maxTurns));
 }
 
+function escapeSqlLike(value) {
+  return String(value || '').replace(/[\\%_]/g, '\\$&');
+}
+
+function rowToSessionMeta(row, store) {
+  const id = String(row.conversation_id || '').trim();
+  const isNative = store.source === 'cli' || hasCliNativeConversation(id);
+  const appDataDir = resolveAppDataDir(row.app_data_dir, store.dir);
+  return {
+    id,
+    title: String(row.title || '').trim() || '(无标题对话)',
+    preview: String(row.preview || '').trim(),
+    source: store.source,
+    sourceLabel: store.sourceLabel,
+    takeoverMode: isNative ? 'native' : 'handoff',
+    takeoverLabel: isNative ? '原生直连' : '摘要接管',
+    running: String(row.status || '') === 'CASCADE_RUN_STATUS_RUNNING',
+    status: String(row.status || ''),
+    stepCount: Number(row.step_count || 0),
+    workspace: decodeWorkspaceUris(row.workspace_uris),
+    lastModifiedTime: String(row.last_modified_time || ''),
+    lastModifiedMs: parseTimestampMs(row.last_modified_time),
+    appDataDir,
+    brainDir: path.join(appDataDir, 'brain', id),
+  };
+}
+
+function shouldPreferSessionCandidate(candidate, best) {
+  if (!best) return true;
+  return (
+    (candidate.takeoverMode === 'native' && best.takeoverMode !== 'native') ||
+    (candidate.takeoverMode === best.takeoverMode && candidate.lastModifiedMs > best.lastModifiedMs)
+  );
+}
+
+/**
+ * Batch-lookup SQLite metadata for multiple conversation IDs in minimal DB opens.
+ */
+export function getDesktopSessionMetaMap(conversationIds = []) {
+  const uniqueIds = [...new Set(
+    (Array.isArray(conversationIds) ? conversationIds : [])
+      .map((id) => String(id || '').trim())
+      .filter(Boolean),
+  )];
+  const resultMap = new Map();
+  if (uniqueIds.length === 0) return resultMap;
+
+  const CHUNK_SIZE = 200;
+  for (const store of getAppStores()) {
+    const dbPath = path.join(store.dir, 'conversation_summaries.db');
+    if (!fs.existsSync(dbPath)) continue;
+    let db;
+    try {
+      db = new DatabaseSync(dbPath, { readOnly: true });
+      db.exec('PRAGMA busy_timeout = 1000;');
+      for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
+        const chunk = uniqueIds.slice(i, i + CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        const rows = db
+          .prepare(`
+            SELECT
+              conversation_id,
+              title,
+              preview,
+              step_count,
+              last_modified_time,
+              workspace_uris,
+              status,
+              nesting_depth,
+              app_data_dir
+            FROM conversation_summaries
+            WHERE conversation_id IN (${placeholders})
+          `)
+          .all(...chunk);
+        for (const row of rows) {
+          const candidate = rowToSessionMeta(row, store);
+          const existing = resultMap.get(candidate.id);
+          if (shouldPreferSessionCandidate(candidate, existing)) {
+            resultMap.set(candidate.id, candidate);
+          }
+        }
+      }
+    } catch {
+      // Ignore single-store errors
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        // Ignore close failures
+      }
+    }
+  }
+  return resultMap;
+}
+
 /**
  * Look up SQLite metadata for a single conversation without reading any transcript JSONL files.
  */
@@ -472,6 +567,7 @@ export function getDesktopSessionMeta(conversationId) {
   if (!target) return null;
 
   let best = null;
+  const escapedTarget = escapeSqlLike(target);
   for (const store of getAppStores()) {
     const dbPath = path.join(store.dir, 'conversation_summaries.db');
     if (!fs.existsSync(dbPath)) continue;
@@ -492,41 +588,15 @@ export function getDesktopSessionMeta(conversationId) {
             nesting_depth,
             app_data_dir
           FROM conversation_summaries
-          WHERE conversation_id = ? OR conversation_id LIKE ?
+          WHERE conversation_id = ? OR conversation_id LIKE ? ESCAPE '\\'
           ORDER BY (conversation_id = ?) DESC, last_modified_time DESC
           LIMIT 1
         `)
-        .get(target, `${target}%`, target);
+        .get(target, `${escapedTarget}%`, target);
       if (row) {
-        const id = String(row.conversation_id || '').trim();
-        const isNative = store.source === 'cli' || hasCliNativeConversation(id);
-        const appDataDir = resolveAppDataDir(row.app_data_dir, store.dir);
-        const candidate = {
-          id,
-          title: String(row.title || '').trim() || '(无标题对话)',
-          preview: String(row.preview || '').trim(),
-          source: store.source,
-          sourceLabel: store.sourceLabel,
-          takeoverMode: isNative ? 'native' : 'handoff',
-          takeoverLabel: isNative ? '原生直连' : '摘要接管',
-          running: String(row.status || '') === 'CASCADE_RUN_STATUS_RUNNING',
-          status: String(row.status || ''),
-          stepCount: Number(row.step_count || 0),
-          workspace: decodeWorkspaceUris(row.workspace_uris),
-          lastModifiedTime: String(row.last_modified_time || ''),
-          lastModifiedMs: parseTimestampMs(row.last_modified_time),
-          appDataDir,
-          brainDir: path.join(appDataDir, 'brain', id),
-        };
-        if (!best) {
+        const candidate = rowToSessionMeta(row, store);
+        if (shouldPreferSessionCandidate(candidate, best)) {
           best = candidate;
-        } else {
-          const preferNew =
-            (candidate.takeoverMode === 'native' && best.takeoverMode !== 'native') ||
-            (candidate.takeoverMode === best.takeoverMode && candidate.lastModifiedMs > best.lastModifiedMs);
-          if (preferNew) {
-            best = candidate;
-          }
         }
       }
     } catch {

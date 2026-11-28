@@ -165,11 +165,15 @@ https://github.com/handais/antigravity-feishu-remote
 #### Step 4 — 写入配置、启动守护进程与验收
 拿到 `App ID` 和 `App Secret` 后执行（`cli.mjs` 内部会自动把 `--cwd ~` 跨平台展开为当前用户主目录，并把配置保存到 `~/.config/antigravity-feishu/` / `%USERPROFILE%\.config\antigravity-feishu\`）：
 
+> [!NOTE]
+> 为保证默认安全（Fail-Closed），当前版本默认关闭无白名单自动绑定（`autoBindFirstUser: false`）。请通过 `--allow-open-id "<YOUR_OPEN_ID>"` 显式授权自己的 `open_id`；如果暂不知晓自己的 `open_id`，也可以加传 `--auto-bind true` 允许首次私聊自动完成一次性绑定（绑定完成后会自动关闭）。推荐通过 `--app-secret-stdin`（或环境变量 `FEISHU_APP_SECRET`）写入密钥，避免在命令行参数或历史记录中暴露明文 `App Secret`。
+
 - **macOS / Linux (bash/zsh)**：
   ```bash
-  node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup \
+  printf '%s' "<APP_SECRET>" | node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup \
     --app-id "<APP_ID>" \
-    --app-secret "<APP_SECRET>" \
+    --app-secret-stdin \
+    --allow-open-id "<YOUR_OPEN_ID>" \
     --cwd ~ \
     --mode accept-edits \
     --notify-mode away
@@ -177,20 +181,22 @@ https://github.com/handais/antigravity-feishu-remote
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs start
   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs status
   ```
+  *(若暂不知晓自己的 `open_id`，可将上面 `--allow-open-id "<YOUR_OPEN_ID>"` 替换为 `--auto-bind true` 启用首次私聊自动绑定。)*
 - **Windows (PowerShell)**（勿使用 `\` 续行）：
   ```powershell
-  node "$HOME\.gemini\config\plugins\feishu-remote\scripts\cli.mjs" setup --app-id "<APP_ID>" --app-secret "<APP_SECRET>" --cwd ~ --mode accept-edits --notify-mode away
+  "<APP_SECRET>" | node "$HOME\.gemini\config\plugins\feishu-remote\scripts\cli.mjs" setup --app-id "<APP_ID>" --app-secret-stdin --allow-open-id "<YOUR_OPEN_ID>" --cwd ~ --mode accept-edits --notify-mode away
   node "$HOME\.gemini\config\plugins\feishu-remote\scripts\cli.mjs" start
   node "$HOME\.gemini\config\plugins\feishu-remote\scripts\cli.mjs" status
   ```
+  *(Windows PowerShell 同样支持把 `--allow-open-id "<YOUR_OPEN_ID>"` 替换为 `--auto-bind true`。)*
 - 阶段验收标准：
   - `cli.mjs status` 中 `configured: true` 且 `daemon.running: true`；
   - 若是路径 B（应用已发布版本）或已完成 Step 3 第 8 步发布，继续执行 `cli.mjs scopes`（Windows 为 `node "$HOME\.gemini\config\plugins\feishu-remote\scripts\cli.mjs" scopes`）确认基础 `im:message`、`im:resource`、`cardkit:*` 等权限处于 `granted` 状态。
 - **Windows 重启后提醒**：原生 Windows 下 `cli.mjs start` 采用分离后台 PID 模式，**系统重启后不会像 macOS `launchd` / Linux `systemd` 那样自动开机启动**；部署完成时请提醒用户：重启电脑后需重新运行一次 `cli.mjs start`（或自行配置 Windows 任务计划程序 / WSL2）。
 
 #### Step 5 — 首轮配对验活
-1. 提示用户在手机/电脑飞书里找到该机器人，**私聊发送一句 `你好`**，触发自动白名单绑定与欢迎卡片。
-2. 绑定完成后，可选执行 `cli.mjs test-send --panel` 验证控制面板卡片可正常送达。
+1. 若 Step 4 使用了 `--allow-open-id` 预绑定，用户打开手机/电脑飞书向机器人发一句 `你好`（或 `/panel`）即可直接开始控制；若使用了 `--auto-bind true`，首次私聊发送 `你好` 会自动绑定为唯一主人并自动关闭 `autoBindFirstUser`（若两边均未设置，发送 `你好` 时机器人会拦截并返回用户的 `open_id`，再执行一次 `cli.mjs setup --allow-open-id "<open_id>"` 即可）。
+2. 配对完成后，可选执行 `cli.mjs test-send --panel` 验证控制面板卡片可正常送达。
 
 #### AI 必守红线与排错速查
 - **凭证隔离红线**：严禁将 `appSecret`、`open_id` 写入插件仓库目录内（`~/.gemini/config/plugins/feishu-remote/` 或 `%USERPROFILE%\.gemini\config\plugins\feishu-remote\`），也严禁在回复或日志中明文回显 `appSecret`（所有凭证与状态统一由 `cli.mjs setup` 保存在 `~/.config/antigravity-feishu/` / `%USERPROFILE%\.config\antigravity-feishu\`，POSIX 权限 `0600`）。
@@ -212,14 +218,15 @@ https://github.com/handais/antigravity-feishu-remote
 1. **飞书长连接桥接守护进程（Daemon）**：
    - 开机后台常驻（macOS `launchd` / Linux `systemd --user`）。
    - **CardKit 2.0 打字机流式更新**（失败自动降级 `patchCard`），工具步骤原地刷新状态与耗时，页脚展示耗时 / 工具次数 / Token 用量；超长结果自动智能分片且不截断代码块。
-   - **消息表情状态反馈**：任务完成后自动在原消息贴上 `DONE` 表情。
+   - **消息表情状态反馈 & 异步文件发送**：普通任务完成后自动在原消息贴上 `DONE` 表情；涉及 `/teamwork` 或后台子代理协作的持久会话会先贴 `Typing` 并保持长驻监听，中间进展推送 `🔄 后台协作新进展（进行中）` 卡片，待全部子代理真正完成后再摘掉 `Typing` 补贴 `DONE` 并推送 `✅ 后台协作新进展（已完成）`。卡片点击「📥 发到聊天」时秒回 `⏳ 正在发送` 轻提示并在后台异步上传（失败时补发错误卡片），避免触发飞书 3 秒回调超时。
    - **任务自动排队 & 失败重试**：上一条任务尚未完成时，后续发送的消息自动排队接力执行（支持一键中止当前立刻执行或取消排队）；中止/异常卡片自带 `🔄 重试` 按钮。
    - **引用回复 & 云文档上下文**：在飞书长按「回复」历史消息、卡片或截图时自动带入上下文；在消息里直接贴 `feishu.cn/docx/...` 或 `/wiki/...` 链接会自动拉取正文给 Antigravity。
    - 每个飞书会话独立记忆工作目录、权限模式（含**临时全权限到期自动降权**）、模型与最近历史会话（支持跨窗口/跨话题聚合）。
    - **单群多话题并行（话题群模式）**：在飞书「话题群」中按 `chatId#threadRootId` 自动隔离会话，群内每开一个话题即一个独立并行会话（默认全局最多同时执行 4 个并发任务，可通过 `--max-concurrent` 调整），消息、流式卡片、分片与文件回传全部锁回原话题楼。
-   - **安全白名单**：默认首次私聊发消息的账号自动绑定为唯一主人（`autoBindFirstUser`），其他陌生私聊直接拦截并提示其 `open_id`。
+   - **安全白名单**：默认 Fail-Closed（`autoBindFirstUser` 默认 `false`），需通过 `--allow-open-id` 预配主人或显式传入 `--auto-bind true` 启用首次私聊一次性绑定；其他陌生私聊直接拦截并提示其 `open_id`。
 2. **飞书常用指令与快捷方式**：
    - **多页可视化控制面板 + 卡片交互按钮**：可在飞书开放平台开启「机器人自定义菜单」与 `card.action.trigger` 长连接回调，不用记命令直接点按钮操作；支持在主控制面板、目录浏览、命令与技能、最近会话、模型切换和 `🛠️ 设置` 之间**原地翻页切换**（子页面均带 `⬅️ 返回面板`）。消息回复卡片内也自带「🆕 新对话」「⚙️ 控制面板」「🗂️ 最近会话」及执行中的「🛑 立即中止」按钮。
+   - **四大交互命令看板**：单独发送 `/goal`（持久目标看板）、`/swarm` / `/teamwork`（多代理蜂群成员与进度看板，只读刷新零 Token 消耗）、`/schedule`（定时巡检看板）、`/plan` / `/grill-me`（计划审批与澄清看板），支持一键快速派发、查看成员状态、批准方案与管理保活会话。
    - `/panel`（或 `/menu`）：打开带按钮的控制面板（一键切换常用目录/模式/模型、**⚡ 30m全权**、**🌿 Git**、**🔐 权限**、目录浏览器、收藏目录、开新对话、**♻️ 安全重启** / **⏪ 快照回滚**）
    - `/` 或 `/skills`：查看 `agy` 内置命令与本机已安装 Skills 清单（支持一键 `/compact` 及 `/agy <原始命令>` 强制透传）
    - `/git`：零延迟查看当前工作目录 Git 分支、工作区改动及最近 5 条提交（不经大模型）
@@ -318,7 +325,7 @@ https://github.com/handais/antigravity-feishu-remote
    - **回调配置**：订阅方式选择 **「使用长连接接收回调」**，添加回调 **`card.action.trigger`**（用于响应控制面板、目录浏览、队列、权限、Git、重试等卡片按钮点击）。
 5. **机器人自定义菜单（推荐，不用打字直接点）**：
    - 在 **应用能力 → 机器人 → 机器人自定义菜单** 中开启（推荐「悬浮菜单」或底部菜单）。
-   - 每个菜单项推荐把「响应动作」设为 **「推送事件」**，Event Key 可设为：`menu_panel`（控制面板）、`menu_commands`（命令与 Skills）、`menu_new`（新对话）、`menu_stop`（中止任务）；也支持 `menu_dirs`、`menu_effort`、`menu_git`、`menu_scopes`、`menu_queue`、`menu_mode_temp_full`、`menu_ops`、`menu_reload`、`menu_sessions`、`menu_models`、`menu_mode_full`、`menu_help`（或直接发送 `/panel`、`/`、`/new`、`/stop`）。
+   - 每个菜单项推荐把「响应动作」设为 **「推送事件」**，Event Key 可设为：`menu_panel`（控制面板）、`menu_commands`（命令与 Skills）、`menu_new`（新对话）、`menu_stop`（中止任务）；也支持 `menu_dirs`、`menu_effort`、`menu_git`、`menu_scopes`、`menu_queue`、`menu_mode_temp_full`、`menu_ops`、`menu_reload`、`menu_sessions`、`menu_models`、`menu_mode_full`、`menu_goal`、`menu_swarm`、`menu_schedule`、`menu_plan`、`menu_help`（或直接发送 `/panel`、`/`、`/new`、`/stop`）。
 6. **版本管理与发布**：创建版本并发布（如果只给自己用，可发布为仅自己/指定测试人员可见）。
 7. 在 **凭证与基础信息** 页面复制 **`App ID`** 和 **`App Secret`**。
 
@@ -347,12 +354,15 @@ cd ~/.gemini/config/plugins/feishu-remote && npm install --omit=dev
 
 ### 2. 写入配置
 ```bash
-node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup \
+printf '%s' "你的_APP_SECRET" | node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup \
   --app-id "你的_APP_ID" \
-  --app-secret "你的_APP_SECRET" \
+  --app-secret-stdin \
+  --allow-open-id "你的_OPEN_ID" \
   --cwd "$HOME" \
   --mode accept-edits
 ```
+> 提示：若你暂时不知晓自己的 `open_id`，可把 `--allow-open-id "你的_OPEN_ID"` 替换为 `--auto-bind true` 开启一次性的首次私聊自动绑定；默认 `autoBindFirstUser` 为 `false`（Fail-Closed）。
+>
 > 国内代理说明：本插件默认会隔离代理环境——飞书长连接与 REST API **直连**（避免本地 `socks5://` 环境变量导致断连），同时自动检测本机 HTTP 代理并仅注入给底层 `agy` 子进程。如需手动指定，可传 `--proxy http://127.0.0.1:7897`。
 
 ### 3. 启动守护进程
@@ -363,7 +373,8 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs status
 
 ### 4. 在手机飞书里配对
 打开手机飞书，搜你的机器人名字，在**私聊**里给它发一句 `你好`（或 `/help`）。  
-机器人会自动绑定你的飞书 `open_id` 为白名单主人并回复欢迎卡片，随后即可直接发任务使用！
+- 若配置时指定了 `--allow-open-id`，会直接进入控制；
+- 若指定了 `--auto-bind true`，机器人会自动绑定你的飞书 `open_id` 为唯一主人并回复欢迎卡片；若两者都未指定，机器人会拦截提示你的 `open_id`，补跑一次 `cli.mjs setup --allow-open-id "<open_id>"` 即可使用！
 
 <details>
 <summary><b>🛠️ 展开查看常用 CLI 运维命令（状态、日志、体检、文档与重启）</b></summary>
@@ -415,13 +426,13 @@ node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs pack --out ~/Desktop
 ### 朋友收到 zip 后的安装步骤（4 步）
 1. 确保朋友电脑上已安装 `Node.js`（22.5+）和 `agy` CLI（并已登录）。
 2. 把 zip 解压到他自己电脑的 `~/.gemini/config/plugins/`（最终路径为 `~/.gemini/config/plugins/feishu-remote/plugin.json`，注意不要套娃）。
-3. 安装依赖并写入他自己的飞书应用凭证：
+3. 安装依赖并写入他自己的飞书应用凭证（传 `--auto-bind true` 或指定 `--allow-open-id`）：
    ```bash
    cd ~/.gemini/config/plugins/feishu-remote && npm install --omit=dev
-   node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup --app-id "他的AppID" --app-secret "他的AppSecret"
+   printf '%s' "他的AppSecret" | node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup --app-id "他的AppID" --app-secret-stdin --auto-bind true
    node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs start
    ```
-4. 他自己在手机飞书私聊自己的机器人发一条消息，即可自动绑定并开始使用。
+4. 他自己在手机飞书私聊自己的机器人发一条消息，即可自动完成一次性绑定并开始使用（如改用 `--allow-open-id` 预绑定也可直接对话）。
 
 ---
 

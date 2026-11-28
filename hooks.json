@@ -19,6 +19,26 @@
             "timeout": 180
           }
         ]
+      },
+      {
+        "matcher": "write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/pre-tool-approval.mjs",
+            "timeout": 180
+          }
+        ]
+      },
+      {
+        "matcher": "edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/pre-tool-approval.mjs",
+            "timeout": 180
+          }
+        ]
       }
     ]
   }

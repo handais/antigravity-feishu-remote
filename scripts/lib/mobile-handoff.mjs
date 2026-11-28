@@ -9,6 +9,7 @@ import {
   extractTranscriptTurns,
   getDesktopSessionDetail,
   getDesktopSessionMeta,
+  getDesktopSessionMetaMap,
   getGeminiRoot,
 } from './desktop-sessions.mjs';
 import { buildCard, chunkButtons, sanitizeForFeishuMarkdown } from './feishu-api.mjs';
@@ -308,9 +309,10 @@ export function listMobileSessions({ cwd = '', originDesktopId = '', limit = 10 
   const originNeedle = String(originDesktopId || '').trim();
   const cwdNeedle = String(cwd || '').trim();
 
+  const metaMap = getDesktopSessionMetaMap([...byId.keys()]);
   const enriched = [];
   for (const entry of byId.values()) {
-    const detail = getDesktopSessionMeta(entry.id);
+    const detail = metaMap.get(entry.id) || null;
     const resolvedCwd = detail?.workspace || entry.cwd || '';
     const lastModifiedMs = Math.max(Number(detail?.lastModifiedMs || 0), Number(entry.lastActiveAt || 0));
     let score = 0;

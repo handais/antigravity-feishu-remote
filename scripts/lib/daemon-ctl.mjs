@@ -107,8 +107,25 @@ function buildPathEnv() {
     '/bin',
     '/usr/sbin',
     '/sbin',
-  ];
+    ...(process.env.PATH || '').split(path.delimiter),
+  ].filter(Boolean);
   return [...new Set(parts)].join(':');
+}
+
+function escapeSystemdValue(val) {
+  return `"${String(val || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function sleepSyncMs(ms) {
+  const buf = new Int32Array(new SharedArrayBuffer(4));
+  try {
+    Atomics.wait(buf, 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      // Fallback
+    }
+  }
 }
 
 function getGuiDomain() {
@@ -126,6 +143,20 @@ function hasSystemdUser() {
   }
 }
 
+function ensurePrivateLogFiles(...logPaths) {
+  if (process.platform === 'win32') return;
+  for (const logPath of logPaths) {
+    if (!logPath) continue;
+    try {
+      const fd = fs.openSync(logPath, 'a', 0o600);
+      fs.closeSync(fd);
+      fs.chmodSync(logPath, 0o600);
+    } catch {
+      // Best-effort log permission tightening
+    }
+  }
+}
+
 export function startDaemon() {
   const config = loadConfig();
   if (!config.feishu.appId || !config.feishu.appSecret) {
@@ -133,6 +164,7 @@ export function startDaemon() {
   }
   ensureConfigDir();
   const { outLog, errLog, pidFile } = getLogPaths();
+  ensurePrivateLogFiles(outLog, errLog);
   const daemonScript = path.join(getPluginRoot(), 'scripts', 'bridge-daemon.mjs');
   const nodeBin = resolveStableNodeBin(process.execPath, process.platform);
   const pathEnv = buildPathEnv();
@@ -157,16 +189,31 @@ export function startDaemon() {
     } catch {
       // Ignore if not currently loaded
     }
-    execFileSync('launchctl', ['bootstrap', domain, plistPath], { stdio: 'pipe' });
+    let lastBootstrapErr = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        execFileSync('launchctl', ['bootstrap', domain, plistPath], { stdio: 'pipe' });
+        lastBootstrapErr = null;
+        break;
+      } catch (err) {
+        lastBootstrapErr = err;
+        if (attempt < 2) {
+          sleepSyncMs(250 * (attempt + 1));
+        }
+      }
+    }
+    if (lastBootstrapErr) {
+      throw lastBootstrapErr;
+    }
     return { manager: 'launchd', plistPath, outLog, errLog };
   }
 
   if (hasSystemdUser()) {
     const unitPath = getSystemdUnitPath();
     fs.mkdirSync(path.dirname(unitPath), { recursive: true });
-    const envLines = [`Environment=PATH=${pathEnv}`];
+    const envLines = [`Environment=${escapeSystemdValue(`PATH=${pathEnv}`)}`];
     if (process.env.FEISHU_REMOTE_CONFIG_DIR) {
-      envLines.push(`Environment=FEISHU_REMOTE_CONFIG_DIR=${getConfigDir()}`);
+      envLines.push(`Environment=${escapeSystemdValue(`FEISHU_REMOTE_CONFIG_DIR=${getConfigDir()}`)}`);
     }
     const unit = `[Unit]
 Description=Antigravity Feishu Remote Control Bridge
@@ -174,7 +221,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart="${nodeBin}" "${daemonScript}"
+ExecStart=${escapeSystemdValue(nodeBin)} ${escapeSystemdValue(daemonScript)}
 Restart=always
 RestartSec=3
 StandardOutput=append:${outLog}
@@ -195,8 +242,14 @@ WantedBy=default.target
   if (existing.running && existing.pid) {
     return { manager: 'pid', pid: existing.pid, outLog, errLog };
   }
-  const outFd = fs.openSync(outLog, 'a');
-  const errFd = fs.openSync(errLog, 'a');
+  const outFd = fs.openSync(outLog, 'a', 0o600);
+  const errFd = fs.openSync(errLog, 'a', 0o600);
+  try {
+    fs.chmodSync(outLog, 0o600);
+    fs.chmodSync(errLog, 0o600);
+  } catch {
+    // Ignore on unsupported filesystems
+  }
   const child = spawn(process.execPath, [daemonScript], {
     detached: true,
     windowsHide: true,
@@ -210,7 +263,7 @@ WantedBy=default.target
   } catch {
     // Ignore close errors
   }
-  fs.writeFileSync(pidFile, `${child.pid}\n`, 'utf8');
+  fs.writeFileSync(pidFile, `${child.pid}\n`, { encoding: 'utf8', mode: 0o600 });
   return { manager: 'pid', pid: child.pid, outLog, errLog };
 }
 
@@ -244,6 +297,15 @@ export function stopDaemon() {
         process.kill(pid, 'SIGTERM');
       } catch {
         // Ignore if already dead
+      }
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        try {
+          process.kill(pid, 0);
+          sleepSyncMs(100);
+        } catch {
+          break;
+        }
       }
     }
     fs.rmSync(pidFile, { force: true });

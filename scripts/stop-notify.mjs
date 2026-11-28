@@ -12,6 +12,7 @@ import {
 import {
   readStdinWithTimeout,
   sanitizeInlineCode,
+  withFileLock,
   writePrivateJsonAtomic,
 } from './lib/io-utils.mjs';
 import {
@@ -76,29 +77,33 @@ function shouldSkipByDedup(conversationId) {
   if (!conversationId) return false;
   try {
     const dedupPath = path.join(getConfigDir(), 'stop-notify-dedup.json');
-    let map = {};
-    if (fs.existsSync(dedupPath)) {
-      try {
-        const parsed = JSON.parse(fs.readFileSync(dedupPath, 'utf8'));
-        if (parsed && typeof parsed === 'object') {
-          map = parsed;
+    const lockPath = path.join(getConfigDir(), '.stop-dedup.lock');
+    return withFileLock(lockPath, () => {
+      let map = {};
+      if (fs.existsSync(dedupPath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(dedupPath, 'utf8'));
+          if (parsed && typeof parsed === 'object') {
+            map = parsed;
+          }
+        } catch {
+          map = {};
         }
-      } catch {
-        map = {};
       }
-    }
-    const now = Date.now();
-    for (const [k, ts] of Object.entries(map)) {
-      if (!Number.isFinite(Number(ts)) || now - Number(ts) > DEDUP_RETENTION_MS) {
-        delete map[k];
+      const now = Date.now();
+      for (const [k, ts] of Object.entries(map)) {
+        if (!Number.isFinite(Number(ts)) || now - Number(ts) > DEDUP_RETENTION_MS) {
+          delete map[k];
+        }
       }
-    }
-    const prevAt = Number(map[conversationId] || 0);
-    if (prevAt > 0 && now - prevAt < DEDUP_WINDOW_MS) {
-      return true;
-    }
-    map[conversationId] = now;
-    writePrivateJsonAtomic(dedupPath, map);
+      const prevAt = Number(map[conversationId] || 0);
+      if (prevAt > 0 && now - prevAt < DEDUP_WINDOW_MS) {
+        return true;
+      }
+      map[conversationId] = now;
+      writePrivateJsonAtomic(dedupPath, map);
+      return false;
+    });
   } catch {
     // Best-effort dedup; ignore FS errors
   }
@@ -279,14 +284,18 @@ async function run() {
     }
 
     try {
-      const topicTimeoutPromise = new Promise((_, reject) => {
-        const t = setTimeout(() => reject(new Error('Feishu topic notification timeout')), 4000);
+      const topicTimedOutSym = Symbol('topic_timeout');
+      const topicTimeoutPromise = new Promise((resolve) => {
+        const t = setTimeout(() => resolve(topicTimedOutSym), 6000);
         t.unref();
       });
-      await Promise.race([
+      const outcome = await Promise.race([
         replyCard(client, { messageId: boundTopic.threadRootId, card: topicCard, replyInThread: true }),
         topicTimeoutPromise,
       ]);
+      if (outcome === topicTimedOutSym) {
+        console.error('[feishu-stop-notify] Topic reply timed out waiting after 6s; skipping P2P fallback to avoid duplicate cards');
+      }
       return;
     } catch (err) {
       console.error('[feishu-stop-notify] Topic reply failed, falling back to P2P:', err?.message || err);

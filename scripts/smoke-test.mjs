@@ -483,22 +483,25 @@ try {
   // 4e. Self-ops preflight and snapshot
   const preflight = runPreflightCheck();
   assert.equal(preflight.ok, true);
-  assert.equal(preflight.checkedFiles.length, 30);
+  assert.ok(preflight.checkedFiles.length >= 30, `Expected >= 30 checked files, got ${preflight.checkedFiles.length}`);
   for (const rel of [
     'scripts/pre-tool-approval.mjs',
     'scripts/lib/io-utils.mjs',
     'scripts/lib/security.mjs',
+    'scripts/lib/agy-session-pool.mjs',
     'scripts/lib/feishu-cards.mjs',
     'scripts/lib/cardkit-stream.mjs',
     'scripts/lib/feishu-docs.mjs',
     'scripts/lib/feishu-tasks.mjs',
     'scripts/lib/bridge-helpers.mjs',
+    'scripts/lib/command-boards.mjs',
     'scripts/lib/task-runner.mjs',
     'scripts/lib/slash-commands.mjs',
     'scripts/lib/card-actions.mjs',
     'scripts/lib/desktop-sessions.mjs',
     'scripts/lib/mobile-handoff.mjs',
     'scripts/lib/command-guard.mjs',
+    'scripts/lib/actions/command-boards.mjs',
     'scripts/lib/actions/desktop.mjs',
     'scripts/lib/actions/artifacts.mjs',
     'scripts/lib/actions/ops.mjs',

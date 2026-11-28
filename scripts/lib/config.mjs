@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { writePrivateJsonAtomic } from './io-utils.mjs';
+import { withFileLock, writePrivateJsonAtomic } from './io-utils.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -125,7 +125,7 @@ export const DEFAULT_CONFIG = {
   },
   security: {
     allowedOpenIds: [],
-    autoBindFirstUser: true,
+    autoBindFirstUser: false,
     groupPolicy: 'mention',
     riskyCommandApproval: 'on',
     approvalTimeoutSeconds: 120,
@@ -201,6 +201,35 @@ export function saveConfig(cfg) {
   return merged;
 }
 
+/**
+ * Reload latest config under an advisory file lock, apply `mutator(config)`, and atomically save back.
+ */
+export function updateConfig(mutator) {
+  return withFileLock(path.join(getConfigDir(), '.config.lock'), () => {
+    const latest = loadConfig();
+    if (typeof mutator === 'function') {
+      mutator(latest);
+    }
+    return saveConfig(latest);
+  });
+}
+
+/**
+ * Resolve an owner `open_id` without misinterpreting group `chat_id` (`oc_...`) defaults as an `open_id`.
+ */
+export function resolveOwnerOpenId(config, explicitOpenId = '') {
+  const explicit = String(explicitOpenId || '').trim();
+  if (explicit) return explicit;
+  const defId = String(config?.notifications?.defaultReceiveId || '').trim();
+  const defType = String(config?.notifications?.defaultReceiveIdType || '').trim().toLowerCase();
+  if (defId && (defId.startsWith('ou_') || (defType === 'open_id' && !defId.startsWith('oc_')))) {
+    return defId;
+  }
+  const allowed = Array.isArray(config?.security?.allowedOpenIds) ? config.security.allowedOpenIds : [];
+  const ouMatch = allowed.find((id) => String(id || '').trim().startsWith('ou_'));
+  return String(ouMatch || allowed[0] || '').trim();
+}
+
 export function loadState() {
   const statePath = getStatePath();
   if (!fs.existsSync(statePath)) {
@@ -248,14 +277,16 @@ export function saveState(state) {
 }
 
 /**
- * Reload latest state from disk, apply `mutator(state)`, and atomically save back.
+ * Reload latest state from disk under an advisory file lock, apply `mutator(state)`, and atomically save back.
  */
 export function updateState(mutator) {
-  const latest = loadState();
-  if (typeof mutator === 'function') {
-    mutator(latest);
-  }
-  return saveState(latest);
+  return withFileLock(path.join(getConfigDir(), '.state.lock'), () => {
+    const latest = loadState();
+    if (typeof mutator === 'function') {
+      mutator(latest);
+    }
+    return saveState(latest);
+  });
 }
 
 export function detectAgyBin() {

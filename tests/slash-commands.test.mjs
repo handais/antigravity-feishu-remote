@@ -332,5 +332,107 @@ describe('slash-commands coverage', () => {
     const newRes = await runCmd('/new');
     assert.equal(newRes.handled, true);
     assert.equal(loadState().chats.oc_slash.pendingCommand, null);
+    const newCard = newRes.calls.repliedCards[0].card;
+    const newJson = JSON.stringify(newCard);
+    assert.equal(newCard.header.title.content, '🆕 已开启新对话');
+    assert.ok(newJson.includes('工作目录'));
+    assert.ok(newJson.includes('执行模式'));
+    assert.ok(newJson.includes('当前模型'));
+    assert.ok(newJson.includes('推理强度'));
+    assert.ok(newJson.includes('单轮超时'));
+    assert.ok(newJson.includes('📁 切换目录'));
+  });
+
+  it('preserves multiline Markdown in /doc create, blocks /send sensitive files, validates /model, and resolves owner open_id safely', async () => {
+    const { resolveOwnerOpenId } = await import('../scripts/lib/config.mjs');
+    const cfg = loadConfig();
+    cfg.notifications.defaultReceiveId = 'oc_group_not_open_id';
+    cfg.notifications.defaultReceiveIdType = 'chat_id';
+    cfg.security.allowedOpenIds = ['ou_real_owner'];
+    assert.equal(resolveOwnerOpenId(cfg), 'ou_real_owner');
+    assert.equal(resolveOwnerOpenId(cfg, 'ou_explicit'), 'ou_explicit');
+
+    // Multiline /doc create keeps newlines cleanly
+    let capturedDocBlocks = null;
+    const docClient = {
+      docx: {
+        v1: {
+          document: {
+            create: async () => ({ code: 0, data: { document: { document_id: 'docx_ml_1', title: 'Multi', revision_id: 1 } } }),
+            get: async () => ({ code: 0, data: { document: { title: 'Multi', revision_id: 1 } } }),
+            convert: async ({ data }) => {
+              capturedDocBlocks = data.content;
+              return { code: 0, data: { first_level_block_ids: ['b1'], blocks: [{ block_id: 'b1', block_type: 2, text: { elements: [{ text_run: { content: 'ok' } }] } }] } };
+            },
+          },
+          documentBlockDescendant: {
+            create: async () => ({ code: 0, data: { children: [{ block_id: 'b1' }] } }),
+          },
+        },
+      },
+      drive: {
+        v1: {
+          permissionMember: {
+            create: async () => ({ code: 0 }),
+          },
+        },
+      },
+      im: {
+        v1: {
+          message: {
+            reply: async () => ({ code: 0, data: { message_id: 'om_doc_ok' } }),
+          },
+        },
+      },
+    };
+    const docCtx = createBridgeContext({ client: docClient });
+    const docRes = await handleSlashCommand(docCtx, {
+      text: '/doc create Report | # Title\n\n- Line 1\n- Line 2',
+      chatId: 'oc_slash',
+      openId: 'ou_test_owner',
+      messageId: 'om_doc_1',
+      config: cfg,
+    });
+    assert.equal(docRes, true);
+    assert.ok(capturedDocBlocks.includes('# Title\n\n- Line 1\n- Line 2'), `Expected newlines preserved, got: ${capturedDocBlocks}`);
+
+    // /send rejects sensitive files (.env and ~/.gemini/*)
+    const dotEnvFile = path.join(env.workDir, '.env');
+    fs.writeFileSync(dotEnvFile, 'SECRET=123\n', 'utf8');
+    const fakeGeminiDb = path.join(env.workDir, '.gemini', 'antigravity-cli', 'conversation_summaries.db');
+    fs.mkdirSync(path.dirname(fakeGeminiDb), { recursive: true });
+    fs.writeFileSync(fakeGeminiDb, 'sqlite', 'utf8');
+
+    const { client: sendClient, calls: sendCalls } = createMockFeishuClient();
+    const sendCtx = createBridgeContext({ client: sendClient });
+    await handleSlashCommand(sendCtx, {
+      text: `/send ${dotEnvFile}`,
+      chatId: 'oc_slash',
+      openId: 'ou_test_owner',
+      messageId: 'om_send_env',
+      config: cfg,
+    });
+    assert.ok(JSON.stringify(sendCalls.repliedCards.at(-1).card).includes('拒绝外发敏感文件'));
+
+    await handleSlashCommand(sendCtx, {
+      text: `/send ${fakeGeminiDb}`,
+      chatId: 'oc_slash',
+      openId: 'ou_test_owner',
+      messageId: 'om_send_gemini',
+      config: cfg,
+    });
+    assert.ok(JSON.stringify(sendCalls.repliedCards.at(-1).card).includes('拒绝外发敏感文件'));
+
+    // /model rejects cmd.exe metacharacters
+    const { client: modClient, calls: modCalls } = createMockFeishuClient();
+    const modCtx = createBridgeContext({ client: modClient });
+    await handleSlashCommand(modCtx, {
+      text: '/model bad&calc',
+      chatId: 'oc_slash',
+      openId: 'ou_test_owner',
+      messageId: 'om_mod_bad',
+      config: cfg,
+    });
+    assert.ok(JSON.stringify(modCalls.repliedCards.at(-1).card).includes('无效模型名称'));
   });
 });

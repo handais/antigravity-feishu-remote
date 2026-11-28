@@ -5,8 +5,10 @@ import {
   buildCard,
   sanitizeForFeishuMarkdown,
   splitMarkdownChunks,
+  stampCardThreadRoot,
 } from './feishu-cards.mjs';
 import { isImageFilePath, resolveFeishuFileType } from './media.mjs';
+import { isSensitiveFilePath } from './security.mjs';
 
 export * from './feishu-cards.mjs';
 
@@ -46,8 +48,31 @@ export function assertLarkOk(res, action) {
   }
 }
 
+async function withLarkRetry(action, callFn) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const res = await callFn();
+      const resCode = Number(res?.code);
+      if ((resCode === 230020 || resCode === 429) && attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        continue;
+      }
+      assertLarkOk(res, action);
+      return res;
+    } catch (err) {
+      const code = Number(err?.response?.data?.code ?? err?.code);
+      const httpStatus = Number(err?.response?.status);
+      if ((code === 230020 || code === 429 || httpStatus === 429) && attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export async function sendCard(client, { receiveId, receiveIdType = 'open_id', card }) {
-  const res = await client.im.v1.message.create({
+  const res = await withLarkRetry('sendCard', () => client.im.v1.message.create({
     data: {
       receive_id: receiveId,
       msg_type: 'interactive',
@@ -56,8 +81,7 @@ export async function sendCard(client, { receiveId, receiveIdType = 'open_id', c
     params: {
       receive_id_type: receiveIdType,
     },
-  });
-  assertLarkOk(res, 'sendCard');
+  }));
   return res?.data?.message_id || '';
 }
 
@@ -92,17 +116,17 @@ export async function replyText(client, { messageId, text, replyInThread = false
 }
 
 export async function replyCard(client, { messageId, card, replyInThread = false }) {
-  const res = await client.im.v1.message.reply({
+  const outboundCard = replyInThread && messageId ? stampCardThreadRoot(card, messageId) : card;
+  const res = await withLarkRetry('replyCard', () => client.im.v1.message.reply({
     data: {
       msg_type: 'interactive',
-      content: JSON.stringify(card),
+      content: JSON.stringify(outboundCard),
       ...(replyInThread ? { reply_in_thread: true } : {}),
     },
     path: {
       message_id: messageId,
     },
-  });
-  assertLarkOk(res, 'replyCard');
+  }));
   return res?.data?.message_id || '';
 }
 
@@ -115,24 +139,7 @@ export async function patchCard(client, { messageId, card }) {
       message_id: messageId,
     },
   };
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const res = await client.im.v1.message.patch(payload);
-      if (res && Number(res.code) === 230020 && attempt === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 600));
-        continue;
-      }
-      assertLarkOk(res, 'patchCard');
-      return;
-    } catch (err) {
-      const code = Number(err?.response?.data?.code ?? err?.code);
-      if (code === 230020 && attempt === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 600));
-        continue;
-      }
-      throw err;
-    }
-  }
+  await withLarkRetry('patchCard', () => client.im.v1.message.patch(payload));
 }
 
 export async function deliverFinalCard(
@@ -162,13 +169,16 @@ export async function deliverFinalCard(
     const partTitle = chunks.length > 1 ? `${title} (${i + 1}/${chunks.length})` : title;
     const partFooter = isLast ? footer : '';
     const partButtons = isLast ? buttonRows : [];
-    const card = buildCard({
+    const rawCard = buildCard({
       title: partTitle,
       template,
       markdown: chunks[i],
       footer: partFooter,
       buttonRows: partButtons,
     });
+    const card = replyInThread && replyTargetMessageId
+      ? stampCardThreadRoot(rawCard, replyTargetMessageId)
+      : rawCard;
 
     if (i === 0 && replyMessageId) {
       try {
@@ -341,6 +351,9 @@ export async function sendLocalMedia(
   client,
   { receiveId, receiveIdType = 'open_id', filePath, forceFile = false, replyToMessageId = '', replyInThread = false },
 ) {
+  if (isSensitiveFilePath(filePath)) {
+    throw new Error(`出于隐私与安全保护，拒绝外发敏感文件：${path.basename(String(filePath || ''))}`);
+  }
   if (!forceFile && isImageFilePath(filePath)) {
     return uploadAndSendImage(client, { receiveId, receiveIdType, filePath, replyToMessageId, replyInThread });
   }

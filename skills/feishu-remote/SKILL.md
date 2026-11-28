@@ -30,7 +30,7 @@ cd ~/.gemini/config/plugins/feishu-remote
    - **事件配置**: Choose **使用长连接接收事件 (WebSocket Long Connection)** and subscribe to **`im.message.receive_v1`** and **`application.bot.menu_v6`** (for Bot Custom Menu click events).
    - **回调配置**: Choose **使用长连接接收回调** and subscribe to **`card.action.trigger`** (for interactive Control Panel, Directory Browser (`/dirs`), Commands & Skills (`/` / `/skills`), Git (`/git`), Scopes (`/scopes`), Queue (`/queue`), Retry, Session, Model, and Abort buttons).
 5. Under **应用能力 → 机器人 → 机器人自定义菜单 (Optional, Recommended)**:
-   - Enable **机器人自定义菜单** (prefer **悬浮菜单**) with shortcut buttons pushing event keys `menu_panel`, `menu_commands`, `menu_new`, `menu_stop` (also supports `menu_skills`, `menu_dirs`, `menu_git`, `menu_scopes`, `menu_queue`, `menu_mode_temp_full`, `menu_ops`, `menu_reload`, `menu_sessions`, `menu_models`, `menu_mode_full`, `menu_help`) or sending `/panel`, `/`, `/new`, `/stop`.
+   - Enable **机器人自定义菜单** (prefer **悬浮菜单**) with shortcut buttons pushing event keys `menu_panel`, `menu_commands`, `menu_new`, `menu_stop` (also supports `menu_skills`, `menu_dirs`, `menu_effort`, `menu_git`, `menu_scopes`, `menu_queue`, `menu_mode_temp_full`, `menu_ops`, `menu_reload`, `menu_sessions`, `menu_models`, `menu_mode_full`, `menu_goal`, `menu_swarm`, `menu_schedule`, `menu_plan`, `menu_help`) or sending `/panel`, `/`, `/new`, `/stop`.
 6. Under **版本管理与发布**, create and publish a version (or enable in test/dev scope).
 
 ## 3. Setup & Manage Daemon (`scripts/cli.mjs`)
@@ -39,13 +39,15 @@ Run commands with `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs`:
 
 - **Configure credentials & defaults**:
   ```bash
-  node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup \
+  printf '%s' "<APP_SECRET>" | node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs setup \
     --app-id "<APP_ID>" \
-    --app-secret "<APP_SECRET>" \
+    --app-secret-stdin \
+    --allow-open-id "<YOUR_OPEN_ID>" \
     --cwd "$HOME" \
     --mode accept-edits
   ```
   Optional flags:
+  - `--app-secret-stdin` / `FEISHU_APP_SECRET` env var (recommended instead of passing `--app-secret` via shell argv)
   - `--domain feishu|lark` (default `feishu`)
   - `--model <model-id>`
   - `--effort <low|medium|high|xhigh|max|default>` (default `default`)
@@ -53,7 +55,8 @@ Run commands with `node ~/.gemini/config/plugins/feishu-remote/scripts/cli.mjs`:
   - `--max-concurrent <1..10>` (default `4`; max simultaneous active `agy` runs across chats/topic threads)
   - `--proxy <http://127.0.0.1:7897>` (proxy for spawned `agy` subprocesses; auto-detected if omitted)
   - `--feishu-proxy <url>` (usually leave empty so Feishu connects directly)
-  - `--allow-open-id <ou_xxx>` (repeatable; if omitted, first private-chat sender is auto-bound)
+  - `--allow-open-id <ou_xxx>` (repeatable; `autoBindFirstUser` defaults to `false` for fail-closed security — pass `--auto-bind true` explicitly if first-P2P auto-bind is desired)
+  - `--auto-bind true|false` (default `false`)
   - `--group-policy mention|off|all` (default `mention`)
   - `--stop-hook true|false` (default `true`; desktop completion cards include a `📱 接管此对话` handoff button)
   - `--notify-mode on|away|off` & `--away-seconds <10..3600>` (default `on`, `120`s; `away` suppresses desktop completion notifications while active at the keyboard)

@@ -1,17 +1,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { listAgyModels, VALID_EFFORTS, VALID_MODES } from '../agy-runner.mjs';
-import { saveConfig, saveState } from '../config.mjs';
+import {
+  isSafeCliConversationId,
+  isValidModelName,
+  listAgyModels,
+  VALID_EFFORTS,
+  VALID_MODES,
+} from '../agy-runner.mjs';
+import { updateConfig, updateState } from '../config.mjs';
 import {
   buildAgySkillsCard,
   buildCard,
   buildDirsCard,
   buildEffortCard,
+  buildNewSessionCard,
   buildPanelHelpCard,
   canonicalizeDirPath,
   getActivePendingCommand,
   isValidCommandPrefix,
   patchCard,
+  stampCardThreadRoot,
 } from '../feishu-api.mjs';
 import {
   buildModelsCard,
@@ -91,8 +99,10 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
   if (cmd === 'skills_menu') {
     const activePending = getActivePendingCommand(chatState);
     if (!activePending && chatState.pendingCommand) {
+      updateState((latest) => {
+        getOrCreateChatState(latest, runKey, config).pendingCommand = null;
+      });
       chatState.pendingCommand = null;
-      saveState(state);
     }
     const skillPage = Math.max(0, Math.floor(Number(value?.skillPage || 0)));
     const card = buildAgySkillsCard({ pendingCommand: activePending, skillPage });
@@ -113,25 +123,32 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
     const skillPage = Math.max(0, Math.floor(Number(value?.skillPage || 0)));
     const current = getActivePendingCommand(chatState);
     if (current && current.prefix === prefix) {
+      updateState((latest) => {
+        getOrCreateChatState(latest, runKey, config).pendingCommand = null;
+      });
       chatState.pendingCommand = null;
-      saveState(state);
       const card = buildAgySkillsCard({ pendingCommand: null, skillPage });
       return toastCardResponse('info', `已取消预选：${prefix}`, inplace ? card : null);
     }
-    chatState.pendingCommand = {
+    const nextPending = {
       prefix,
       kind: value?.kind === 'skill' ? 'skill' : 'builtin',
       armedAt: Date.now(),
     };
-    saveState(state);
-    const card = buildAgySkillsCard({ pendingCommand: chatState.pendingCommand, skillPage });
+    updateState((latest) => {
+      getOrCreateChatState(latest, runKey, config).pendingCommand = nextPending;
+    });
+    chatState.pendingCommand = nextPending;
+    const card = buildAgySkillsCard({ pendingCommand: nextPending, skillPage });
     return toastCardResponse('success', `✅ 已预选 ${prefix}，直接发送任务内容即可`, inplace ? card : null);
   }
 
   if (cmd === 'clear_pending_cmd') {
     const prev = getActivePendingCommand(chatState);
+    updateState((latest) => {
+      getOrCreateChatState(latest, runKey, config).pendingCommand = null;
+    });
     chatState.pendingCommand = null;
-    saveState(state);
     if (value?.fromSkills) {
       const skillPage = Math.max(0, Math.floor(Number(value?.skillPage || 0)));
       const card = buildAgySkillsCard({ pendingCommand: null, skillPage });
@@ -158,7 +175,6 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
     if (wasRunning && runner.getQueueForChat(runKey).length >= 5) {
       return toastCardResponse('warning', '任务队列已满（最多 5 条），请先清理队列');
     }
-    saveState(state);
     void runner.enqueueOrExecutePrompt({
       text: promptText,
       displayPreview: promptText,
@@ -176,37 +192,58 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
   }
 
   if (cmd === 'new') {
-    chatState.conversationId = '';
-    chatState.pendingHandoff = null;
-    chatState.pendingCommand = null;
-    chatState.originDesktopSession = null;
-    chatState.lastTurnArtifacts = null;
-    chatState.topicClosed = false;
-    saveState(state);
-    return toastCardResponse('success', '✅ 已开启新对话', inplace ? renderPanel() : null);
+    runner?.releasePersistentSession?.(runKey);
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      targetChat.conversationId = '';
+      targetChat.persistentSession = false;
+      targetChat.pendingHandoff = null;
+      targetChat.pendingCommand = null;
+      targetChat.originDesktopSession = null;
+      targetChat.lastTurnArtifacts = null;
+      targetChat.topicClosed = false;
+      Object.assign(chatState, targetChat);
+    });
+    if (inplace) {
+      return toastCardResponse('success', '✅ 已开启新对话', renderPanel());
+    }
+    void sendToTarget(buildNewSessionCard({ chatState, config, threadRootId })).catch((err) => {
+      console.error('[feishu-remote] send new session card error:', err?.message || err);
+    });
+    return toastCardResponse('success', '✅ 已开启新对话');
   }
 
   if (cmd === 'mode') {
     if (!VALID_MODES.includes(arg)) {
       return toastCardResponse('error', `无效模式：${arg}`);
     }
-    chatState.mode = arg;
-    chatState.fullExpiresAt = 0;
-    saveState(state);
+    runner?.releasePersistentSession?.(runKey);
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      targetChat.mode = arg;
+      targetChat.fullExpiresAt = 0;
+      targetChat.persistentSession = false;
+      Object.assign(chatState, targetChat);
+    });
     return toastCardResponse('success', `已切换为 ${arg} 模式`, inplace ? renderPanel() : null);
   }
 
   if (cmd === 'mode_temp_full') {
     const minutes = normalizeTempMinutes(arg, 30);
-    chatState.fullRevertMode =
-      chatState.mode && chatState.mode !== 'full'
-        ? chatState.mode
-        : chatState.fullRevertMode && chatState.fullRevertMode !== 'full'
-          ? chatState.fullRevertMode
-          : 'accept-edits';
-    chatState.mode = 'full';
-    chatState.fullExpiresAt = Date.now() + minutes * 60_000;
-    saveState(state);
+    runner?.releasePersistentSession?.(runKey);
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      targetChat.fullRevertMode =
+        targetChat.mode && targetChat.mode !== 'full'
+          ? targetChat.mode
+          : targetChat.fullRevertMode && targetChat.fullRevertMode !== 'full'
+            ? targetChat.fullRevertMode
+            : 'accept-edits';
+      targetChat.mode = 'full';
+      targetChat.fullExpiresAt = Date.now() + minutes * 60_000;
+      targetChat.persistentSession = false;
+      Object.assign(chatState, targetChat);
+    });
     return toastCardResponse(
       'warning',
       `⚡ 已开启 ${minutes}m 临时全权（到期自动切回 ${chatState.fullRevertMode}）`,
@@ -230,8 +267,11 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
     if (normalized && normalized !== 'default' && !VALID_EFFORTS.includes(normalized)) {
       return toastCardResponse('error', `无效推理强度：${arg}`);
     }
-    chatState.effort = normalized === 'default' || !normalized ? '' : normalized;
-    saveState(state);
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      targetChat.effort = normalized === 'default' || !normalized ? '' : normalized;
+      Object.assign(chatState, targetChat);
+    });
     return toastCardResponse(
       'success',
       `已切换推理强度为 ${chatState.effort || 'default'}`,
@@ -246,11 +286,14 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
       if (!stat.isDirectory()) {
         return toastCardResponse('error', '目标路径不是文件夹');
       }
-      chatState.cwd = targetDir;
-      if (threadRootId && targetChatId) {
-        getOrCreateChatState(state, targetChatId, config).cwd = targetDir;
-      }
-      saveState(state);
+      updateState((latest) => {
+        const targetChat = getOrCreateChatState(latest, runKey, config);
+        targetChat.cwd = targetDir;
+        if (threadRootId && targetChatId) {
+          getOrCreateChatState(latest, targetChatId, config).cwd = targetDir;
+        }
+        Object.assign(chatState, targetChat);
+      });
       return toastCardResponse(
         'success',
         `已切换目录到 ${path.basename(targetDir) || targetDir}`,
@@ -277,9 +320,10 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
       nextFavorites = [resolved, ...existing];
       actionLabel = '已收藏到快捷目录';
     }
+    updateConfig((c) => {
+      c.agy.favoriteDirs = nextFavorites;
+    });
     config.agy.favoriteDirs = nextFavorites;
-    saveConfig(config);
-    saveState(state);
     const page = Number(value?.page || 0);
     if (cmd === 'pin_in_dirs') {
       return toastCardResponse('success', actionLabel, buildDirsCard({ chatState, config, page }));
@@ -289,9 +333,12 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
 
   if (cmd === 'dirs') {
     if (value?.showHidden !== undefined) {
-      chatState.showHiddenDirs = Boolean(value.showHidden);
+      updateState((latest) => {
+        const targetChat = getOrCreateChatState(latest, runKey, config);
+        targetChat.showHiddenDirs = Boolean(value.showHidden);
+        Object.assign(chatState, targetChat);
+      });
     }
-    saveState(state);
     const page = Number(value?.page || 0);
     const card = buildDirsCard({ chatState, config, page });
     if (inplace) {
@@ -317,11 +364,14 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
       if (!stat.isDirectory()) {
         return toastCardResponse('error', '目标路径不是文件夹');
       }
-      chatState.cwd = targetDir;
-      if (threadRootId && targetChatId) {
-        getOrCreateChatState(state, targetChatId, config).cwd = targetDir;
-      }
-      saveState(state);
+      updateState((latest) => {
+        const targetChat = getOrCreateChatState(latest, runKey, config);
+        targetChat.cwd = targetDir;
+        if (threadRootId && targetChatId) {
+          getOrCreateChatState(latest, targetChatId, config).cwd = targetDir;
+        }
+        Object.assign(chatState, targetChat);
+      });
       return toastCardResponse(
         'success',
         `已进入 ${path.basename(targetDir) || targetDir}`,
@@ -351,32 +401,52 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
     const allSessions = collectFeishuSessions(state, runKey, { scope: 'all', limit: 50 });
     const matched = allSessions.find((s) => s.id === arg || s.id.startsWith(arg)) || null;
     const resolvedId = matched?.id || arg;
-    chatState.conversationId = resolvedId;
-    chatState.pendingHandoff = null;
-    chatState.pendingCommand = null;
-    chatState.originDesktopSession = null;
-    chatState.lastTurnArtifacts = null;
-    chatState.topicClosed = false;
+    if (!isSafeCliConversationId(resolvedId)) {
+      return toastCardResponse('error', '无效会话 ID 格式');
+    }
+    runner?.releasePersistentSession?.(runKey);
+    let cwdSynced = '';
     if (matched && matched.sourceKind !== 'current' && matched.cwd) {
       try {
         if (fs.existsSync(matched.cwd) && fs.statSync(matched.cwd).isDirectory()) {
-          chatState.cwd = matched.cwd;
+          cwdSynced = matched.cwd;
         }
       } catch {
         // Ignore inaccessible cwd
       }
     }
-    saveState(state);
+    let nextStateSnapshot = state;
+    nextStateSnapshot = updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      targetChat.conversationId = resolvedId;
+      targetChat.persistentSession = false;
+      targetChat.pendingHandoff = null;
+      targetChat.pendingCommand = null;
+      targetChat.originDesktopSession = null;
+      targetChat.lastTurnArtifacts = null;
+      targetChat.topicClosed = false;
+      if (cwdSynced) {
+        targetChat.cwd = cwdSynced;
+      }
+      Object.assign(chatState, targetChat);
+    });
     return toastCardResponse(
       'success',
       `已切换到会话 ${resolvedId.slice(0, 8)}`,
-      inplace ? buildSessionsCard(chatState, { state, sessionKey: runKey, scope }) : null,
+      inplace ? buildSessionsCard(chatState, { state: nextStateSnapshot, sessionKey: runKey, scope }) : null,
     );
   }
 
   if (cmd === 'model') {
-    chatState.model = arg === 'default' || !arg ? '' : arg;
-    saveState(state);
+    const cleanModel = arg.trim();
+    if (cleanModel && cleanModel !== 'default' && !isValidModelName(cleanModel)) {
+      return toastCardResponse('error', '无效模型名称格式');
+    }
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      targetChat.model = cleanModel === 'default' || !cleanModel ? '' : cleanModel;
+      Object.assign(chatState, targetChat);
+    });
     return toastCardResponse(
       'success',
       `已切换模型为 ${chatState.model || 'default'}`,
@@ -386,9 +456,12 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
 
   if (cmd === 'sessions') {
     const scope = String(value?.scope || 'all').trim().toLowerCase() === 'current' ? 'current' : 'all';
-    chatState.lastSessionsScope = scope;
-    saveState(state);
-    const card = buildSessionsCard(chatState, { state, sessionKey: runKey, scope });
+    const nextStateSnapshot = updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      targetChat.lastSessionsScope = scope;
+      Object.assign(chatState, targetChat);
+    });
+    const card = buildSessionsCard(chatState, { state: nextStateSnapshot, sessionKey: runKey, scope });
     const isTopic = Boolean(parseSessionKey(runKey).threadRootId);
     const scopeLabel = scope === 'current' ? (isTopic ? '本话题会话' : '本窗口会话') : '全部飞书会话';
     if (inplace) {
@@ -403,7 +476,8 @@ export async function handleWorkspaceAndSessionAction(actionCtx) {
   if (cmd === 'models') {
     void listAgyModels(config)
       .then(async (models) => {
-        const card = buildModelsCard(models, chatState.model);
+        const rawCard = buildModelsCard(models, chatState.model);
+        const card = threadRootId ? stampCardThreadRoot(rawCard, threadRootId) : rawCard;
         if (inplace && openMessageId) {
           try {
             await patchCard(client, { messageId: openMessageId, card });
