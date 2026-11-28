@@ -5,6 +5,7 @@ import {
   buildNotifyCard,
   buildScopesCard,
   buildSystemSettingsCard,
+  buildTimeoutCard,
 } from '../feishu-api.mjs';
 import { applyPendingAppScopes, queryAppScopes } from '../feishu-docs.mjs';
 import {
@@ -18,7 +19,10 @@ import {
 import {
   buildCurrentOpsCard,
   collectGitInfoAsync,
+  formatTimeoutLabel,
   formatUptime,
+  getOrCreateChatState,
+  parseTimeoutArg,
   toastCardResponse,
 } from '../bridge-helpers.mjs';
 
@@ -35,6 +39,7 @@ export async function handleOpsAction(actionCtx) {
     targetChatId,
     threadRootId,
     runKey,
+    value,
     cmd,
     arg,
     inplace,
@@ -52,6 +57,7 @@ export async function handleOpsAction(actionCtx) {
   if (cmd === 'system_menu') {
     const card = buildSystemSettingsCard({
       config,
+      chatState,
       isRunning: anyBusy(),
       uptimeText: formatUptime(Date.now() - (startedAt || Date.now())),
     });
@@ -71,6 +77,7 @@ export async function handleOpsAction(actionCtx) {
     state.panelActionUsage = {};
     const card = buildSystemSettingsCard({
       config,
+      chatState,
       isRunning: anyBusy(),
       uptimeText: formatUptime(Date.now() - (startedAt || Date.now())),
     });
@@ -164,6 +171,74 @@ export async function handleOpsAction(actionCtx) {
       'success',
       `🧠 已设为离开电脑 ≥ ${minLabel} 分钟才提醒`,
       inplace ? buildNotifyCard({ config }) : null,
+    );
+  }
+
+  if (cmd === 'timeout_menu') {
+    const card = buildTimeoutCard({ chatState, config });
+    if (inplace) {
+      return toastCardResponse('info', '单轮超时设置', card);
+    }
+    void sendToTarget(card).catch((err) => {
+      console.error('[feishu-remote] send timeout card error:', err.message);
+    });
+    return toastCardResponse('info', '已打开单轮超时设置');
+  }
+
+  if (cmd === 'timeout_set') {
+    const seconds = parseTimeoutArg(arg);
+    if (seconds === null) {
+      return toastCardResponse('error', `无效超时参数：${arg}`);
+    }
+    const scope = String(value?.scope || 'global').trim().toLowerCase();
+    if (scope === 'chat') {
+      updateState((latest) => {
+        const targetChat = getOrCreateChatState(latest, runKey, config);
+        targetChat.timeoutSeconds = seconds;
+        Object.assign(chatState, targetChat);
+      });
+      return toastCardResponse(
+        'success',
+        `⏱️ 本会话单轮超时已设为：${formatTimeoutLabel(seconds)}`,
+        inplace ? buildTimeoutCard({ chatState, config }) : null,
+      );
+    }
+
+    updateConfig((c) => {
+      c.agy.timeoutSeconds = seconds;
+    });
+    config.agy.timeoutSeconds = seconds;
+    let clearedOverride = false;
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      if (targetChat.timeoutSeconds !== undefined && targetChat.timeoutSeconds !== null) {
+        delete targetChat.timeoutSeconds;
+        clearedOverride = true;
+      }
+      delete chatState.timeoutSeconds;
+      Object.assign(chatState, targetChat);
+    });
+    const toastText = clearedOverride
+      ? `⏱️ 全局单轮超时已设为：${formatTimeoutLabel(seconds)}（已清除本会话覆盖）`
+      : `⏱️ 全局单轮超时已设为：${formatTimeoutLabel(seconds)}`;
+    return toastCardResponse(
+      'success',
+      toastText,
+      inplace ? buildTimeoutCard({ chatState, config }) : null,
+    );
+  }
+
+  if (cmd === 'timeout_clear_override') {
+    updateState((latest) => {
+      const targetChat = getOrCreateChatState(latest, runKey, config);
+      delete targetChat.timeoutSeconds;
+      delete chatState.timeoutSeconds;
+      Object.assign(chatState, targetChat);
+    });
+    return toastCardResponse(
+      'success',
+      `↩️ 已清除本会话覆盖，恢复跟随全局默认（${formatTimeoutLabel(config?.agy?.timeoutSeconds ?? 3600)}）`,
+      inplace ? buildTimeoutCard({ chatState, config }) : null,
     );
   }
 

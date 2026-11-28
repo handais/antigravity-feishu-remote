@@ -14,6 +14,7 @@ const env = createTestEnv('feishu-slash-cmds-');
 let config;
 
 const { loadConfig, loadState, resolveRiskyApprovalEnabled, saveState } = await import('../scripts/lib/config.mjs');
+const { resolveEffectiveTimeoutSeconds } = await import('../scripts/lib/bridge-helpers.mjs');
 const { handleSlashCommand } = await import('../scripts/lib/slash-commands.mjs');
 
 describe('slash-commands coverage', () => {
@@ -141,9 +142,23 @@ describe('slash-commands coverage', () => {
     assert.equal(modeTemp.handled, true);
     assert.ok(JSON.stringify(modeTemp.calls.repliedCards[0].card).includes('临时 15 分钟'));
 
-    const timeoutRes = await runCmd('/timeout 2h');
+    const timeoutMenuRes = await runCmd('/timeout');
+    assert.equal(timeoutMenuRes.handled, true);
+    const timeoutMenuJson = JSON.stringify(timeoutMenuRes.calls.repliedCards[0].card);
+    assert.ok(timeoutMenuJson.includes('单轮任务超时设置'));
+    assert.ok(timeoutMenuJson.includes('"cmd":"timeout_set"'));
+
+    // Simulate a prior per-chat override (e.g. from /goal board) and ensure /timeout clears it
+    const stBeforeTimeout = loadState();
+    stBeforeTimeout.chats.oc_slash = { ...(stBeforeTimeout.chats.oc_slash || {}), timeoutSeconds: 0 };
+    saveState(stBeforeTimeout);
+
+    const timeoutRes = await runCmd('/timeout 90m');
     assert.equal(timeoutRes.handled, true);
-    assert.equal(loadConfig().agy.timeoutSeconds, 7200);
+    assert.equal(loadConfig().agy.timeoutSeconds, 5400);
+    assert.equal(loadState().chats.oc_slash?.timeoutSeconds, undefined);
+    assert.equal(resolveEffectiveTimeoutSeconds(loadState().chats.oc_slash, loadConfig()), 5400);
+    assert.ok(JSON.stringify(timeoutRes.calls.repliedCards[0].card).includes('已清除本会话覆盖'));
 
     const effortRes = await runCmd('/effort high');
     assert.equal(effortRes.handled, true);

@@ -28,6 +28,7 @@ import {
   buildQueueListCard,
   buildScopesCard,
   buildTasksCard,
+  buildTimeoutCard,
   canonicalizeDirPath,
   getActivePendingCommand,
   replyCard as sendReplyCard,
@@ -943,18 +944,9 @@ export async function handleSlashCommand(
 
   if (cmd === '/timeout') {
     if (!arg) {
-      await replySimple({
-        title: '⏱️ 单轮任务超时设置',
-        template: 'blue',
-        markdown: [
-          `- **当前超时**：\`${formatTimeoutLabel(resolveEffectiveTimeoutSeconds(chatState, config))}\``,
-          '',
-          '**调整用法（下条任务起实时生效）：**',
-          '- `/timeout 60`（或 `/timeout 120m`）：设为 60 / 120 分钟',
-          '- `/timeout 2h`：设为 2 小时（最长 24 小时）',
-          '- `/timeout 0`：设为**不限时**（直到任务自然完成或手动 `/stop`）',
-        ].join('\n'),
-        buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+      await replyCard(client, {
+        messageId,
+        card: buildTimeoutCard({ chatState, config }),
       });
       return true;
     }
@@ -965,7 +957,10 @@ export async function handleSlashCommand(
         title: '⚠️ 超时参数格式无效',
         template: 'orange',
         markdown: `未能解析 \`${arg}\`。\n示例：\`/timeout 60\`、\`/timeout 2h\`、\`/timeout 90s\`、\`/timeout 0\`（不限时）`,
-        buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+        buttonRows: [[
+          { label: '⏱️ 超时设置', value: { cmd: 'timeout_menu' } },
+          { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
+        ]],
       });
       return true;
     }
@@ -974,16 +969,26 @@ export async function handleSlashCommand(
       c.agy.timeoutSeconds = seconds;
     });
     config.agy.timeoutSeconds = seconds;
+    const hadChatOverride = chatState.timeoutSeconds !== undefined && chatState.timeoutSeconds !== null;
+    if (hadChatOverride) {
+      persistChatMutation((c) => {
+        delete c.timeoutSeconds;
+      });
+    }
     await replySimple({
       title: '⏱️ 已更新单轮超时设置',
       template: 'green',
       markdown: [
         `- **最新超时**：\`${formatTimeoutLabel(seconds)}\``,
+        hadChatOverride ? '- **已清除本会话覆盖**：当前会话将立即使用新的全局超时' : '',
         seconds === 0
           ? '- **说明**：任务将一直运行到自然结束（可随时点卡片「🛑 立即中止」或发 `/stop`）'
           : '- **说明**：超过 10 分钟的长任务会自动切为全卡节流刷新，保证持续更新与最终送达',
-      ].join('\n'),
-      buttonRows: [[{ label: '⚙️ 控制面板', value: { cmd: 'panel' } }]],
+      ].filter(Boolean).join('\n'),
+      buttonRows: [[
+        { label: '⏱️ 超时设置', value: { cmd: 'timeout_menu' } },
+        { label: '⚙️ 控制面板', value: { cmd: 'panel' } },
+      ]],
     });
     return true;
   }

@@ -427,6 +427,7 @@ const TRACKED_DIRECT_PANEL_CMDS = new Set([
   'mode_temp_full',
   'safe_restart',
   'notify_menu',
+  'timeout_menu',
   'guard_toggle',
   'scopes',
   'ops',
@@ -533,6 +534,7 @@ export function buildFrequentPanelButtons({
     },
     safe_restart: { label: '♻️ 安全重启', value: { cmd: 'safe_restart', inplace: true } },
     notify_menu: { label: '🔔 桌面提醒', value: { cmd: 'notify_menu', inplace: true } },
+    timeout_menu: { label: '⏱️ 单轮超时', value: { cmd: 'timeout_menu', inplace: true } },
     guard_toggle: {
       label: guardEnabled ? '🛡️ 高危审批:开' : '⚪ 高危审批:关',
       value: { cmd: 'guard_toggle', inplace: true },
@@ -799,6 +801,33 @@ export function buildControlPanelCard({
   });
 }
 
+function formatCardTimeoutLabel(sec) {
+  const n = Number(sec);
+  if (!n || n <= 0) return '不限时';
+  const s = Math.floor(n);
+  if (s >= 60) {
+    return `${Math.round(s / 60)} 分钟（${s}s）`;
+  }
+  return `${s} 秒`;
+}
+
+function resolveTimeoutDisplay(chatState, config) {
+  const rawGlobal = config?.agy?.timeoutSeconds;
+  const globalSec = rawGlobal !== undefined && rawGlobal !== null && Number.isFinite(Number(rawGlobal)) && Number(rawGlobal) >= 0
+    ? Math.floor(Number(rawGlobal))
+    : 3600;
+  const rawPerChat = chatState?.timeoutSeconds;
+  const hasOverride = rawPerChat !== undefined && rawPerChat !== null && Number.isFinite(Number(rawPerChat)) && Number(rawPerChat) >= 0;
+  const effectiveSec = hasOverride ? Math.floor(Number(rawPerChat)) : globalSec;
+  return {
+    effectiveSec,
+    globalSec,
+    hasOverride,
+    effectiveLabel: formatCardTimeoutLabel(effectiveSec),
+    globalLabel: formatCardTimeoutLabel(globalSec),
+  };
+}
+
 export function buildNewSessionCard({ chatState, config, threadRootId = '' } = {}) {
   const cwd = chatState?.cwd || config?.agy?.defaultCwd || os.homedir();
   const mode = chatState?.mode || config?.agy?.defaultMode || 'accept-edits';
@@ -811,15 +840,7 @@ export function buildNewSessionCard({ chatState, config, threadRootId = '' } = {
   const modeDisplay = isTempFull
     ? `\`full\`（⏱️ 临时全权，约 ${remainingMin} 分钟后自动切回 \`${revertMode}\`）`
     : `\`${mode}\``;
-  const rawTimeoutSec = chatState?.timeoutSeconds !== undefined && chatState?.timeoutSeconds !== null
-    ? chatState.timeoutSeconds
-    : (config?.agy?.timeoutSeconds ?? 3600);
-  const timeoutSec = Number(rawTimeoutSec);
-  const timeoutLabel = !timeoutSec || timeoutSec <= 0
-    ? '不限时'
-    : timeoutSec >= 60
-      ? `${Math.round(timeoutSec / 60)} 分钟（${Math.floor(timeoutSec)}s）`
-      : `${Math.floor(timeoutSec)} 秒`;
+  const timeoutInfo = resolveTimeoutDisplay(chatState, config);
 
   const lines = [
     threadRootId ? `- **所属话题**：\`${threadRootId.slice(0, 12)}\`（独立并行会话）` : '',
@@ -827,7 +848,7 @@ export function buildNewSessionCard({ chatState, config, threadRootId = '' } = {
     `- **执行模式**：${modeDisplay}`,
     `- **当前模型**：\`${model || 'default (随 CLI 配置)'}\``,
     `- **推理强度**：\`${effort || 'default (随 CLI 配置)'}\``,
-    `- **单轮超时**：\`${timeoutLabel}\``,
+    `- **单轮超时**：\`${timeoutInfo.effectiveLabel}\``,
     '',
     '下条消息将以上述配置开启全新上下文。',
   ].filter((line, idx, arr) => line !== '' || (idx > 0 && arr[idx - 1] !== ''));
@@ -851,7 +872,7 @@ export function buildNewSessionCard({ chatState, config, threadRootId = '' } = {
   });
 }
 
-export function buildSystemSettingsCard({ config, isRunning = false, uptimeText = '' } = {}) {
+export function buildSystemSettingsCard({ config, chatState = null, isRunning = false, uptimeText = '' } = {}) {
   const guardEnabled = resolveRiskyApprovalEnabled(config);
   const timeoutSec = Math.max(15, Math.min(160, Number(config?.security?.approvalTimeoutSeconds || 120)));
   const notifyMode = resolveStopNotifyMode(config);
@@ -862,10 +883,12 @@ export function buildSystemSettingsCard({ config, isRunning = false, uptimeText 
       ? `🧠 仅离开电脑时（空闲 ≥ ${awayMin}m）`
       : '🔕 已关闭';
   const defaultTopic = String(config?.notifications?.defaultTopicChatId || '').trim();
+  const timeoutInfo = resolveTimeoutDisplay(chatState, config);
 
   const lines = [
     `- **高危命令审批**：${guardEnabled ? `🛡️ 已开启（超时 \`${timeoutSec}s\` 自动拒绝）` : '⚪ 已关闭'}`,
     `- **桌面端完成提醒**：${notifyLabel}`,
+    `- **单轮超时**：\`${timeoutInfo.effectiveLabel}\`${timeoutInfo.hasOverride ? `（本会话覆盖；全局 \`${timeoutInfo.globalLabel}\`）` : '（全局默认）'}`,
     `- **默认接管话题群**：\`${defaultTopic || '自动记忆最近活跃话题群'}\``,
     `- **任务状态**：${isRunning ? '⏳ 有任务运行中' : '🟢 空闲'}${uptimeText ? ` · 守护进程在线 \`${uptimeText}\`` : ''}`,
   ];
@@ -885,6 +908,7 @@ export function buildSystemSettingsCard({ config, isRunning = false, uptimeText 
             value: { cmd: 'guard_toggle', inplace: true, fromSystem: true },
           },
           { label: '🔔 桌面提醒设置', value: { cmd: 'notify_menu', inplace: true } },
+          { label: '⏱️ 单轮超时', value: { cmd: 'timeout_menu', inplace: true } },
           { label: '🔐 应用权限自检', value: { cmd: 'scopes', inplace: true } },
         ]],
       },
@@ -899,7 +923,7 @@ export function buildSystemSettingsCard({ config, isRunning = false, uptimeText 
         ]],
       },
     ],
-    footer: '可在话题群发送 /topic set 绑定默认接管群 · 发送 /guard on|off 切换审批',
+    footer: '可在话题群发 /topic set 绑定默认群 · /guard on|off 切换审批 · /timeout <时长> 调超时',
   });
 }
 
@@ -923,7 +947,7 @@ export function buildPanelHelpCard() {
     '- `🤖 自动` / `📖 只读`：智能平衡自动执行，或只分析规划不改任何文件',
     '- `⚡ 30m全权` / `⚡ 常驻全权`：放开 Shell / MCP 执行权限（30m全权到期后自动降权）',
     '- `🧠 模型` / `🎛️ 强度`：切换当前会话使用的模型与推理深度',
-    '- `🛠️ 设置`：集中管理高危命令审批、桌面完成提醒、应用权限自检、安全重启与快照回滚',
+    '- `🛠️ 设置`：集中管理高危命令审批、桌面完成提醒、单轮超时、应用权限自检、安全重启与快照回滚',
     '- `🔄 刷新`：立即同步最新运行状态、目录与队列计数',
   ].join('\n');
 
@@ -2047,6 +2071,84 @@ export function buildNotifyCard({ config } = {}) {
       [{ label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } }],
     ],
     footer: '也可在聊天发送 /notify <on|away|off> 或 /mute',
+  });
+}
+
+/**
+ * Render the single-turn task timeout settings card (global default + per-chat override).
+ */
+export function buildTimeoutCard({ chatState = null, config = {} } = {}) {
+  const {
+    effectiveSec,
+    hasOverride,
+    effectiveLabel,
+    globalLabel,
+  } = resolveTimeoutDisplay(chatState, config);
+
+  const globalOptions = [
+    { label: '30 分钟', arg: '30m', seconds: 1800 },
+    { label: '60 分钟', arg: '60m', seconds: 3600 },
+    { label: '2 小时', arg: '2h', seconds: 7200 },
+    { label: '4 小时', arg: '4h', seconds: 14400 },
+    { label: '♾️ 不限时', arg: '0', seconds: 0 },
+  ];
+
+  const globalButtons = globalOptions.map((opt) => ({
+    label: opt.label,
+    type: !hasOverride && effectiveSec === opt.seconds ? 'primary' : 'default',
+    value: { cmd: 'timeout_set', arg: opt.arg, scope: 'global', inplace: true },
+  }));
+
+  const chatOptions = [
+    { label: '⏱️ 本会话 30m', arg: '30m', seconds: 1800 },
+    { label: '⏱️ 本会话 2h', arg: '2h', seconds: 7200 },
+    { label: '♾️ 本会话不限时', arg: '0', seconds: 0 },
+  ];
+
+  const chatRow = chatOptions.map((opt) => ({
+    label: opt.label,
+    type: hasOverride && effectiveSec === opt.seconds ? 'primary' : 'default',
+    value: { cmd: 'timeout_set', arg: opt.arg, scope: 'chat', inplace: true },
+  }));
+  if (hasOverride) {
+    chatRow.push({
+      label: '↩️ 跟随全局默认',
+      value: { cmd: 'timeout_clear_override', inplace: true },
+    });
+  }
+
+  return buildSectionedCard({
+    title: '⏱️ 单轮任务超时设置',
+    template: effectiveSec === 0 ? 'wathet' : 'blue',
+    markdown: [
+      `- **当前生效**：\`${effectiveLabel}\`${hasOverride ? '（本会话单独覆盖）' : '（跟随全局默认）'}`,
+      `- **全局默认**：\`${globalLabel}\``,
+      '',
+      '超过 10 分钟的长任务会自动切为全卡节流刷新；设为不限时后可随时点「🛑 立即中止」或发 `/stop` 结束。',
+    ].join('\n'),
+    sections: [
+      {
+        title: '🌍 设为全局默认（本会话立即生效）',
+        divider: true,
+        rows: [
+          globalButtons.slice(0, 3),
+          globalButtons.slice(3),
+        ],
+      },
+      {
+        title: '💬 仅当前会话覆盖',
+        divider: true,
+        rows: [chatRow],
+      },
+      {
+        divider: true,
+        rows: [[
+          { label: '🛠️ 返回设置', value: { cmd: 'system_menu', inplace: true } },
+          { label: '⬅️ 返回面板', value: { cmd: 'panel', inplace: true } },
+        ]],
+      },
+    ],
+    footer: '自定义时长可发送 /timeout 90m、/timeout 3h 或 /timeout 0（不限时）',
   });
 }
 

@@ -284,6 +284,7 @@ export async function handleArtifactAction(actionCtx) {
         ? value?.fromSystem
           ? buildSystemSettingsCard({
               config,
+              chatState: actionCtx.chatState,
               isRunning: actionCtx.anyBusy?.() || false,
               uptimeText: formatUptime(Date.now() - (actionCtx.startedAt || Date.now())),
             })

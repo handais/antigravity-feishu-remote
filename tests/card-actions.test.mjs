@@ -409,9 +409,10 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
     const sysCard = sysRes.card?.data;
     assert.equal(sysCard.header.title.content, '🛠️ 设置');
     const sysJson = JSON.stringify(sysCard);
-    for (const cmdName of ['guard_toggle', 'notify_menu', 'scopes', 'safe_restart', 'ops', 'panel']) {
+    for (const cmdName of ['guard_toggle', 'notify_menu', 'timeout_menu', 'scopes', 'safe_restart', 'ops', 'panel']) {
       assert.ok(sysJson.includes(`"cmd":"${cmdName}"`), `Missing ${cmdName} in system settings card`);
     }
+    assert.ok(sysJson.includes('单轮超时'));
 
     const toggleFromSys = await handleCardAction(
       ctx,
@@ -1239,5 +1240,74 @@ describe('card-actions & bot-menu across all 5 action submodules', () => {
       assert.equal(fs.statSync(outLog).mode & 0o777, 0o600);
       assert.equal(fs.statSync(errLog).mode & 0o777, 0o600);
     }
+  });
+
+  it('handles timeout_menu, timeout_set (chat/global), timeout_clear_override, and frequent usage tracking', async () => {
+    const { client } = createMockFeishuClient();
+    const ctx = createBridgeContext({ client });
+    const chatId = 'oc_timeout_subpage';
+
+    const menuRes = await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'timeout_menu', inplace: true }, 'ou_test_owner', chatId),
+    );
+    const menuCard = menuRes.card?.data;
+    assert.equal(menuCard?.header?.title?.content, '⏱️ 单轮任务超时设置');
+    for (const el of menuCard?.body?.elements || []) {
+      if (el.tag === 'column_set') {
+        assert.ok(el.columns.length <= 5, `column_set exceeded 5 columns: ${el.columns.length}`);
+      }
+    }
+    assert.equal(loadState().panelActionUsage?.timeout_menu?.count, 1);
+
+    // 1. Set per-chat override without changing global config
+    const prevGlobal = loadConfig().agy.timeoutSeconds;
+    const chatRes = await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'timeout_set', arg: '0', scope: 'chat', inplace: true }, 'ou_test_owner', chatId),
+    );
+    assert.equal(chatRes.toast?.type, 'success');
+    assert.equal(loadConfig().agy.timeoutSeconds, prevGlobal);
+    assert.equal(loadState().chats[chatId]?.timeoutSeconds, 0);
+    const chatCardJson = JSON.stringify(chatRes.card?.data || {});
+    assert.ok(chatCardJson.includes('本会话单独覆盖'));
+    assert.ok(chatCardJson.includes('"cmd":"timeout_clear_override"'));
+
+    // 2. Clear override restores following global default
+    const clearRes = await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'timeout_clear_override', inplace: true }, 'ou_test_owner', chatId),
+    );
+    assert.equal(clearRes.toast?.type, 'success');
+    assert.equal(loadState().chats[chatId]?.timeoutSeconds, undefined);
+    assert.ok(JSON.stringify(clearRes.card?.data || {}).includes('跟随全局默认'));
+
+    // 3. Re-arm per-chat override, then set global timeout -> clears per-chat override so global takes effect immediately
+    await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'timeout_set', arg: '30m', scope: 'chat', inplace: true }, 'ou_test_owner', chatId),
+    );
+    assert.equal(loadState().chats[chatId]?.timeoutSeconds, 1800);
+
+    const globalRes = await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'timeout_set', arg: '2h', scope: 'global', inplace: true }, 'ou_test_owner', chatId),
+    );
+    assert.equal(globalRes.toast?.type, 'success');
+    assert.ok(globalRes.toast?.content.includes('已清除本会话覆盖'));
+    assert.equal(loadConfig().agy.timeoutSeconds, 7200);
+    assert.equal(loadState().chats[chatId]?.timeoutSeconds, undefined);
+    const globalCardJson = JSON.stringify(globalRes.card?.data || {});
+    assert.ok(globalCardJson.includes('跟随全局默认'));
+    assert.ok(globalCardJson.includes('120 分钟（7200s）'));
+
+    // 4. Invalid argument returns error toast without mutating config or chat state
+    const badRes = await handleCardAction(
+      ctx,
+      makeEvent({ cmd: 'timeout_set', arg: 'invalid_val', scope: 'global', inplace: true }, 'ou_test_owner', chatId),
+    );
+    assert.equal(badRes.toast?.type, 'error');
+    assert.equal(loadConfig().agy.timeoutSeconds, 7200);
+    assert.equal(loadState().chats[chatId]?.timeoutSeconds, undefined);
   });
 });
